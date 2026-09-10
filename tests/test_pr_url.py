@@ -1,6 +1,6 @@
 import pytest
 
-from github.pr_url import parse_pr_url
+from openreview.github.pr_url import parse_pr_url
 
 
 def test_parse_pr_url_success():

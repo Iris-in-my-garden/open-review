@@ -1,5 +1,5 @@
 import pytest
-from github.client import GitHubClient, GitHubPRRef, GitHubAPIError
+from openreview.github.client import GitHubClient, GitHubPRRef, GitHubAPIError
 
 
 def test_get_pull_request_success(respx_mock):

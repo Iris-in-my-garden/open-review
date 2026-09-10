@@ -3,7 +3,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
 
-from repo.manager import RepoCommandError, RepoManager
+from openreview.repo.manager import RepoCommandError, RepoManager
 
 
 @pytest.fixture

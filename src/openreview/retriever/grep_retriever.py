@@ -6,7 +6,7 @@ from typing import List, Set
 
 from pydantic import BaseModel
 
-from repo.diff_parser import ParsedDiff
+from openreview.repo.diff_parser import ParsedDiff
 
 EXCLUDE_DIRS = {
     ".git",

@@ -4,7 +4,7 @@ from typing import List, Optional
 import httpx
 from pydantic import BaseModel
 
-from github.pr_url import GitHubPRRef
+from openreview.github.pr_url import GitHubPRRef
 
 
 class PullRequestInfo(BaseModel):

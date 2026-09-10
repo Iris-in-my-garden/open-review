@@ -1,5 +1,5 @@
 # test_diff_parser.py
-from repo.diff_parser import DiffParser
+from openreview.repo.diff_parser import DiffParser
 
 
 def test_python_symbol_extraction():
