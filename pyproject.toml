@@ -1,0 +1,35 @@
+[project]
+name = "openreview"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Ran", email = "55568777+Iris-in-my-garden@users.noreply.github.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "annotated-types==0.8.0",
+    "certifi==2026.7.22",
+    "charset-normalizer==3.5.1",
+    "idna==3.19",
+    "iniconfig==2.3.0",
+    "packaging==26.3",
+    "pip==26.0.1",
+    "pluggy==1.6.0",
+    "pydantic==2.13.5",
+    "pydantic-core==2.46.5",
+    "pygments==2.21.0",
+    "pytest==9.1.1",
+    "requests==2.34.2",
+    "setuptools==82.0.0",
+    "typing-extensions==4.16.0",
+    "typing-inspection==0.4.4",
+    "urllib3==2.7.0",
+]
+
+[project.scripts]
+openreview = "openreview:main"
+
+[build-system]
+requires = ["uv_build>=0.12.11,<0.13.0"]
+build-backend = "uv_build"

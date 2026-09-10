@@ -1,10 +1,9 @@
 # test_manager.py
 from pathlib import Path
-import subprocess
 from unittest.mock import MagicMock, patch
 import pytest
 
-from manager import RepoCommandError, RepoManager
+from repo.manager import RepoCommandError, RepoManager
 
 
 @pytest.fixture
