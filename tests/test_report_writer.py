@@ -1,0 +1,100 @@
+# tests/test_report_writer.py
+from pathlib import Path
+from openreview.review.report_writer import (
+    PotentialIssue,
+    ReportWriter,
+    ReviewResult,
+)
+
+
+def test_write_report_creates_file_and_directory(tmp_path: Path):
+    """测试自动创建输出目录并写入符合规范命名的文件"""
+    output_dir = tmp_path / "nested" / "reports"
+
+    result = ReviewResult(
+        owner="octocat",
+        repo="Hello-World",
+        pr_number=42,
+        summary="Add new greeting feature.",
+        risk_level="Low",
+        risk_reason="Minor addition with low impact.",
+        key_changes=["Added hello() method in main.py"],
+        final_decision="Approve",
+        final_summary="Looks good to merge.",
+    )
+
+    written_path = ReportWriter.write(result, output_dir)
+
+    expected_filename = "octocat_Hello-World_pr_42_review.md"
+    assert written_path.name == expected_filename
+    assert written_path.exists()
+    assert written_path.is_file()
+
+
+def test_write_report_without_findings(tmp_path: Path):
+    """测试当没有 potential_issues 和测试建议时，仍能正确输出完整结构"""
+    result = ReviewResult(
+        owner="foo",
+        repo="bar",
+        pr_number=1,
+        summary="Refactor internal helper.",
+        risk_level="Low",
+        risk_reason="Pure internal refactoring.",
+        final_decision="Approve",
+        final_summary="Clean changes.",
+    )
+
+    written_path = ReportWriter.write(result, tmp_path)
+    content = written_path.read_text(encoding="utf-8")
+
+    # 校验各主要 Heading 均被保留
+    assert "# PR Review Report" in content
+    assert "## 1. PR Summary" in content
+    assert "Refactor internal helper." in content
+    assert "## 2. Risk Level" in content
+    assert "- **Risk Level**: Low" in content
+    assert "## 4. Potential Issues" in content
+    assert "No high-confidence issues found." in content
+    assert "## 7. Final Recommendation" in content
+    assert "- **Decision**: Approve" in content
+
+
+def test_write_report_with_findings(tmp_path: Path):
+    """测试包含完整的 Potential Issues 和 Evidence 时的格式渲染"""
+    issue = PotentialIssue(
+        file="src/auth.py",
+        severity="High",
+        category="Security",
+        confidence=0.95,
+        reasoning="Hardcoded secret key detected.",
+        suggestion="Use environment variables instead.",
+    )
+
+    result = ReviewResult(
+        owner="org",
+        repo="project",
+        pr_number=100,
+        summary="Updated authentication logic.",
+        risk_level="High",
+        risk_reason="Security sensitive area.",
+        key_changes=["Modified token validation in auth.py"],
+        potential_issues=[issue],
+        missing_test_suggestions=["Add unit tests for missing token cases."],
+        evidence=["Line 45 in src/auth.py: secret = '123456'"],
+        final_decision="Request Changes",
+        final_summary="Please fix the security issue before merging.",
+    )
+
+    written_path = ReportWriter.write(result, tmp_path)
+    content = written_path.read_text(encoding="utf-8")
+
+    assert "### Issue 1" in content
+    assert "- **file**: `src/auth.py`" in content
+    assert "- **severity**: High" in content
+    assert "- **category**: Security" in content
+    assert "- **confidence**: 0.95" in content
+    assert "Hardcoded secret key detected." in content
+    assert "Use environment variables instead." in content
+    assert "- Add unit tests for missing token cases." in content
+    assert "- Line 45 in src/auth.py: secret = '123456'" in content
+    assert "- **Decision**: Request Changes" in content
