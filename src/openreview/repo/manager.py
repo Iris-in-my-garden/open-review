@@ -58,17 +58,17 @@ class RepoManager:
         if not target_dir.exists():
             # 1. 目录不存在，执行 clone
             self._run_git_cmd(["clone", repo_url, str(target_dir)])
-        else:
-            # 2. 目录已存在，执行 fetch origin
-            self._run_git_cmd(["fetch", "origin"], cwd=target_dir)
 
-        # 3. Fetch 指定 PR 的 head
         pr_branch = f"pr-{pr_number}"
-        fetch_ref = f"pull/{pr_number}/head:{pr_branch}"
-        self._run_git_cmd(["fetch", "origin", fetch_ref], cwd=target_dir)
 
-        # 4. Checkout 到 PR 分支
-        self._run_git_cmd(["checkout", pr_branch], cwd=target_dir)
+        # 先清理可能存在的脏文件（可选，保证工作区纯净）
+        self._run_git_cmd(["reset", "--hard"], cwd=target_dir)
+
+        # 拉取最新 PR HEAD 到 FETCH_HEAD
+        self._run_git_cmd(["fetch", "origin", f"pull/{pr_number}/head"], cwd=target_dir)
+
+        # 强制切到 pr-xxx 分支并重置到 FETCH_HEAD
+        self._run_git_cmd(["checkout", "-B", pr_branch, "FETCH_HEAD"], cwd=target_dir)
 
         # 5. 返回 Path 对象
         return target_dir.resolve()

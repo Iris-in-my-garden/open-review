@@ -1,21 +1,14 @@
 # openreview/reviewer.py
-import os
 from typing import List, Optional
-from pydantic import BaseModel
-from openai import OpenAI
 
-from openreview.repo.diff_parser import ParsedDiff
-from openreview.retriever.grep_retriever import CodeContext
-from openreview.review.report_writer import PotentialIssue, ReviewResult
-# openreview/reviewer.py
-from typing import List, Optional
+from openreview.github.client import PullRequestInfo
 from openreview.repo.diff_parser import ParsedDiff
 from openreview.retriever.grep_retriever import CodeContext
 from openreview.review.report_writer import ReviewResult
-from prompt_builder import PromptBuilder
-from llm_client import LLMClient, AbstractLLMClient
-from output_parser import OutputParser
-from finding_validator import FindingValidator
+from openreview.review.prompt_builder import PromptBuilder
+from openreview.review.llm_client import LLMClient, AbstractLLMClient
+from openreview.review.output_parser import OutputParser
+from openreview.review.finding_validator import FindingValidator
 
 class Reviewer:
     def __init__(
@@ -32,7 +25,7 @@ class Reviewer:
 
     def review(
         self,
-        pr_info: dict,
+        pr_info: PullRequestInfo,
         parsed_diff: ParsedDiff,
         contexts: List[CodeContext],
     ) -> ReviewResult:
@@ -41,7 +34,7 @@ class Reviewer:
         user_prompt = self.prompt_builder.build_user_prompt(pr_info, parsed_diff, contexts)
 
         # 2. 调用 LLM
-        raw_output = self.llm_client.generate_structured(
+        review_data = self.llm_client.generate_structured(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             response_schema=self.output_parser.schema,
@@ -49,11 +42,11 @@ class Reviewer:
 
         # 3. 解析与格式转换
         metadata = {
-            "owner": pr_info.get("base", {}).get("repo", {}).get("owner", {}).get("login", "unknown"),
-            "repo": pr_info.get("base", {}).get("repo", {}).get("name", "unknown"),
-            "pr_number": pr_info.get("number", 0),
+            "owner": pr_info.owner,
+            "repo": pr_info.repo,
+            "pr_number": pr_info.pr_number
         }
-        review_result = self.output_parser.parse(raw_output, metadata)
+        review_result = self.output_parser.build_final_result(review_data, metadata)
 
         # 4. 后置校验与过滤
         validated_result = self.validator.validate(review_result, parsed_diff)

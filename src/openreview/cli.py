@@ -33,12 +33,17 @@ def review(
         envvar="GITHUB_TOKEN",
         help="GitHub Personal Access Token",
     ),
+    mock_llm: bool = typer.Option(
+        False,
+        "--mock_llm",
+        help = "use mock llm",
+    ),
 ):
     def print_progress(step: int, msg: str):
         typer.secho(f"--> [{step}/7] {msg}", fg=typer.colors.CYAN)
 
     try:
-        pipeline = ReviewPipeline(github_token=github_token)
+        pipeline = ReviewPipeline(github_token=github_token, mock_llm=mock_llm)
         report_path = pipeline.run(
             pr_url, output, progress_cb=print_progress
         )

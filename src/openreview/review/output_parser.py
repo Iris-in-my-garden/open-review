@@ -1,7 +1,7 @@
 # openreview/output_parser.py
-from typing import List
+from typing import List,Type
 from pydantic import BaseModel
-from report_writer import PotentialIssue, ReviewResult
+from openreview.review.report_writer import PotentialIssue, ReviewResult
 
 class PotentialIssueSchema(BaseModel):
     file: str
@@ -27,15 +27,15 @@ class OutputParser:
     def schema(self) -> Type[BaseModel]:
         return ReviewResultSchema
 
-    def parse(self, raw_data: ReviewResultSchema, metadata: dict) -> ReviewResult:
+    def build_final_result(self, review_data: ReviewResultSchema, metadata: dict) -> ReviewResult:
         return ReviewResult(
             owner=metadata.get("owner", "unknown"),
             repo=metadata.get("repo", "unknown"),
             pr_number=metadata.get("pr_number", 0),
-            summary=raw_data.summary,
-            risk_level=raw_data.risk_level,
-            risk_reason=raw_data.risk_reason,
-            key_changes=raw_data.key_changes,
+            summary=review_data.summary,
+            risk_level=review_data.risk_level,
+            risk_reason=review_data.risk_reason,
+            key_changes=review_data.key_changes,
             potential_issues=[
                 PotentialIssue(
                     file=issue.file,
@@ -45,10 +45,10 @@ class OutputParser:
                     reasoning=issue.reasoning,
                     suggestion=issue.suggestion,
                 )
-                for issue in raw_data.potential_issues
+                for issue in review_data.potential_issues
             ],
-            missing_test_suggestions=raw_data.missing_test_suggestions,
-            evidence=raw_data.evidence,
-            final_decision=raw_data.final_decision,
-            final_summary=raw_data.final_summary,
+            missing_test_suggestions=review_data.missing_test_suggestions,
+            evidence=review_data.evidence,
+            final_decision=review_data.final_decision,
+            final_summary=review_data.final_summary,
         )

@@ -1,5 +1,7 @@
 # openreview/prompt_builder.py
 from typing import List
+
+from openreview.github.client import PullRequestInfo
 from openreview.repo.diff_parser import ParsedDiff
 from openreview.retriever.grep_retriever import CodeContext
 
@@ -90,7 +92,7 @@ class PromptBuilder:
 
     def build_user_prompt(
         self,
-        pr_info: dict,
+        pr_info: PullRequestInfo,
         parsed_diff: ParsedDiff,
         contexts: List[CodeContext],
     ) -> str:
@@ -117,8 +119,8 @@ class PromptBuilder:
         ]
         context_str = "\n\n".join(context_list) if context_list else "No relevant contexts retrieved."
 
-        pr_title = pr_info.get("title", "N/A")
-        pr_body = pr_info.get("body", "No description provided.")
+        pr_title = pr_info.title
+        pr_body = pr_info.body
 
         return f"""
 ### 【输入数据】

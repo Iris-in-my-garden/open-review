@@ -50,12 +50,8 @@ class ReviewPipeline:
 
         # 2. 获取 PR 元数据与 Changed Files
         log(2, "Fetching PR metadata & changed files...")
-        pr_info = self.gh_client.get_pull_request(
-            pr_ref.owner, pr_ref.repo, pr_ref.pr_number
-        )
-        raw_files = self.gh_client.list_changed_files(
-            pr_ref.owner, pr_ref.repo, pr_ref.pr_number
-        )
+        pr_info = self.gh_client.get_pull_request(pr_ref)
+        raw_files = self.gh_client.list_changed_files(pr_ref)
 
         # 3. 准备本地 Git 仓库缓存
         log(3, "Preparing local repository cache...")
@@ -65,7 +61,7 @@ class ReviewPipeline:
 
         # 4. 解析 Diff
         log(4, "Parsing diffs and extracting symbols...")
-        parsed_diff = self.diff_parser.parse_diff(raw_files)
+        parsed_diff = self.diff_parser.parse_diff([f.model_dump() for f in raw_files])
 
         # 5. 上下文检索
         log(5, "Retrieving relevant code context...")

@@ -3,7 +3,7 @@ from typing import Optional, Type, TypeVar, Protocol
 from pydantic import BaseModel
 from openai import OpenAI
 
-from output_parser import ReviewResultSchema
+from openreview.review.output_parser import ReviewResultSchema
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -40,7 +40,18 @@ class LLMClient:
             ],
             response_format=response_schema,
         )
-        return response.choices[0].message.parsed
+
+        message = response.choices[0].message
+
+        # 检查模型是否拒绝了请求
+        if message.refusal:
+            raise ValueError(f"Model refused to respond: {message.refusal}")
+
+        # 检查解析结果是否存在
+        if message.parsed is None:
+            raise RuntimeError("Failed to parse structured output from model response.")
+
+        return message.parsed
 
 
 class MockLLMClient:
