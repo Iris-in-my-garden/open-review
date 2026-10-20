@@ -1,5 +1,3 @@
-"""基于 changed file 和 changed symbols，在本地 repo 中检索相关上下文。"""
-
 import re
 from pathlib import Path
 from typing import List, Set
@@ -16,6 +14,8 @@ EXCLUDE_DIRS = {
     "venv",
     ".venv",
     "__pycache__",
+    ".tox",
+    ".idea",
 }
 MAX_FILE_SIZE = 500 * 1024  # 500 KB
 MAX_SNIPPET_LINES = 40
@@ -37,100 +37,34 @@ class GrepRetriever:
             return []
 
         results: List[CodeContext] = []
-        seen_keys: Set[str] = set()  # 防止重复添加相同的 file_path + snippet
+        seen_keys: Set[str] = set()
 
-        # 1. 策略一：寻找对应的测试文件
-        for changed_file in parsed_diff.files:
-            test_contexts = self._find_test_files(repo_path, changed_file.filename)
-            for ctx in test_contexts:
-                key = f"{ctx.file_path}:{ctx.reason}"
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    results.append(ctx)
+        # 1. 预处理：提取所有改动文件的 stem，扩展多语言测试文件匹配规则
+        changed_stems = {Path(f.filename).stem for f in parsed_diff.files}
+        possible_test_names = set()
+        for stem in changed_stems:
+            possible_test_names.update({
+                f"test_{stem}.py",
+                f"{stem}_test.py",
+                f"{stem}.test.ts",
+                f"{stem}.spec.ts",
+                f"{stem}_test.go",
+            })
 
-        # 提取所有改动到的 Symbol
-        all_symbols = set()
+        # 2. 预处理：收集所有需要搜索的 Symbol 并预编译正则
+        all_symbols: Set[str] = set()
         for file in parsed_diff.files:
             all_symbols.update(file.changed_symbols)
 
-        # 2. 策略二：在 repo 全局检索 changed_symbols
-        if all_symbols:
-            symbol_contexts = self._search_symbols(repo_path, all_symbols)
-            for ctx in symbol_contexts:
-                key = f"{ctx.file_path}:{ctx.snippet[:50]}"
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    results.append(ctx)
-
-        # 按照 score 降序排序并截断至 MAX_CONTEXT_COUNT (20)
-        results.sort(key=lambda x: x.score, reverse=True)
-        return results[:MAX_CONTEXT_COUNT]
-
-    def _is_excluded(self, path: Path) -> bool:
-        """检查路径是否包含被排除的目录"""
-        for part in path.parts:
-            if part in EXCLUDE_DIRS:
-                return True
-        return False
-
-    def _is_binary(self, file_path: Path) -> bool:
-        """简单的二进制文件检测：读取前 1024 字节检查是否包含 NULL 字符"""
-        try:
-            with open(file_path, "rb") as f:
-                chunk = f.read(1024)
-                return b"\x00" in chunk
-        except Exception:
-            return True
-
-    def _find_test_files(
-        self, repo_path: Path, changed_filename: str
-    ) -> List[CodeContext]:
-        contexts = []
-        file_path = Path(changed_filename)
-        stem = file_path.stem  # 例如 "bar"
-
-        # 如果修改的文件本身就是测试文件，跳过反向查找
-        if stem.startswith("test_") or stem.endswith("_test"):
-            return contexts
-
-        possible_test_names = {f"test_{stem}.py", f"{stem}_test.py"}
-
-        for p in repo_path.rglob("*"):
-            if not p.is_file() or self._is_excluded(p.relative_to(repo_path)):
-                continue
-
-            if p.name in possible_test_names:
-                try:
-                    if p.stat().st_size > MAX_FILE_SIZE or self._is_binary(p):
-                        continue
-                    text = p.read_text(encoding="utf-8", errors="ignore")
-                    lines = text.splitlines()[:MAX_SNIPPET_LINES]
-                    rel_path = str(p.relative_to(repo_path))
-
-                    contexts.append(
-                        CodeContext(
-                            file_path=rel_path,
-                            reason=f"Matched test file for {changed_filename}",
-                            snippet="\n".join(lines),
-                            score=0.9,  # 测试文件关联赋高权重
-                        )
-                    )
-                except Exception:
-                    continue
-        return contexts
-
-    def _search_symbols(
-        self, repo_path: Path, symbols: Set[str]
-    ) -> List[CodeContext]:
-        contexts = []
-        if not symbols:
-            return contexts
-
-        # 预编译正则提高效率
-        patterns = {
-            symbol: re.compile(rf"\b{re.escape(symbol)}\b") for symbol in symbols
+        symbol_patterns = {
+            symbol: re.compile(rf"\b{re.escape(symbol)}\b")
+            for symbol in all_symbols
         }
 
+        # 定义匹配正则（用于识别是否为函数/类定义）
+        def_pattern = re.compile(r"\b(def|class|func|interface|type|struct)\s+")
+
+        # 3. 单次遍历仓库（Single-Pass Scan）：兼顾测试文件查找与符号全局检索
         for p in repo_path.rglob("*"):
             if not p.is_file():
                 continue
@@ -143,28 +77,80 @@ class GrepRetriever:
                 if p.stat().st_size > MAX_FILE_SIZE or self._is_binary(p):
                     continue
 
-                text = p.read_text(encoding="utf-8", errors="ignore")
-                lines = text.splitlines()
+                rel_path_str = str(rel_path)
+                text = None  # 延迟读取，按需加载
 
-                for symbol, pattern in patterns.items():
-                    for idx, line in enumerate(lines):
-                        if pattern.search(line):
-                            # 获取包含该 symbol 的前后行片段（最多 40 行）
-                            start_line = max(0, idx - 5)
-                            end_line = min(len(lines), start_line + MAX_SNIPPET_LINES)
-                            snippet_lines = lines[start_line:end_line]
-
-                            contexts.append(
-                                CodeContext(
-                                    file_path=str(rel_path),
-                                    reason=f"Symbol '{symbol}' referenced at line {idx + 1}",
-                                    snippet="\n".join(snippet_lines),
-                                    score=0.7,
-                                )
+                # 策略一：检查是否为关联的测试文件
+                if p.name in possible_test_names:
+                    text = p.read_text(encoding="utf-8", errors="ignore")
+                    lines = text.splitlines()[:MAX_SNIPPET_LINES]
+                    key = f"{rel_path_str}:test_file"
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        results.append(
+                            CodeContext(
+                                file_path=rel_path_str,
+                                reason="Matched test file for changes",
+                                snippet="\n".join(lines),
+                                score=0.9,  # 测试文件保持高权重
                             )
-                            # 每个文件对同一 symbol 提取一次 snippet 即可
-                            break
+                        )
+
+                # 策略二：在当前文件中检索 changed_symbols
+                if symbol_patterns:
+                    if text is None:
+                        text = p.read_text(encoding="utf-8", errors="ignore")
+                    lines = text.splitlines()
+
+                    for symbol, pattern in symbol_patterns.items():
+                        for idx, line in enumerate(lines):
+                            if pattern.search(line):
+                                start_line = max(0, idx - 5)
+                                end_line = min(len(lines), start_line + MAX_SNIPPET_LINES)
+                                snippet_lines = lines[start_line:end_line]
+
+                                # 区分定义与引用，动态赋分
+                                is_definition = bool(def_pattern.search(line) and symbol in line)
+                                score = 0.85 if is_definition else 0.65
+
+                                # 修复点：已将末尾的 /> 改为正确的闭合括号 )
+                                reason = (
+                                    f"Definition of '{symbol}' at line {idx + 1}"
+                                    if is_definition
+                                    else f"Reference to '{symbol}' at line {idx + 1}"
+                                )
+
+                                key = f"{rel_path_str}:{symbol}:{idx}"
+                                if key not in seen_keys:
+                                    seen_keys.add(key)
+                                    results.append(
+                                        CodeContext(
+                                            file_path=rel_path_str,
+                                            reason=reason,
+                                            snippet="\n".join(snippet_lines),
+                                            score=score,
+                                        )
+                                    )
+                                # 每个文件对该符号仅提取首个显著匹配，避免单个大文件产生过多重复上下文
+                                break
+
             except Exception:
                 continue
 
-        return contexts
+        # 4. 统一降序排序并截断至最大限制
+        results.sort(key=lambda x: x.score, reverse=True)
+        print(f"[DEBUG] Optimized Contexts count: {len(results)}")
+        return results[:MAX_CONTEXT_COUNT]
+
+    def _is_excluded(self, path: Path) -> bool:
+        for part in path.parts:
+            if part in EXCLUDE_DIRS:
+                return True
+        return False
+
+    def _is_binary(self, file_path: Path) -> bool:
+        try:
+            with open(file_path, "rb") as f:
+                return b"\x00" in f.read(1024)
+        except Exception:
+            return True
