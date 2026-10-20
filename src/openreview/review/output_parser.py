@@ -1,7 +1,7 @@
 # openreview/output_parser.py
 from typing import List
 from pydantic import BaseModel
-from openreview.review.report_writer import PotentialIssue, ReviewResult
+from report_writer import PotentialIssue, ReviewResult
 
 class PotentialIssueSchema(BaseModel):
     file: str

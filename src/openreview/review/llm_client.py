@@ -3,7 +3,7 @@ from typing import Optional, Type, TypeVar, Protocol
 from pydantic import BaseModel
 from openai import OpenAI
 
-from openreview.output_parser import ReviewResultSchema
+from output_parser import ReviewResultSchema
 
 T = TypeVar("T", bound=BaseModel)
 

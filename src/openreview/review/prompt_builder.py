@@ -1,7 +1,7 @@
 # openreview/prompt_builder.py
 from typing import List
-from openreview.diff_parser import ParsedDiff
-from openreview.grep_retriever import CodeContext
+from openreview.repo.diff_parser import ParsedDiff
+from openreview.retriever.grep_retriever import CodeContext
 
 
 DEFAULT_SYSTEM_PROMPT = """你是一位资深、严谨的软件架构师和 Code Reviewer。请根据提供的 GitHub PR 基础信息、Diff 摘要以及检索到的上下文代码，生成一份客观、准确的 PR Review 报告。
