@@ -7,6 +7,7 @@ from openreview.github.client import GitHubClient
 from openreview.github.pr_url import  parse_pr_url
 from openreview.retriever.grep_retriever import GrepRetriever
 from openreview.repo.manager import RepoManager
+from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
 from openreview.review.finding_validator import FindingValidator
 from openreview.review.output_parser import OutputParser
 from openreview.review.prompt_builder import PromptBuilder
@@ -21,7 +22,8 @@ class ReviewPipeline:
         self.gh_client = GitHubClient(token=github_token)
         self.repo_mgr = RepoManager()
         self.diff_parser = DiffParser()
-        self.retriever = GrepRetriever()
+        # self.retriever = GrepRetriever()
+        self.retriever = TreeSitterLocalRetriever()
         self.reviewer = Reviewer()
 
         # 根据标志直接切换实例，不需要用 MagicMock 动态拼装

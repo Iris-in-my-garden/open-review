@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 from typing import List, Set
 
-from pydantic import BaseModel
+from openreview.retriever.code_context import CodeContext
 
 from openreview.repo.diff_parser import ParsedDiff
 
@@ -20,13 +20,6 @@ EXCLUDE_DIRS = {
 MAX_FILE_SIZE = 500 * 1024  # 500 KB
 MAX_SNIPPET_LINES = 40
 MAX_CONTEXT_COUNT = 20
-
-
-class CodeContext(BaseModel):
-    file_path: str
-    reason: str
-    snippet: str
-    score: float
 
 
 class GrepRetriever:

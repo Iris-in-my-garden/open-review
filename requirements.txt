@@ -27,3 +27,6 @@ typing-inspection==0.4.4
 urllib3==2.7.0
 
 openai
+tree-sitter
+tree-sitter-python
+tree-sitter-go
