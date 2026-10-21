@@ -110,6 +110,10 @@ class TreeSitterLocalRetriever:
                     if not abs_file_path.exists() or abs_file_path.stat().st_size > MAX_FILE_SIZE:
                         continue
 
+                    # 【新增过滤】：如果该文件的后缀不在支持的解析器中（例如 .md, .yml），直接跳过
+                    if abs_file_path.suffix not in self.parsers:
+                        continue
+
                     rel_path = rel_path_str
                     snippet, reason, is_def = self._extract_snippet_with_ast(
                         abs_file_path, line_number, symbols
