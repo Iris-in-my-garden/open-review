@@ -1,6 +1,4 @@
 import subprocess
-import json
-import re
 from pathlib import Path
 from typing import List, Set, Optional
 
@@ -16,9 +14,8 @@ MAX_FILE_SIZE = 500 * 1024  # 500 KB 限制
 
 class TreeSitterLocalRetriever:
     """
-    工程级高性能本地混合检索器 (Local Hybrid Pipeline + Tree-sitter AST 解析)。
-    支持 Python 与 Golang 的 AST 边界精准切块。
-    结合 ParsedDiff 的 changed_symbols 与 enclosing_contexts 进行深度检索。
+    工程级高性能本地混合检索器 (Hybrid Funnel Pipeline + Tree-sitter AST 解析)。
+    采用三层漏斗模型：路径剪枝 -> Git Grep 召回 -> AST 结构化校验。
     """
 
     def __init__(self):
@@ -46,13 +43,12 @@ class TreeSitterLocalRetriever:
         if not repo_path.exists() or not repo_path.is_dir():
             return []
 
-        # 优化点 1：同时提取 changed_symbols 与 enclosing_contexts 作为检索关键词
         search_targets = self._extract_search_targets(parsed_diff)
         print(f"[DEBUG] TreeSitterLocalRetriever search_targets: {search_targets}")
         if not search_targets:
             return []
 
-        # 使用 git grep 高速检索所有目标的引用与定义
+        # 执行检索与漏斗过滤
         contexts = self._search_with_git_grep(repo_path, search_targets)
 
         contexts.sort(key=lambda x: x.score, reverse=True)
@@ -60,7 +56,7 @@ class TreeSitterLocalRetriever:
         return contexts[:MAX_CONTEXT_COUNT]
 
     def _extract_search_targets(self, parsed_diff: ParsedDiff) -> Set[str]:
-        """同时收集变更符号和 Hunk 捕获的父级上下文"""
+        """收集检索目标"""
         targets: Set[str] = set()
         for file_diff in parsed_diff.files:
             if hasattr(file_diff, "changed_symbols") and file_diff.changed_symbols:
@@ -68,6 +64,22 @@ class TreeSitterLocalRetriever:
             if hasattr(file_diff, "enclosing_contexts") and file_diff.enclosing_contexts:
                 targets.update(file_diff.enclosing_contexts)
         return targets
+
+    def _is_valid_source_file(self, rel_path_str: str) -> bool:
+        """【第一层：路径剪枝】通用规则：排除文档、缓存及根目录下的非源码单文件配置脚本"""
+        path = Path(rel_path_str)
+        parts = path.parts
+
+        # 排除常见文档与缓存目录
+        if any(p in parts for p in {"docs", "site-packages", ".cache", "examples", "scripts"}):
+            return False
+
+        # 如果是根目录下的单文件（如 setup.py, __version__.py 等），通常不是代码评审的核心关注点
+        if len(parts) == 1 and path.suffix in {".py", ".go"}:
+            if path.name in {"setup.py", "__version__.py", "conf.py", "conftest.py"}:
+                return False
+
+        return True
 
     def _search_with_git_grep(self, repo_path: Path, targets: Set[str]) -> List[CodeContext]:
         contexts: List[CodeContext] = []
@@ -77,7 +89,6 @@ class TreeSitterLocalRetriever:
         if not valid_targets:
             return []
 
-        # 使用 git grep 原生的 -w (--word-regexp) 参数
         cmd = [
             "git",
             "-C", str(repo_path),
@@ -92,8 +103,6 @@ class TreeSitterLocalRetriever:
 
         try:
             process = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            print(f"[DEBUG] git grep returncode: {process.returncode}")
-
             if process.returncode not in (0, 1):
                 return []
 
@@ -104,6 +113,11 @@ class TreeSitterLocalRetriever:
                         continue
 
                     rel_path_str, line_str, _ = parts
+
+                    # 应用第一层路径剪枝
+                    if not self._is_valid_source_file(rel_path_str):
+                        continue
+
                     try:
                         line_number = int(line_str)
                     except ValueError:
@@ -116,20 +130,23 @@ class TreeSitterLocalRetriever:
                     if abs_file_path.suffix not in self.parsers:
                         continue
 
-                    rel_path = rel_path_str
-                    snippet, reason, is_def = self._extract_snippet_with_ast(
+                    # 进入第二、三层：AST 校验与精准边界截取
+                    snippet, reason, is_def, valid = self._extract_snippet_with_ast(
                         abs_file_path, line_number, targets
                     )
 
-                    key = f"{rel_path}:{line_number}"
+                    if not valid:
+                        # 如果 AST 校验不通过（例如只是顶层字符串匹配），直接丢弃
+                        continue
+
+                    key = f"{rel_path_str}:{line_number}"
                     if key not in seen_keys:
                         seen_keys.add(key)
-                        # 定义类/函数给更高分，普通引用给次高分
                         score = 0.90 if is_def else 0.65
 
                         contexts.append(
                             CodeContext(
-                                file_path=rel_path,
+                                file_path=rel_path_str,
                                 reason=reason,
                                 snippet=snippet,
                                 score=score
@@ -146,8 +163,8 @@ class TreeSitterLocalRetriever:
 
     def _extract_snippet_with_ast(
             self, file_path: Path, line_number: int, targets: Set[str]
-    ) -> tuple[str, str, bool]:
-        """利用 Tree-sitter 解析文件 AST，精准截取包含目标行的函数/类/结构体完整边界"""
+    ) -> tuple[str, str, bool, bool]:
+        """利用 Tree-sitter 进行第三层过滤：必须位于函数/类边界内，杜绝顶层噪声"""
         try:
             text = file_path.read_text(encoding="utf-8", errors="ignore")
             lines = text.splitlines()
@@ -156,48 +173,44 @@ class TreeSitterLocalRetriever:
             suffix = file_path.suffix
             parser = self.parsers.get(suffix)
 
-            if parser:
-                tree = parser.parse(text.encode("utf-8"))
-                root_node = tree.root_node
+            if not parser:
+                return "", "", False, False
 
-                target_node = self._find_enclosing_definition(root_node, target_idx)
+            tree = parser.parse(text.encode("utf-8"))
+            root_node = tree.root_node
 
-                if target_node:
-                    start_row = target_node.start_point[0]
-                    end_row = target_node.end_point[0]
+            # 寻找包含目标行的最小定义节点（函数、类等）
+            target_node = self._find_enclosing_definition(root_node, target_idx)
 
-                    snippet_lines = lines[start_row: end_row + 1]
-                    snippet = "\n".join(snippet_lines)
+            # 【核心优化】：如果没有找到 enclosing definition（说明是模块顶层的变量、赋值或字符串），直接判定为无效噪音，过滤掉！
+            if not target_node:
+                return "", "", False, False
 
-                    target_line = lines[target_idx] if 0 <= target_idx < len(lines) else ""
-                    matched_target = next((t for t in targets if t in target_line), "unknown")
+            start_row = target_node.start_point[0]
+            end_row = target_node.end_point[0]
 
-                    definition_types = {
-                        "function_definition", "class_definition", "method_definition",  # Python
-                        "assignment",
-                        "function_declaration", "method_declaration", "type_declaration"  # Golang
-                    }
-
-                    is_def = target_node.type in definition_types
-                    reason = f"AST-enclosed definition of '{matched_target}' (lines {start_row + 1}-{end_row + 1})" if is_def else f"AST-enclosed reference to '{matched_target}'"
-                    return snippet, reason, is_def
-
-            # 兜底逻辑
-            print(f"[DEBUG] TreeSitterLocalRetriever fallback for {file_path.name}")
-            start_line = max(0, target_idx - 10)
-            end_line = min(len(lines), target_idx + 15)
-            snippet = "\n".join(lines[start_line:end_line])
+            snippet_lines = lines[start_row: end_row + 1]
+            snippet = "\n".join(snippet_lines)
 
             target_line = lines[target_idx] if 0 <= target_idx < len(lines) else ""
             matched_target = next((t for t in targets if t in target_line), "unknown")
-            is_def = any(kw in target_line for kw in ["def ", "class ", "func ", "type "])
-            reason = f"Fallback snippet around line {line_number} for '{matched_target}'"
 
-            return snippet, reason, is_def
+            definition_types = {
+                "function_definition", "class_definition", "method_definition",  # Python
+                "function_declaration", "method_declaration", "type_declaration"  # Golang
+            }
+
+            is_def = target_node.type in definition_types
+            reason = (
+                f"AST-enclosed definition of '{matched_target}' (lines {start_row + 1}-{end_row + 1})"
+                if is_def
+                else f"AST-enclosed reference to '{matched_target}' (lines {start_row + 1}-{end_row + 1})"
+            )
+            return snippet, reason, is_def, True
 
         except Exception as e:
             print(f"[DEBUG] AST extraction failed exception: {e}")
-            return "", "AST extraction failed", False
+            return "", "", False, False
 
     def _find_enclosing_definition(self, node: Node, target_row: int) -> Optional[Node]:
         """递归遍历 AST，寻找包含 target_row 的最小定义节点"""
