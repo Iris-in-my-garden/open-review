@@ -55,7 +55,7 @@ class TreeSitterLocalRetriever:
         contexts = self._search_with_git_grep(repo_path, symbols)
 
         contexts.sort(key=lambda x: x.score, reverse=True)
-        print(f"[DEBUG] TreeSitterLocalRetriever Contexts count: {len(contexts)}")
+        print(f"[DEBUG] TreeSitterLocalRetriever Contexts count: {len(contexts)}, contexts, {contexts}")
         return contexts[:MAX_CONTEXT_COUNT]
 
     def _extract_symbols(self, parsed_diff: ParsedDiff) -> Set[str]:

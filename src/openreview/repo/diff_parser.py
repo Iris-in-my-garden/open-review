@@ -1,8 +1,6 @@
-""" 从 patch 中粗略提取函数名、类名、导出的变量名，简单判断patch的文件类型等"""
-
 from pathlib import Path
 import re
-from typing import List, Optional
+from typing import List, Optional, Set
 from pydantic import BaseModel, Field
 
 # 常见后缀映射与类别定义
@@ -30,25 +28,35 @@ LANGUAGE_MAP = {
     ".json": "json",
 }
 
-# 提取新增行正则模式（仅匹配以 '+' 开头，且排除 '+++' 文件的行）
+# 符号匹配正则模式（支持新增和删除行）
 SYMBOL_PATTERNS = {
     "python": [
-        re.compile(r"^\+\s*def\s+([a-zA-Z_]\w*)\s*\("),
-        re.compile(r"^\+\s*class\s+([a-zA-Z_]\w*)\s*[\(:]"),
+        re.compile(r"^\s*def\s+([a-zA-Z_]\w*)\s*\("),
+        re.compile(r"^\s*class\s+([a-zA-Z_]\w*)\s*[\(:]"),
     ],
     "go": [
-        re.compile(r"^\+\s*func\s+(?:\([^\)]+\)\s+)?([a-zA-Z_]\w*)\s*\("),
-        re.compile(r"^\+\s*type\s+([a-zA-Z_]\w*)\s+(?:struct|interface)"),
+        re.compile(r"^\s*func\s+(?:\([^\)]+\)\s+)?([a-zA-Z_]\w*)\s*\("),
+        re.compile(r"^\s*type\s+([a-zA-Z_]\w*)\s+(?:struct|interface)"),
     ],
-    "java": [
-        re.compile(
-            r"^\+\s*(?:public|protected|private)?\s*(?:static\s+)?(?:final\s+)?class\s+([a-zA-Z_]\w*)"
-        ),
-        re.compile(
-            r"^\+\s*(?:public|protected|private)\s+[\w<>\[\]]+\s+([a-zA-Z_]\w*)\s*\("
-        ),
+    "javascript": [
+        re.compile(r"^\s*(?:async\s+)?function\s+([a-zA-Z_]\w*)\s*\("),
+        re.compile(r"^\s*(?:const|let|var)\s+([a-zA-Z_]\w*)\s*=\s*(?:async\s*)?\("),
+        re.compile(r"^\s*class\s+([a-zA-Z_]\w*)"),
+    ],
+    "typescript": [
+        re.compile(r"^\s*(?:async\s+)?function\s+([a-zA-Z_]\w*)\s*\("),
+        re.compile(r"^\s*(?:const|let|var)\s+([a-zA-Z_]\w*)\s*:\s*[\w<>\[\]]+\s*=\s*"),
+        re.compile(r"^\s*class\s+([a-zA-Z_]\w*)"),
+    ],
+    "rust": [
+        re.compile(r"^\s*(?:pub\s+)?fn\s+([a-zA-Z_]\w*)\s*\("),
+        re.compile(r"^\s*(?:pub\s+)?struct\s+([a-zA-Z_]\w*)"),
+        re.compile(r"^\s*(?:pub\s+)?enum\s+([a-zA-Z_]\w*)"),
     ],
 }
+
+# Hunk Header 提取上下文的正则（匹配 @@ ... @@ 后面的函数签名）
+HUNK_CONTEXT_PATTERN = re.compile(r"^@@\s+.*?\s+@@\s*(.*)$")
 
 
 class ParsedChangedFile(BaseModel):
@@ -62,6 +70,7 @@ class ParsedChangedFile(BaseModel):
     is_docs_file: bool = False
     language: Optional[str] = None
     changed_symbols: List[str] = Field(default_factory=list)
+    enclosing_contexts: List[str] = Field(default_factory=list)  # 新增：Hunk 带来的上下文父函数/类
 
 
 class ParsedDiff(BaseModel):
@@ -78,10 +87,8 @@ class DiffParser:
         lower_name = path.name.lower()
         parts = [p.lower() for p in path.parts]
 
-        # 检查路径中是否包含 test/tests 目录
         if "test" in parts or "tests" in parts or "__tests__" in parts:
             return True
-        # 检查文件名规则
         if (
             lower_name.startswith("test_")
             or lower_name.endswith("_test.py")
@@ -99,28 +106,39 @@ class DiffParser:
     def _detect_language(ext: str) -> Optional[str]:
         return LANGUAGE_MAP.get(ext.lower())
 
-    # todo 新增行里如果没有函数名，就解析不出来symbol
     @classmethod
-    def extract_symbols(cls, patch: Optional[str], language: Optional[str]) -> List[str]:
-        if not patch or not language or language not in SYMBOL_PATTERNS:
-            return []
+    def extract_symbols_and_contexts(cls, patch: Optional[str], language: Optional[str]):
+        """同时从 Hunk 头部和变更行中提取符号与上下文"""
+        if not patch:
+            return [], []
 
-        symbols = []
-        patterns = SYMBOL_PATTERNS[language]
+        symbols: Set[str] = set()
+        contexts: Set[str] = set()
+        patterns = SYMBOL_PATTERNS.get(language, []) if language else []
 
         for line in patch.splitlines():
-            # 过滤统一 diff 头部
-            if line.startswith("+++"):
+            # 1. 提取 Hunk Header 的上下文（如 def iter_raw(...)）
+            if line.startswith("@@"):
+                match = HUNK_CONTEXT_PATTERN.match(line)
+                if match and match.group(1).strip():
+                    ctx_text = match.group(1).strip()
+                    # 尝试从上下文中提取函数名或类名
+                    for pattern in patterns:
+                        m = pattern.search(ctx_text)
+                        if m:
+                            contexts.add(m.group(1))
                 continue
-            # 仅匹配新增的行
-            if line.startswith("+"):
+
+            # 2. 匹配新增 (+) 或删除 (-) 行中的符号定义
+            if line.startswith("+") or line.startswith("-"):
+                # 去除前缀符号 + 或 -
+                content = line[1:]
                 for pattern in patterns:
-                    match = pattern.search(line)
+                    match = pattern.search(content)
                     if match:
-                        symbol = match.group(1)
-                        if symbol not in symbols:
-                            symbols.append(symbol)
-        return symbols
+                        symbols.add(match.group(1))
+
+        return list(symbols), list(contexts)
 
     @classmethod
     def parse_file(cls, file_data: dict) -> ParsedChangedFile:
@@ -136,7 +154,7 @@ class DiffParser:
         language = cls._detect_language(ext)
 
         patch = file_data.get("patch")
-        symbols = cls.extract_symbols(patch, language)
+        symbols, contexts = cls.extract_symbols_and_centers = cls.extract_symbols_and_contexts(patch, language)
 
         return ParsedChangedFile(
             filename=filename,
@@ -149,11 +167,12 @@ class DiffParser:
             is_docs_file=is_docs,
             language=language,
             changed_symbols=symbols,
+            enclosing_contexts=contexts,
         )
 
     @classmethod
     def parse_diff(cls, changed_files: List[dict]) -> ParsedDiff:
-        parsed_files = [cls.parse_file(f) for f in changed_files]
+        parsed_files = [cls.parse_file(f) for f in parsed_files] if 'parsed_files' in locals() else [cls.parse_file(f) for f in changed_files]
         total_add = sum(f.additions for f in parsed_files)
         total_del = sum(f.deletions for f in parsed_files)
         return ParsedDiff(
