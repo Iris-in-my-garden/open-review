@@ -18,6 +18,7 @@ class TreeSitterLocalRetriever:
     """
     工程级高性能本地混合检索器 (Local Hybrid Pipeline + Tree-sitter AST 解析)。
     支持 Python 与 Golang 的 AST 边界精准切块。
+    结合 ParsedDiff 的 changed_symbols 与 enclosing_contexts 进行深度检索。
     """
 
     def __init__(self):
@@ -45,35 +46,38 @@ class TreeSitterLocalRetriever:
         if not repo_path.exists() or not repo_path.is_dir():
             return []
 
-        # 从 parsed_diff 提取所有变更的符号
-        symbols = self._extract_symbols(parsed_diff)
-        print(f"[DEBUG] TreeSitterLocalRetriever symbols: {symbols}")
-        if not symbols:
+        # 优化点 1：同时提取 changed_symbols 与 enclosing_contexts 作为检索关键词
+        search_targets = self._extract_search_targets(parsed_diff)
+        print(f"[DEBUG] TreeSitterLocalRetriever search_targets: {search_targets}")
+        if not search_targets:
             return []
 
-        # 使用 git grep 高速检索所有符号的引用与定义
-        contexts = self._search_with_git_grep(repo_path, symbols)
+        # 使用 git grep 高速检索所有目标的引用与定义
+        contexts = self._search_with_git_grep(repo_path, search_targets)
 
         contexts.sort(key=lambda x: x.score, reverse=True)
-        print(f"[DEBUG] TreeSitterLocalRetriever Contexts count: {len(contexts)}, contexts, {contexts}")
+        print(f"[DEBUG] TreeSitterLocalRetriever Contexts count: {len(contexts)} contexts : {contexts}")
         return contexts[:MAX_CONTEXT_COUNT]
 
-    def _extract_symbols(self, parsed_diff: ParsedDiff) -> Set[str]:
-        symbols: Set[str] = set()
+    def _extract_search_targets(self, parsed_diff: ParsedDiff) -> Set[str]:
+        """同时收集变更符号和 Hunk 捕获的父级上下文"""
+        targets: Set[str] = set()
         for file_diff in parsed_diff.files:
             if hasattr(file_diff, "changed_symbols") and file_diff.changed_symbols:
-                symbols.update(file_diff.changed_symbols)
-        return symbols
+                targets.update(file_diff.changed_symbols)
+            if hasattr(file_diff, "enclosing_contexts") and file_diff.enclosing_contexts:
+                targets.update(file_diff.enclosing_contexts)
+        return targets
 
-    def _search_with_git_grep(self, repo_path: Path, symbols: Set[str]) -> List[CodeContext]:
+    def _search_with_git_grep(self, repo_path: Path, targets: Set[str]) -> List[CodeContext]:
         contexts: List[CodeContext] = []
         seen_keys: Set[str] = set()
 
-        valid_symbols = [s.strip() for s in symbols if s and s.strip()]
-        if not valid_symbols:
+        valid_targets = [s.strip() for s in targets if s and s.strip()]
+        if not valid_targets:
             return []
 
-        # 使用 git grep 原生的 -w (--word-regexp) 参数，安全、原生、无惧转义陷阱
+        # 使用 git grep 原生的 -w (--word-regexp) 参数
         cmd = [
             "git",
             "-C", str(repo_path),
@@ -83,8 +87,7 @@ class TreeSitterLocalRetriever:
             "-w"
         ]
 
-        # 动态追加所有需要检索的符号
-        for sym in valid_symbols:
+        for sym in valid_targets:
             cmd.extend(["-e", sym])
 
         try:
@@ -110,18 +113,18 @@ class TreeSitterLocalRetriever:
                     if not abs_file_path.exists() or abs_file_path.stat().st_size > MAX_FILE_SIZE:
                         continue
 
-                    # 【新增过滤】：如果该文件的后缀不在支持的解析器中（例如 .md, .yml），直接跳过
                     if abs_file_path.suffix not in self.parsers:
                         continue
 
                     rel_path = rel_path_str
                     snippet, reason, is_def = self._extract_snippet_with_ast(
-                        abs_file_path, line_number, symbols
+                        abs_file_path, line_number, targets
                     )
 
                     key = f"{rel_path}:{line_number}"
                     if key not in seen_keys:
                         seen_keys.add(key)
+                        # 定义类/函数给更高分，普通引用给次高分
                         score = 0.90 if is_def else 0.65
 
                         contexts.append(
@@ -142,7 +145,7 @@ class TreeSitterLocalRetriever:
         return contexts
 
     def _extract_snippet_with_ast(
-            self, file_path: Path, line_number: int, symbols: Set[str]
+            self, file_path: Path, line_number: int, targets: Set[str]
     ) -> tuple[str, str, bool]:
         """利用 Tree-sitter 解析文件 AST，精准截取包含目标行的函数/类/结构体完整边界"""
         try:
@@ -160,7 +163,6 @@ class TreeSitterLocalRetriever:
                 target_node = self._find_enclosing_definition(root_node, target_idx)
 
                 if target_node:
-                    # 修正：使用元组索引 [0] 获取行号 (row)
                     start_row = target_node.start_point[0]
                     end_row = target_node.end_point[0]
 
@@ -168,28 +170,28 @@ class TreeSitterLocalRetriever:
                     snippet = "\n".join(snippet_lines)
 
                     target_line = lines[target_idx] if 0 <= target_idx < len(lines) else ""
-                    matched_symbol = next((sym for sym in symbols if sym in target_line), "unknown")
+                    matched_target = next((t for t in targets if t in target_line), "unknown")
 
                     definition_types = {
                         "function_definition", "class_definition", "method_definition",  # Python
-                        "assignment",  # 允许捕获全局变量赋值
+                        "assignment",
                         "function_declaration", "method_declaration", "type_declaration"  # Golang
                     }
 
                     is_def = target_node.type in definition_types
-                    reason = f"AST-enclosed definition of '{matched_symbol}' (lines {start_row + 1}-{end_row + 1})" if is_def else f"AST-enclosed reference to '{matched_symbol}'"
+                    reason = f"AST-enclosed definition of '{matched_target}' (lines {start_row + 1}-{end_row + 1})" if is_def else f"AST-enclosed reference to '{matched_target}'"
                     return snippet, reason, is_def
 
-            # 没有对应解析器时的通用兜底
+            # 兜底逻辑
             print(f"[DEBUG] TreeSitterLocalRetriever fallback for {file_path.name}")
             start_line = max(0, target_idx - 10)
             end_line = min(len(lines), target_idx + 15)
             snippet = "\n".join(lines[start_line:end_line])
 
             target_line = lines[target_idx] if 0 <= target_idx < len(lines) else ""
-            matched_symbol = next((sym for sym in symbols if sym in target_line), "unknown")
+            matched_target = next((t for t in targets if t in target_line), "unknown")
             is_def = any(kw in target_line for kw in ["def ", "class ", "func ", "type "])
-            reason = f"Fallback snippet around line {line_number}"
+            reason = f"Fallback snippet around line {line_number} for '{matched_target}'"
 
             return snippet, reason, is_def
 
@@ -208,7 +210,6 @@ class TreeSitterLocalRetriever:
 
         def traverse(curr: Node):
             nonlocal best_match
-            # 修正：使用 [0] 获取行号
             if curr.start_point[0] <= target_row <= curr.end_point[0]:
                 if curr.type in definition_types:
                     best_match = curr
