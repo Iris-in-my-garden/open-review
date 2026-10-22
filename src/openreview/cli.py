@@ -50,19 +50,40 @@ def review(
         "--mock_llm",
         help = "use mock llm",
     ),
+    post_comment: bool = typer.Option(
+        False,
+        "--post-comment",
+        help="Post findings back to the PR as GitHub inline review comments",
+    ),
+    max_batch_tokens: int = typer.Option(
+        60000,
+        "--max-batch-tokens",
+        help="Max estimated patch tokens per review batch (0 disables batching)",
+    ),
+    max_workers: int = typer.Option(
+        4,
+        "--max-workers",
+        help="Max parallel aspect reviewers",
+    ),
 ):
     def print_progress(step: int, msg: str):
-        typer.secho(f"--> [{step}/7] {msg}", fg=typer.colors.CYAN)
+        typer.secho(f"--> [{step}/8] {msg}", fg=typer.colors.CYAN)
 
+    pipeline = None
     try:
         pipeline = ReviewPipeline(
             github_token=github_token,
             llm_model=llm_model,
             llm_base_url=llm_base_url,
             mock_llm=mock_llm,
+            max_batch_tokens=max_batch_tokens,
+            max_workers=max_workers,
         )
         report_path = pipeline.run(
-            pr_url, output, progress_cb=print_progress
+            pr_url,
+            output,
+            progress_cb=print_progress,
+            post_comments=post_comment,
         )
 
         typer.secho(
@@ -85,6 +106,9 @@ def review(
             f"\n❌ Review failed: {err_msg}", fg=typer.colors.RED, err=True
         )
         raise typer.Exit(code=1)
+    finally:
+        if pipeline is not None:
+            pipeline.close()
 
 
 def main():

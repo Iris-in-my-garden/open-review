@@ -103,3 +103,46 @@ def test_command_error_raises_exception(mock_exists, mock_run, manager):
     assert exc_info.value.returncode == 1
     assert "Fatal: repository not found" in exc_info.value.stderr
     assert exc_info.value.stderr in str(exc_info.value)
+
+
+@patch.object(RepoManager, "_run_git_cmd")
+@patch.object(Path, "exists")
+def test_prepare_base_worktree_adds_detached_worktree(mock_exists, mock_run, manager):
+    mock_exists.side_effect = [True, False]  # repo 存在，base worktree 不存在
+    mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+    result = manager.prepare_base_worktree("owner_a", "repo_b", "base-sha")
+
+    expected_base = Path(".cache/repos/owner_a__repo_b__base").resolve()
+    assert result == expected_base
+    commands = [call.args[0] for call in mock_run.call_args_list]
+    assert commands[0] == ["cat-file", "-e", "base-sha^{commit}"]
+    assert commands[-1] == [
+        "worktree",
+        "add",
+        "--detach",
+        str(expected_base),
+        "base-sha",
+    ]
+
+
+@patch.object(RepoManager, "_run_git_cmd")
+@patch.object(Path, "exists")
+def test_prepare_base_worktree_replaces_stale_directory(
+    mock_exists, mock_run, manager
+):
+    mock_exists.side_effect = [True, True]
+    mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+    manager.prepare_base_worktree("owner_a", "repo_b", "base-sha")
+
+    commands = [call.args[0] for call in mock_run.call_args_list]
+    expected_base = Path(".cache/repos/owner_a__repo_b__base").resolve()
+    assert ["worktree", "remove", "--force", str(expected_base)] in commands
+    assert commands[-1] == [
+        "worktree",
+        "add",
+        "--detach",
+        str(expected_base),
+        "base-sha",
+    ]

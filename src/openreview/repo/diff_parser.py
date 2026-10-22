@@ -79,6 +79,8 @@ class ParsedChangedFile(BaseModel):
     enclosing_contexts: List[str] = Field(default_factory=list)  # 新增：Hunk 带来的上下文父函数/类
     # 新增：变更后的新文件行号（用于反查“变更行所属的函数/类”）
     changed_lines: List[int] = Field(default_factory=list)
+    # 新增：Patch 中新文件侧可见的行号（新增行 + 上下文行，用于校验行号是否落在 diff 内）
+    visible_lines: List[int] = Field(default_factory=list)
 
 
 class ParsedDiff(BaseModel):
@@ -95,6 +97,8 @@ class DiffParser:
         lower_name = path.name.lower()
         parts = [p.lower() for p in path.parts]
 
+        if lower_name == "__init__.py":
+            return False
         if "test" in parts or "tests" in parts or "__tests__" in parts:
             return True
         if (
@@ -107,6 +111,49 @@ class DiffParser:
             or lower_name.endswith("spec.ts")
             or lower_name.endswith("test.java")
         ):
+            return True
+        return False
+
+    @staticmethod
+    def is_test_path(filename: str) -> bool:
+        """公开的测试文件判断，供检索器与测试缺口分析复用。"""
+        return DiffParser._is_test_file(filename)
+
+    @staticmethod
+    def is_linked_test(source_file: str, test_path: str) -> bool:
+        """判断 test_path 是否像 source_file 对应的测试文件。
+
+        支持两类约定：
+        1. 文件名约定：test_mod.py / mod_test.py / mod.test.ts / modTest.java
+        2. 目录约定：httpx/_models.py ↔ tests/models/test_cookies.py
+        """
+        source = Path(source_file)
+        test = Path(test_path)
+        source_stem = source.stem.lower().lstrip("_")
+        test_stem = test.stem.lower().lstrip("_")
+        candidates = {
+            f"test_{source_stem}",
+            f"{source_stem}_test",
+            f"{source_stem}.test",
+            f"{source_stem}.spec",
+            f"{source_stem}test",
+        }
+        if test_stem in candidates or source_stem == test_stem:
+            return True
+
+        source_dirs = {
+            part.lower().lstrip("_")
+            for part in source.parent.parts
+            if part not in (".", "")
+        }
+        test_dirs = {
+            part.lower().lstrip("_")
+            for part in test.parent.parts
+            if part not in (".", "")
+        }
+        if source_stem in test_dirs:
+            return True
+        if source_dirs & test_dirs and source_stem in test_stem:
             return True
         return False
 
@@ -212,6 +259,40 @@ class DiffParser:
                 unique_lines.append(line)
         return unique_lines
 
+    @staticmethod
+    def extract_visible_lines(patch: Optional[str]) -> List[int]:
+        """提取 Patch 中新文件侧可见的所有行号（新增行 + 上下文行）。"""
+        if not patch:
+            return []
+
+        visible: List[int] = []
+        new_line: Optional[int] = None
+
+        for raw_line in patch.splitlines():
+            header = HUNK_RANGE_PATTERN.match(raw_line)
+            if header:
+                new_line = int(header.group(3))
+                continue
+
+            if new_line is None:
+                continue
+
+            if raw_line.startswith("+"):
+                visible.append(new_line)
+                new_line += 1
+            elif raw_line.startswith(" "):
+                visible.append(new_line)
+                new_line += 1
+            # 删除行不在新文件中
+
+        seen: Set[int] = set()
+        unique_lines: List[int] = []
+        for line in visible:
+            if line not in seen:
+                seen.add(line)
+                unique_lines.append(line)
+        return unique_lines
+
     @classmethod
     def parse_file(cls, file_data: dict) -> ParsedChangedFile:
         filename = file_data.get("filename", "")
@@ -230,6 +311,7 @@ class DiffParser:
             patch, language
         )
         changed_lines = cls.extract_changed_lines(patch)
+        visible_lines = cls.extract_visible_lines(patch)
 
         return ParsedChangedFile(
             filename=filename,
@@ -245,6 +327,7 @@ class DiffParser:
             removed_symbols=removed_symbols,
             enclosing_contexts=contexts,
             changed_lines=changed_lines,
+            visible_lines=visible_lines,
         )
 
     @classmethod

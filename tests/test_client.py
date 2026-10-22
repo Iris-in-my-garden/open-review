@@ -1,3 +1,6 @@
+import json
+import time
+
 import httpx
 import pytest
 
@@ -77,3 +80,100 @@ def test_list_changed_files_pagination():
     assert files[0].deletions == 2
     assert files[0].changes == 7
     assert files[0].patch == "@@ -1,3 +1,6 @@"
+
+
+def test_create_review_posts_body_and_inline_comments():
+    ref = GitHubPRRef(owner="octocat", repo="Hello-World", pr_number=1342)
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/repos/octocat/Hello-World/pulls/1342/reviews"
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(201, json={"id": 99})
+
+    comments = [
+        {"path": "main.py", "line": 12, "side": "RIGHT", "body": "issue"}
+    ]
+    with _client_with_handler(handler) as client:
+        response = client.create_review(
+            ref,
+            body="review body",
+            comments=comments,
+            event="COMMENT",
+            commit_id="head-sha",
+        )
+
+    assert response == {"id": 99}
+    payload = captured["payload"]
+    assert payload["body"] == "review body"
+    assert payload["event"] == "COMMENT"
+    assert payload["comments"] == comments
+    assert payload["commit_id"] == "head-sha"
+
+
+def test_retries_on_retryable_status():
+    ref = GitHubPRRef(owner="octocat", repo="Hello-World", pr_number=1)
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(500, json={"message": "temporary"})
+        return httpx.Response(
+            200,
+            json={
+                "title": "ok",
+                "body": "",
+                "base": {"ref": "main", "sha": "base"},
+                "head": {"ref": "feature", "sha": "head"},
+                "html_url": "https://github.com/octocat/Hello-World/pull/1",
+            },
+        )
+
+    with GitHubClient(
+        transport=httpx.MockTransport(handler),
+        max_retries=1,
+        backoff_factor=0,
+    ) as client:
+        pr_info = client.get_pull_request(ref)
+
+    assert pr_info.title == "ok"
+    assert len(calls) == 2
+
+
+def test_retries_on_rate_limit_exhausted():
+    ref = GitHubPRRef(owner="octocat", repo="Hello-World", pr_number=1)
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(
+                403,
+                headers={
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Reset": str(int(time.time())),
+                },
+                json={"message": "rate limited"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "title": "ok",
+                "body": "",
+                "base": {"ref": "main", "sha": "base"},
+                "head": {"ref": "feature", "sha": "head"},
+                "html_url": "https://github.com/octocat/Hello-World/pull/1",
+            },
+        )
+
+    with GitHubClient(
+        transport=httpx.MockTransport(handler),
+        max_retries=1,
+        backoff_factor=0,
+    ) as client:
+        pr_info = client.get_pull_request(ref)
+
+    assert pr_info.title == "ok"
+    assert len(calls) == 2

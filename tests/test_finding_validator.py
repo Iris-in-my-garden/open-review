@@ -105,3 +105,104 @@ def test_validate_deduplicates_cross_aspect_findings():
     assert result.potential_issues[0].severity == "critical"
     assert result.risk_level == "CRITICAL"
     assert result.final_decision == "REQUEST_CHANGES"
+
+
+def _diff_with_patch() -> ParsedDiff:
+    return ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="src/auth.py",
+                status="modified",
+                patch=(
+                    "@@ -0,0 +1,2 @@\n"
+                    '+password = "123"\n'
+                    "+return password\n"
+                ),
+                visible_lines=[1, 2],
+            )
+        ]
+    )
+
+
+def test_validate_grounded_evidence_gets_bonus():
+    issue = PotentialIssue(
+        file="src/auth.py",
+        severity="High",
+        category="Security",
+        confidence=0.7,
+        reasoning="Hardcoded password.",
+        suggestion="Use env vars.",
+        line=1,
+        evidence='password = "123"',
+    )
+
+    result = FindingValidator().validate(_result([issue]), _diff_with_patch())
+
+    assert len(result.potential_issues) == 1
+    assert result.potential_issues[0].line == 1
+    assert result.potential_issues[0].confidence == 0.75
+
+
+def test_validate_ungrounded_evidence_is_penalized_and_dropped():
+    issue = PotentialIssue(
+        file="src/auth.py",
+        severity="High",
+        category="Security",
+        confidence=0.7,
+        reasoning="Hardcoded API key.",
+        suggestion="Use env vars.",
+        line=1,
+        evidence='api_key = "definitely-not-in-code"',
+    )
+
+    result = FindingValidator().validate(_result([issue]), _diff_with_patch())
+
+    assert result.potential_issues == []
+    assert result.risk_level == "LOW"
+    assert result.final_decision == "APPROVE"
+
+
+def test_validate_invalid_line_is_cleared_and_penalized():
+    issue = PotentialIssue(
+        file="src/auth.py",
+        severity="High",
+        category="Security",
+        confidence=0.9,
+        reasoning="Hardcoded password.",
+        suggestion="Use env vars.",
+        line=99,
+    )
+
+    result = FindingValidator().validate(_result([issue]), _diff_with_patch())
+
+    assert len(result.potential_issues) == 1
+    assert result.potential_issues[0].line is None
+    assert result.potential_issues[0].confidence == 0.7
+
+
+def test_validate_evidence_can_be_grounded_in_local_source(tmp_path):
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "auth.py").write_text(
+        "def login():\n"
+        "    API_KEY = 'secret'\n"
+        "    return API_KEY\n",
+        encoding="utf-8",
+    )
+    issue = PotentialIssue(
+        file="src/auth.py",
+        severity="High",
+        category="Security",
+        confidence=0.7,
+        reasoning="Hardcoded API key.",
+        suggestion="Use env vars.",
+        line=2,
+        evidence="API_KEY = 'secret'",
+    )
+
+    result = FindingValidator().validate(
+        _result([issue]), _diff_with_patch(), repo_path=tmp_path
+    )
+
+    assert len(result.potential_issues) == 1
+    assert result.potential_issues[0].confidence == 0.75

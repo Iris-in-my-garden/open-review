@@ -1,4 +1,4 @@
-from typing import List, Type, Dict, Any
+from typing import List, Optional, Type
 from pydantic import BaseModel, Field
 
 from openreview.review.assessment import (
@@ -18,6 +18,22 @@ class PotentialIssueSchema(BaseModel):
     confidence: float = Field(description="置信度分数 0.0 ~ 1.0")
     reasoning: str = Field(description="问题的原理解释与上下文背景")
     suggestion: str = Field(description="具体的修复或重构建议代码")
+    line: Optional[int] = Field(
+        default=None,
+        description="问题所在的新文件行号（必须来自 Patch 中带行号的新增行或上下文行）",
+    )
+    end_line: Optional[int] = Field(
+        default=None,
+        description="多行问题的结束行号（可选，需 >= line）",
+    )
+    evidence: Optional[str] = Field(
+        default=None,
+        description="支撑该问题的原始代码片段，必须逐字来自 Patch 或 Context",
+    )
+    suggested_patch: Optional[str] = Field(
+        default=None,
+        description="可直接应用的 unified diff 修复片段（可选）",
+    )
 
 class AspectReviewOutputSchema(BaseModel):
     """单个 Worker（维度）的标准输出结构"""
@@ -116,6 +132,10 @@ class OutputParser:
                     confidence=issue.confidence,
                     reasoning=issue.reasoning,
                     suggestion=issue.suggestion,
+                    line=issue.line,
+                    end_line=issue.end_line,
+                    evidence=issue.evidence,
+                    suggested_patch=issue.suggested_patch,
                 )
                 for issue in review_data.potential_issues
             ],

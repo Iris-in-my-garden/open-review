@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Set, Tuple
 # 引入 tree-sitter
 from tree_sitter import Language, Parser, Node, Tree
 
-from openreview.repo.diff_parser import ParsedDiff
+from openreview.repo.diff_parser import DiffParser, ParsedDiff
 from openreview.retriever.code_context import CodeContext
 
 logger = logging.getLogger(__name__)
@@ -14,11 +14,16 @@ logger = logging.getLogger(__name__)
 MAX_CONTEXT_COUNT = 20
 MAX_FILE_SIZE = 500 * 1024  # 500 KB 限制
 MAX_SEARCH_TARGETS = 200
+MAX_TEST_CONTEXT_COUNT = 8
+MAX_TEST_SNIPPET_LINES = 120
 
-# 打分：变更行所在的函数/类 > 符号定义 > 符号引用
+# 打分：变更行所在的函数/类 > 符号定义 > 关联测试 > 符号引用 > base 侧历史代码
 SCORE_ENCLOSING = 0.95
 SCORE_DEFINITION = 0.90
+SCORE_TEST_FILE = 0.85
 SCORE_REFERENCE = 0.65
+SCORE_BASE_DEFINITION = 0.80
+SCORE_BASE_REFERENCE = 0.55
 
 DEFINITION_TYPES = {
     "function_definition", "class_definition", "method_definition",  # Python
@@ -53,7 +58,12 @@ class TreeSitterLocalRetriever:
         except ImportError:
             pass
 
-    def retrieve(self, repo_path: Path, parsed_diff: ParsedDiff) -> List[CodeContext]:
+    def retrieve(
+        self,
+        repo_path: Path,
+        parsed_diff: ParsedDiff,
+        base_path: Optional[Path] = None,
+    ) -> List[CodeContext]:
         repo_path = Path(repo_path).resolve()
         if not repo_path.exists() or not repo_path.is_dir():
             return []
@@ -76,6 +86,32 @@ class TreeSitterLocalRetriever:
         contexts = enclosing_contexts + self._search_with_git_grep(
             repo_path, search_targets, seen_node_ranges, file_cache
         )
+
+        # 3. 关联测试文件：用于测试缺口分析，而不是让模型凭空猜“应该有测试”
+        contexts.extend(
+            self._collect_test_contexts(
+                repo_path, parsed_diff, seen_node_ranges, file_cache
+            )
+        )
+
+        # 4. base 侧历史代码：只查被删除的符号，补充“删掉的函数原来长什么样”
+        removed_targets = {
+            symbol
+            for file_diff in parsed_diff.files
+            for symbol in (file_diff.removed_symbols or [])
+        }
+        if base_path and removed_targets:
+            base_path = Path(base_path).resolve()
+            if base_path.is_dir():
+                contexts.extend(
+                    self._search_with_git_grep(
+                        base_path,
+                        removed_targets,
+                        set(),
+                        file_cache,
+                        revision="base",
+                    )
+                )
 
         contexts.sort(key=lambda x: x.score, reverse=True)
         logger.debug("Retrieved %d contexts", len(contexts))
@@ -151,6 +187,84 @@ class TreeSitterLocalRetriever:
 
         return contexts, definition_names
 
+    def _collect_test_contexts(
+        self,
+        repo_path: Path,
+        parsed_diff: ParsedDiff,
+        seen_node_ranges: Set[Tuple[str, int, int]],
+        file_cache: Dict[Path, Optional[LoadedFile]],
+    ) -> List[CodeContext]:
+        """找到与变更模块关联的测试文件，作为测试缺口分析的依据。"""
+        source_files = {
+            file_diff.filename
+            for file_diff in parsed_diff.files
+            if not file_diff.is_test_file
+            and not file_diff.is_docs_file
+            and not file_diff.is_config_file
+        }
+        if not source_files:
+            return []
+
+        try:
+            process = subprocess.run(
+                ["git", "-C", str(repo_path), "ls-files"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("Git is required but not found in system path.") from exc
+
+        if process.returncode != 0:
+            return []
+
+        tracked_tests = [
+            rel_path
+            for rel_path in process.stdout.splitlines()
+            if self._is_valid_source_file(rel_path)
+            and DiffParser.is_test_path(rel_path)
+        ]
+
+        selected: List[str] = []
+        for source_file in sorted(source_files):
+            matches = [
+                rel_path
+                for rel_path in tracked_tests
+                if DiffParser.is_linked_test(source_file, rel_path)
+            ]
+            selected.extend(matches[:2])
+            if len(selected) >= MAX_TEST_CONTEXT_COUNT:
+                break
+
+        selected = selected[:MAX_TEST_CONTEXT_COUNT]
+
+        contexts: List[CodeContext] = []
+        for rel_path in dict.fromkeys(selected):
+            unique_key = (rel_path, -1, -1)
+            if unique_key in seen_node_ranges:
+                continue
+
+            abs_path = self._resolve_repo_file(repo_path, rel_path)
+            if abs_path is None:
+                continue
+            loaded = self._load_file(abs_path, file_cache)
+            if loaded is None:
+                continue
+
+            _, lines, _, _ = loaded
+            seen_node_ranges.add(unique_key)
+            contexts.append(
+                CodeContext(
+                    file_path=rel_path,
+                    reason="Linked test file for changed module",
+                    snippet="\n".join(lines[:MAX_TEST_SNIPPET_LINES]),
+                    score=SCORE_TEST_FILE,
+                    revision="head",
+                )
+            )
+
+        return contexts
+
     def _resolve_repo_file(self, repo_path: Path, rel_path_str: str) -> Optional[Path]:
         """把仓库相对路径解析为绝对路径，并阻止 ../ 越界。"""
         candidate = (repo_path / rel_path_str).resolve()
@@ -210,6 +324,7 @@ class TreeSitterLocalRetriever:
         targets: Set[str],
         seen_node_ranges: Set[Tuple[str, int, int]],
         file_cache: Dict[Path, Optional[LoadedFile]],
+        revision: str = "head",
     ) -> List[CodeContext]:
         contexts: List[CodeContext] = []
 
@@ -266,8 +381,14 @@ class TreeSitterLocalRetriever:
                     continue
                 seen_node_ranges.add(unique_key)
 
-                # 定义给予较高权重，引用给予基础权重
-                score = SCORE_DEFINITION if is_def else SCORE_REFERENCE
+                # 定义给予较高权重，引用给予基础权重；base 侧整体降权
+                if revision == "base":
+                    score = (
+                        SCORE_BASE_DEFINITION if is_def else SCORE_BASE_REFERENCE
+                    )
+                    reason = f"[base revision] {reason}"
+                else:
+                    score = SCORE_DEFINITION if is_def else SCORE_REFERENCE
 
                 contexts.append(
                     CodeContext(
@@ -275,6 +396,7 @@ class TreeSitterLocalRetriever:
                         reason=reason,
                         snippet=snippet,
                         score=score,
+                        revision=revision,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - 单行解析失败不应中断整体检索

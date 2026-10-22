@@ -1,6 +1,6 @@
 """ 把 ReviewResult 写成 Markdown 文件。 """
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -11,6 +11,10 @@ class PotentialIssue(BaseModel):
     confidence: float
     reasoning: str
     suggestion: str
+    line: Optional[int] = None
+    end_line: Optional[int] = None
+    evidence: Optional[str] = None
+    suggested_patch: Optional[str] = None
 
 
 class ReviewResult(BaseModel):
@@ -26,6 +30,7 @@ class ReviewResult(BaseModel):
     evidence: List[str] = Field(default_factory=list)
     final_decision: str
     final_summary: str
+    review_notes: List[str] = Field(default_factory=list)
 
 
 class ReportWriter:
@@ -63,18 +68,35 @@ class ReportWriter:
             md_lines.append("No high-confidence issues found.")
         else:
             for idx, issue in enumerate(result.potential_issues, 1):
-                md_lines.extend(
-                    [
-                        f"### Issue {idx}",
-                        f"- **file**: `{issue.file}`",
-                        f"- **severity**: {issue.severity}",
-                        f"- **category**: {issue.category}",
-                        f"- **confidence**: {issue.confidence}",
-                        f"- **reasoning**: {issue.reasoning}",
-                        f"- **suggestion**: {issue.suggestion}",
-                        "",
-                    ]
-                )
+                location = issue.file
+                if issue.line:
+                    location += f":{issue.line}"
+                    if issue.end_line and issue.end_line != issue.line:
+                        location += f"-{issue.end_line}"
+                location = f"`{location}`"
+
+                issue_lines = [
+                    f"### Issue {idx}",
+                    f"- **file**: {location}",
+                    f"- **severity**: {issue.severity}",
+                    f"- **category**: {issue.category}",
+                    f"- **confidence**: {issue.confidence}",
+                    f"- **reasoning**: {issue.reasoning}",
+                    f"- **suggestion**: {issue.suggestion}",
+                ]
+                if issue.evidence:
+                    issue_lines.append(f"- **evidence**: `{issue.evidence}`")
+                if issue.suggested_patch:
+                    issue_lines.extend(
+                        [
+                            "- **suggested_patch**:",
+                            "```diff",
+                            issue.suggested_patch,
+                            "```",
+                        ]
+                    )
+                issue_lines.append("")
+                md_lines.extend(issue_lines)
         md_lines.append("")
 
         # 5. Missing Test Suggestions
@@ -104,6 +126,13 @@ class ReportWriter:
                 "",
             ]
         )
+
+        # 8. Review Notes（可选：批次、失败维度、注入告警等）
+        if result.review_notes:
+            md_lines.append("## 8. Review Notes")
+            for note in result.review_notes:
+                md_lines.append(f"- {note}")
+            md_lines.append("")
 
         return "\n".join(md_lines)
 

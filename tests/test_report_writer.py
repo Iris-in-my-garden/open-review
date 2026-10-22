@@ -68,6 +68,9 @@ def test_write_report_with_findings(tmp_path: Path):
         confidence=0.95,
         reasoning="Hardcoded secret key detected.",
         suggestion="Use environment variables instead.",
+        line=45,
+        evidence="secret = '123456'",
+        suggested_patch="-secret = '123456'\n+secret = os.environ['SECRET']",
     )
 
     result = ReviewResult(
@@ -83,18 +86,23 @@ def test_write_report_with_findings(tmp_path: Path):
         evidence=["Line 45 in src/auth.py: secret = '123456'"],
         final_decision="Request Changes",
         final_summary="Please fix the security issue before merging.",
+        review_notes=["batch 1/2"],
     )
 
     written_path = ReportWriter.write(result, tmp_path)
     content = written_path.read_text(encoding="utf-8")
 
     assert "### Issue 1" in content
-    assert "- **file**: `src/auth.py`" in content
+    assert "- **file**: `src/auth.py:45`" in content
     assert "- **severity**: High" in content
     assert "- **category**: Security" in content
     assert "- **confidence**: 0.95" in content
     assert "Hardcoded secret key detected." in content
     assert "Use environment variables instead." in content
+    assert "- **evidence**: `secret = '123456'`" in content
+    assert "-secret = '123456'" in content
     assert "- Add unit tests for missing token cases." in content
     assert "- Line 45 in src/auth.py: secret = '123456'" in content
     assert "- **Decision**: Request Changes" in content
+    assert "## 8. Review Notes" in content
+    assert "- batch 1/2" in content

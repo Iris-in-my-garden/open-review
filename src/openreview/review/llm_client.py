@@ -89,6 +89,23 @@ class MockLLMClient:
     def __init__(self, custom_schema: Optional[BaseModel] = None):
         self.custom_schema = custom_schema
 
+    @staticmethod
+    def _extract_anchor(user_prompt: str, filename: str) -> tuple[Optional[int], Optional[str]]:
+        """从带行号的 Patch 中取第一处新增/上下文行，作为 line + evidence。"""
+        pattern = rf"^### {re.escape(filename)}\n```diff\n(.*?)\n```"
+        block = re.search(pattern, user_prompt, flags=re.MULTILINE | re.DOTALL)
+        if not block:
+            return None, None
+
+        for raw_line in block.group(1).splitlines():
+            added = re.match(r"^\s*(\d+) \| \+(.*)$", raw_line)
+            if added and added.group(2).strip():
+                return int(added.group(1)), added.group(2).strip()
+            context = re.match(r"^\s*(\d+) \|  (.*)$", raw_line)
+            if context and context.group(2).strip():
+                return int(context.group(1)), context.group(2).strip()
+        return None, None
+
     def generate_structured(
             self,
             system_prompt: str,
@@ -112,6 +129,12 @@ class MockLLMClient:
             secondary_file = (
                 changed_files[1] if len(changed_files) > 1 else primary_file
             )
+            primary_line, primary_evidence = self._extract_anchor(
+                user_prompt, primary_file
+            )
+            secondary_line, secondary_evidence = self._extract_anchor(
+                user_prompt, secondary_file
+            )
 
             # 依据不同情况塞入模拟的 PotentialIssueSchema 列表
             mock_issues = [
@@ -121,7 +144,9 @@ class MockLLMClient:
                     category="security",
                     confidence=0.92,
                     reasoning="发现硬编码的 JWT 密钥或敏感凭证，存在严重的安全隐患。",
-                    suggestion="请将密钥移除，并改用环境变量（如 os.environ.get('JWT_SECRET')）进行加载。"
+                    suggestion="请将密钥移除，并改用环境变量（如 os.environ.get('JWT_SECRET')）进行加载。",
+                    line=primary_line,
+                    evidence=primary_evidence,
                 ),
                 PotentialIssueSchema(
                     file=secondary_file,
@@ -129,7 +154,9 @@ class MockLLMClient:
                     category="clean_code",
                     confidence=0.85,
                     reasoning="函数体过长且嵌套层级较深，可读性较差。",
-                    suggestion="建议将核心逻辑拆分为独立的小函数，遵循单一职责原则（SRP）。"
+                    suggestion="建议将核心逻辑拆分为独立的小函数，遵循单一职责原则（SRP）。",
+                    line=secondary_line,
+                    evidence=secondary_evidence,
                 )
             ]
 

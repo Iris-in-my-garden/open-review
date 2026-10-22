@@ -1,7 +1,11 @@
 """ 给定owner、repo、pr_number，把Github仓库clone到本地缓存目录，并且checkout到pr分支"""
 
 from pathlib import Path
+import logging
+import shutil
 import subprocess
+
+logger = logging.getLogger(__name__)
 
 
 class RepoCommandError(Exception):
@@ -72,3 +76,43 @@ class RepoManager:
 
         # 5. 返回 Path 对象
         return target_dir.resolve()
+
+    def _git_ref_exists(self, ref: str, cwd: Path) -> bool:
+        try:
+            self._run_git_cmd(["cat-file", "-e", f"{ref}^{{commit}}"], cwd=cwd)
+            return True
+        except RepoCommandError:
+            return False
+
+    def prepare_base_worktree(
+        self, owner: str, repo: str, base_sha: str
+    ) -> Path:
+        """把 PR 的 base SHA checkout 到独立 worktree，用于查看被删除代码的上下文。"""
+        repo_dir = (self.base_cache_dir / f"{owner}__{repo}").resolve()
+        base_dir = (self.base_cache_dir / f"{owner}__{repo}__base").resolve()
+
+        if not repo_dir.exists():
+            raise RepoCommandError(
+                ["git", "worktree", "add"],
+                -1,
+                f"Repository cache not found: {repo_dir}",
+            )
+
+        if not self._git_ref_exists(base_sha, repo_dir):
+            self._run_git_cmd(["fetch", "origin", base_sha], cwd=repo_dir)
+
+        if base_dir.exists():
+            try:
+                self._run_git_cmd(
+                    ["worktree", "remove", "--force", str(base_dir)], cwd=repo_dir
+                )
+            except RepoCommandError:
+                # 目录存在但未注册为 worktree，直接清理后 prune
+                shutil.rmtree(base_dir, ignore_errors=True)
+                self._run_git_cmd(["worktree", "prune"], cwd=repo_dir)
+
+        self._run_git_cmd(
+            ["worktree", "add", "--detach", str(base_dir), base_sha], cwd=repo_dir
+        )
+        logger.debug("Base worktree ready at %s (%s)", base_dir, base_sha)
+        return base_dir

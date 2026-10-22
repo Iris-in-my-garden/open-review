@@ -90,14 +90,15 @@ def _fingerprint(issue: IssueLike) -> tuple[str, ...]:
     """
     reasoning = " ".join((getattr(issue, "reasoning", "") or "").lower().split())
     file_key = (issue.file or "").strip().lower()
+    line_key = str(getattr(issue, "line", None) or "")
     if reasoning:
-        return (file_key, reasoning)
+        return (file_key, line_key, reasoning)
 
     category = (getattr(issue, "category", "") or "").strip().lower()
     suggestion = " ".join(
         (getattr(issue, "suggestion", "") or "").lower().split()
     )
-    return (file_key, category, suggestion)
+    return (file_key, line_key, category, suggestion)
 
 
 def deduplicate_issues(issues: Iterable[IssueLike]) -> list:
@@ -125,4 +126,61 @@ def deduplicate_issues(issues: Iterable[IssueLike]) -> list:
             best[key] = issue
 
     return [best[key] for key in order]
+
+
+def _unique_strings(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def merge_review_results(results: list) -> "ReviewResult":
+    """合并多个批次（split_parsed_diff）的审查结果，并重新计算全局结论。"""
+    from openreview.review.report_writer import ReviewResult
+
+    if not results:
+        raise ValueError("No review results to merge.")
+
+    issues = []
+    for result in results:
+        issues.extend(result.potential_issues)
+
+    issues = deduplicate_issues(issues)
+    for issue in issues:
+        issue.severity = normalize_severity(issue.severity)
+
+    risk_level, risk_reason = assess_risk(issues)
+    final_decision = decide(risk_level)
+    first = results[0]
+
+    return ReviewResult(
+        owner=first.owner,
+        repo=first.repo,
+        pr_number=first.pr_number,
+        summary="\n\n".join(result.summary for result in results if result.summary),
+        risk_level=risk_level,
+        risk_reason=risk_reason,
+        key_changes=_unique_strings(
+            change for result in results for change in result.key_changes
+        ),
+        potential_issues=issues,
+        missing_test_suggestions=_unique_strings(
+            suggestion
+            for result in results
+            for suggestion in result.missing_test_suggestions
+        ),
+        evidence=unique_files(issues),
+        final_decision=final_decision,
+        final_summary=(
+            f"合并 {len(results)} 个批次，保留 {len(issues)} 个问题。"
+            f"最终决策: {final_decision} (风险等级: {risk_level})"
+        ),
+        review_notes=_unique_strings(
+            note for result in results for note in result.review_notes
+        ),
+    )
 

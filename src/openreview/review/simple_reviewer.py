@@ -3,12 +3,13 @@ from typing import List, Optional
 
 from openreview.github.client import PullRequestInfo
 from openreview.repo.diff_parser import ParsedDiff
-from openreview.retriever.grep_retriever import CodeContext
+from openreview.retriever.code_context import CodeContext
 from openreview.review.report_writer import ReviewResult
 from openreview.review.prompt_builder import PromptBuilder
 from openreview.review.llm_client import LLMClient, AbstractLLMClient
 from openreview.review.output_parser import OutputParser
 from openreview.review.finding_validator import FindingValidator
+from openreview.review.test_gap import analyze_test_gaps
 
 class Reviewer:
     def __init__(
@@ -48,7 +49,12 @@ class Reviewer:
         }
         review_result = self.output_parser.build_final_result(review_data, metadata)
 
-        # 4. 后置校验与过滤
-        validated_result = self.validator.validate(review_result, parsed_diff)
+        # 4. 后置校验与过滤（带真实上下文做证据核对）
+        validated_result = self.validator.validate(
+            review_result, parsed_diff, contexts=contexts
+        )
+        validated_result.missing_test_suggestions = analyze_test_gaps(
+            parsed_diff, contexts
+        )
 
         return validated_result
