@@ -1,8 +1,10 @@
 from typing import List, Optional, Type
-from pydantic import BaseModel, Field
+
+from pydantic import BaseModel, Field, field_validator
 
 from openreview.review.assessment import (
     SEVERITY_WEIGHTS,
+    Severity,
     assess_risk,
     decide,
     deduplicate_issues,
@@ -11,9 +13,12 @@ from openreview.review.assessment import (
 )
 from openreview.review.report_writer import PotentialIssue, ReviewResult
 
+
 class PotentialIssueSchema(BaseModel):
     file: str = Field(description="发生问题的代码文件路径")
-    severity: str = Field(description="严重程度，取值范围: critical, high, medium, low")
+    severity: Severity = Field(
+        description="严重程度，取值范围: critical, high, medium, low"
+    )
     category: str = Field(description="问题分类，对应当前的审查维度")
     confidence: float = Field(description="置信度分数 0.0 ~ 1.0")
     reasoning: str = Field(description="问题的原理解释与上下文背景")
@@ -34,6 +39,12 @@ class PotentialIssueSchema(BaseModel):
         default=None,
         description="可直接应用的 unified diff 修复片段（可选）",
     )
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _normalize_severity(cls, value: object) -> Severity:
+        return normalize_severity(str(value))
+
 
 class AspectReviewOutputSchema(BaseModel):
     """单个 Worker（维度）的标准输出结构"""
@@ -59,10 +70,10 @@ class ReviewResultSchema(BaseModel):
 
 class OutputParser:
     @property
-    def schema(self) -> Type[BaseModel]:
+    def schema(self) -> Type[ReviewResultSchema]:
         return ReviewResultSchema
 
-    def schema_for_aspect(self, aspect: str) -> Type[BaseModel]:
+    def schema_for_aspect(self, aspect: str) -> Type[AspectReviewOutputSchema]:
         """所有 Worker 维度统一使用该 Schema，确保 LLM 结构化输出稳定性"""
         return AspectReviewOutputSchema
 

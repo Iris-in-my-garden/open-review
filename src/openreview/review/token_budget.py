@@ -7,8 +7,7 @@
 import math
 from typing import List
 
-from openreview.repo.diff_parser import ParsedDiff, ParsedChangedFile
-
+from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
 
 CHARS_PER_TOKEN = 3.0
 TRUNCATION_MARKER = "\n... [内容因 token 预算被截断] ...\n"

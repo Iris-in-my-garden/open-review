@@ -6,12 +6,11 @@ from pydantic import BaseModel
 from openreview.github.client import PullRequestInfo
 from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
 from openreview.review.aspect_reviewer import ReviewOrchestrator
+from openreview.review.assessment import merge_review_results
 from openreview.review.output_parser import (
-    AspectReviewOutputSchema,
     PotentialIssueSchema,
 )
 from openreview.review.report_writer import PotentialIssue, ReviewResult
-from openreview.review.assessment import merge_review_results
 
 T = TypeVar("T", bound=BaseModel)
 

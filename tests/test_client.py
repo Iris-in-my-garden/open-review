@@ -4,7 +4,7 @@ import time
 import httpx
 import pytest
 
-from openreview.github.client import GitHubClient, GitHubPRRef, GitHubAPIError
+from openreview.github.client import GitHubAPIError, GitHubClient, GitHubPRRef
 
 
 def _client_with_handler(handler, token: str | None = None) -> GitHubClient:

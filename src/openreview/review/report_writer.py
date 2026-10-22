@@ -1,12 +1,15 @@
 """ 把 ReviewResult 写成 Markdown 文件。 """
 from pathlib import Path
-from typing import List, Optional
-from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field, field_validator
+
+from openreview.review.assessment import Severity, normalize_severity
 
 
 class PotentialIssue(BaseModel):
     file: str
-    severity: str
+    severity: Severity
     category: str
     confidence: float
     reasoning: str
@@ -15,6 +18,11 @@ class PotentialIssue(BaseModel):
     end_line: Optional[int] = None
     evidence: Optional[str] = None
     suggested_patch: Optional[str] = None
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _normalize_severity(cls, value: object) -> Severity:
+        return normalize_severity(str(value))
 
 
 class ReviewResult(BaseModel):
@@ -31,6 +39,7 @@ class ReviewResult(BaseModel):
     final_decision: str
     final_summary: str
     review_notes: List[str] = Field(default_factory=list)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ReportWriter:
@@ -127,11 +136,33 @@ class ReportWriter:
             ]
         )
 
-        # 8. Review Notes（可选：批次、失败维度、注入告警等）
-        if result.review_notes:
+        # 8. Review Notes & Run Metrics
+        if result.review_notes or result.metrics:
             md_lines.append("## 8. Review Notes")
             for note in result.review_notes:
                 md_lines.append(f"- {note}")
+
+            metrics = result.metrics or {}
+            if metrics:
+                md_lines.extend(["", "### Run Metrics"])
+                stages = metrics.get("stages_seconds")
+                if isinstance(stages, dict):
+                    stage_text = ", ".join(
+                        f"{name}={seconds:.2f}s"
+                        for name, seconds in stages.items()
+                    )
+                    md_lines.append(f"- **Stages**: {stage_text}")
+                for key, label in (
+                    ("files", "Files"),
+                    ("batches", "Batches"),
+                    ("aspects", "Aspects"),
+                    ("llm_calls", "LLM Calls"),
+                    ("estimated_patch_tokens", "Estimated Patch Tokens"),
+                    ("estimated_context_tokens", "Estimated Context Tokens"),
+                    ("total_seconds", "Total Seconds"),
+                ):
+                    if key in metrics:
+                        md_lines.append(f"- **{label}**: {metrics[key]}")
             md_lines.append("")
 
         return "\n".join(md_lines)

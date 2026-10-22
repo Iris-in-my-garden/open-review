@@ -121,6 +121,8 @@ def test_pipeline_batches_merges_and_posts_comments(tmp_path: Path):
     content = report_path.read_text(encoding="utf-8")
     assert "2 个批次" in content
     assert "## 8. Review Notes" in content
+    assert "### Run Metrics" in content
+    assert "**Batches**: 2" in content
 
     # 两个文件各成一批，检索器与 reviewer 都被调用两次
     assert len(pipeline.retriever.calls) == 2

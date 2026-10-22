@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 # 引入 tree-sitter
-from tree_sitter import Language, Parser, Node, Tree
+from tree_sitter import Language, Node, Parser, Tree
 
 from openreview.repo.diff_parser import DiffParser, ParsedDiff
 from openreview.retriever.code_context import CodeContext

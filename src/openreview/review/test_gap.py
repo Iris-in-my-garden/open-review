@@ -5,7 +5,6 @@ from typing import List, Sequence
 from openreview.repo.diff_parser import DiffParser, ParsedDiff
 from openreview.retriever.code_context import CodeContext
 
-
 MAX_TEST_SUGGESTIONS = 6
 
 

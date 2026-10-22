@@ -1,5 +1,7 @@
 # openreview/cli.py
+import logging
 from pathlib import Path
+
 import typer
 
 from openreview.repo.manager import RepoCommandError
@@ -65,7 +67,31 @@ def review(
         "--max-workers",
         help="Max parallel aspect reviewers",
     ),
+    retriever: str = typer.Option(
+        "tree_sitter",
+        "--retriever",
+        help="Context retriever: tree_sitter (default) or grep (ablation baseline)",
+    ),
+    reviewer_mode: str = typer.Option(
+        "multi",
+        "--reviewer",
+        help="Reviewer mode: multi (4 aspects, default) or single (ablation baseline)",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Enable debug logging",
+    ),
 ):
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logging.getLogger("openreview").setLevel(
+        logging.DEBUG if verbose else logging.INFO
+    )
+
     def print_progress(step: int, msg: str):
         typer.secho(f"--> [{step}/8] {msg}", fg=typer.colors.CYAN)
 
@@ -78,6 +104,8 @@ def review(
             mock_llm=mock_llm,
             max_batch_tokens=max_batch_tokens,
             max_workers=max_workers,
+            retriever=retriever,
+            reviewer_mode=reviewer_mode,
         )
         report_path = pipeline.run(
             pr_url,
@@ -96,7 +124,7 @@ def review(
         typer.secho(
             f"\n❌ Git Command Error: {e.stderr}", fg=typer.colors.RED, err=True
         )
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from e
     except Exception as e:
         err_msg = str(e)
         if github_token and github_token in err_msg:
@@ -105,7 +133,7 @@ def review(
         typer.secho(
             f"\n❌ Review failed: {err_msg}", fg=typer.colors.RED, err=True
         )
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from e
     finally:
         if pipeline is not None:
             pipeline.close()

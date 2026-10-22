@@ -1,10 +1,11 @@
 import os
 import re
-from typing import Optional, Type, TypeVar, Protocol
-from pydantic import BaseModel
-from openai import OpenAI
+from typing import Any, Optional, Protocol, Type, TypeVar
 
-from openreview.review.output_parser import ReviewResultSchema, PotentialIssueSchema
+from openai import OpenAI
+from pydantic import BaseModel
+
+from openreview.review.output_parser import PotentialIssueSchema
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -43,10 +44,10 @@ class LLMClient:
                 "或使用 `openreview review <PR_URL> --mock_llm` 进行离线演示。"
             )
 
-        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o")
+        self.model: str = model or os.getenv("OPENAI_MODEL") or "gpt-4o"
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
 
-        client_kwargs = {
+        client_kwargs: dict[str, Any] = {
             "api_key": self.api_key,
             "timeout": timeout,
             "max_retries": max_retries,

@@ -1,5 +1,6 @@
 # tests/test_report_writer.py
 from pathlib import Path
+
 from openreview.review.report_writer import (
     PotentialIssue,
     ReportWriter,
@@ -94,7 +95,7 @@ def test_write_report_with_findings(tmp_path: Path):
 
     assert "### Issue 1" in content
     assert "- **file**: `src/auth.py:45`" in content
-    assert "- **severity**: High" in content
+    assert "- **severity**: high" in content
     assert "- **category**: Security" in content
     assert "- **confidence**: 0.95" in content
     assert "Hardcoded secret key detected." in content
@@ -106,3 +107,54 @@ def test_write_report_with_findings(tmp_path: Path):
     assert "- **Decision**: Request Changes" in content
     assert "## 8. Review Notes" in content
     assert "- batch 1/2" in content
+
+def test_severity_is_normalized_to_literal_values():
+    issue = PotentialIssue(
+        file="src/auth.py",
+        severity="HIGH",
+        category="Security",
+        confidence=0.9,
+        reasoning="Issue.",
+        suggestion="Fix it.",
+    )
+    assert issue.severity == "high"
+
+    chinese = PotentialIssue(
+        file="src/auth.py",
+        severity="严重",
+        category="Security",
+        confidence=0.9,
+        reasoning="Issue.",
+        suggestion="Fix it.",
+    )
+    assert chinese.severity == "critical"
+
+
+def test_run_metrics_are_rendered(tmp_path: Path):
+    result = ReviewResult(
+        owner="org",
+        repo="project",
+        pr_number=1,
+        summary="Summary.",
+        risk_level="LOW",
+        risk_reason="Reason.",
+        final_decision="APPROVE",
+        final_summary="LGTM.",
+        metrics={
+            "stages_seconds": {"fetch_pr": 0.25, "retrieve_and_review": 1.5},
+            "files": 2,
+            "batches": 1,
+            "aspects": 4,
+            "llm_calls": 4,
+            "estimated_patch_tokens": 120,
+            "estimated_context_tokens": 80,
+            "total_seconds": 1.75,
+        },
+    )
+
+    content = ReportWriter.render_markdown(result)
+
+    assert "### Run Metrics" in content
+    assert "**Stages**: fetch_pr=0.25s, retrieve_and_review=1.50s" in content
+    assert "**LLM Calls**: 4" in content
+    assert "**Estimated Patch Tokens**: 120" in content

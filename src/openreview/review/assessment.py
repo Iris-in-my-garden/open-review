@@ -5,10 +5,19 @@
 """
 
 from collections import Counter
-from typing import Iterable, Protocol, Tuple
+from typing import TYPE_CHECKING, Iterable, Literal, Protocol, Tuple, cast
 
+if TYPE_CHECKING:
+    from openreview.review.report_writer import ReviewResult
 
-SEVERITY_WEIGHTS = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+Severity = Literal["critical", "high", "medium", "low"]
+
+SEVERITY_WEIGHTS: dict[Severity, int] = {
+    "critical": 4,
+    "high": 3,
+    "medium": 2,
+    "low": 1,
+}
 
 # 兼容 LLM 可能返回的同义词
 _SEVERITY_ALIASES = {
@@ -20,20 +29,27 @@ _SEVERITY_ALIASES = {
     "trivial": "low",
     "info": "low",
     "informational": "low",
+    "致命": "critical",
+    "严重": "critical",
+    "高": "high",
+    "中": "medium",
+    "低": "low",
 }
 
 
 class IssueLike(Protocol):
-    severity: str
+    severity: Severity
     confidence: float
     file: str
 
 
-def normalize_severity(value: str) -> str:
+def normalize_severity(value: str) -> Severity:
     """把 LLM 输出的大小写/同义词统一成标准等级。"""
     normalized = (value or "").strip().lower()
     normalized = _SEVERITY_ALIASES.get(normalized, normalized)
-    return normalized if normalized in SEVERITY_WEIGHTS else "medium"
+    if normalized in SEVERITY_WEIGHTS:
+        return cast(Severity, normalized)
+    return "medium"
 
 
 def assess_risk(issues: Iterable[IssueLike]) -> Tuple[str, str]:

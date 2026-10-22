@@ -1,10 +1,12 @@
+import logging
 import re
 from pathlib import Path
-from typing import List, Set
+from typing import List, Optional, Set
 
+from openreview.repo.diff_parser import DiffParser, ParsedDiff
 from openreview.retriever.code_context import CodeContext
 
-from openreview.repo.diff_parser import ParsedDiff
+logger = logging.getLogger(__name__)
 
 EXCLUDE_DIRS = {
     ".git",
@@ -24,7 +26,13 @@ MAX_CONTEXT_COUNT = 20
 
 class GrepRetriever:
 
-    def retrieve(self, repo_path: Path, parsed_diff: ParsedDiff) -> List[CodeContext]:
+    def retrieve(
+        self,
+        repo_path: Path,
+        parsed_diff: ParsedDiff,
+        base_path: Optional[Path] = None,
+    ) -> List[CodeContext]:
+        _ = base_path  # grep 基线暂不读取 base 版本，仅保持接口一致
         repo_path = Path(repo_path).resolve()
         if not repo_path.exists() or not repo_path.is_dir():
             return []
@@ -32,17 +40,14 @@ class GrepRetriever:
         results: List[CodeContext] = []
         seen_keys: Set[str] = set()
 
-        # 1. 预处理：提取所有改动文件的 stem，扩展多语言测试文件匹配规则
-        changed_stems = {Path(f.filename).stem for f in parsed_diff.files}
-        possible_test_names = set()
-        for stem in changed_stems:
-            possible_test_names.update({
-                f"test_{stem}.py",
-                f"{stem}_test.py",
-                f"{stem}.test.ts",
-                f"{stem}.spec.ts",
-                f"{stem}_test.go",
-            })
+        # 1. 预处理：复用统一的测试文件约定，避免和 AST 检索器行为分叉
+        changed_files = [f.filename for f in parsed_diff.files]
+
+        def is_linked_test(rel_path: str) -> bool:
+            return DiffParser.is_test_path(rel_path) and any(
+                DiffParser.is_linked_test(source, rel_path)
+                for source in changed_files
+            )
 
         # 2. 预处理：收集所有需要搜索的 Symbol 并预编译正则
         all_symbols: Set[str] = set()
@@ -74,7 +79,7 @@ class GrepRetriever:
                 text = None  # 延迟读取，按需加载
 
                 # 策略一：检查是否为关联的测试文件
-                if p.name in possible_test_names:
+                if is_linked_test(str(rel_path)):
                     text = p.read_text(encoding="utf-8", errors="ignore")
                     lines = text.splitlines()[:MAX_SNIPPET_LINES]
                     key = f"{rel_path_str}:test_file"
@@ -132,7 +137,7 @@ class GrepRetriever:
 
         # 4. 统一降序排序并截断至最大限制
         results.sort(key=lambda x: x.score, reverse=True)
-        print(f"[DEBUG] Optimized Contexts count: {len(results)}")
+        logger.debug("GrepRetriever contexts: %d", len(results))
         return results[:MAX_CONTEXT_COUNT]
 
     def _is_excluded(self, path: Path) -> bool:

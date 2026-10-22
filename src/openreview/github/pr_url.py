@@ -3,7 +3,6 @@ import re
 
 from pydantic import BaseModel
 
-
 PR_URL_PATTERN = re.compile(
     r"""^
     https?://(?:www\.)?github\.com/
@@ -25,5 +24,9 @@ def parse_pr_url(url: str) -> GitHubPRRef:
     match = PR_URL_PATTERN.match(url.strip())
     if match is None:
         raise ValueError(f"Invalid PR URL: {url}")
-    return GitHubPRRef(**match.groupdict())
+    return GitHubPRRef(
+        owner=match.group("owner"),
+        repo=match.group("repo"),
+        pr_number=int(match.group("pr_number")),
+    )
 

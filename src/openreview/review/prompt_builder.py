@@ -7,7 +7,6 @@ from openreview.repo.diff_parser import HUNK_RANGE_PATTERN, ParsedDiff
 from openreview.retriever.code_context import CodeContext
 from openreview.review.token_budget import estimate_tokens, truncate_to_tokens
 
-
 UNTRUSTED_START = "<untrusted_input>"
 UNTRUSTED_END = "</untrusted_input>"
 

@@ -1,14 +1,16 @@
 # test_manager.py
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
 import pytest
 
-from openreview.repo.manager import RepoCommandError, RepoManager
+from openreview.repo.manager import RepoCommandError, RepoManager, default_cache_dir
 
 
 @pytest.fixture
 def manager():
-    return RepoManager(cache_dir=".cache/repos", timeout=30)
+    return RepoManager(cache_dir=".cache/repos", timeout=30, max_cache_size_gb=0)
 
 
 @patch("subprocess.run")
@@ -30,8 +32,10 @@ def test_prepare_pr_repo_clone_new(mock_exists, mock_run, manager):
                 [
                     "git",
                     "clone",
+                    "--no-tags",
+                    "--filter=blob:none",
                     "https://github.com/owner_a/repo_b.git",
-                    str(Path(".cache/repos/owner_a__repo_b")),
+                    str(Path(".cache/repos/owner_a__repo_b").resolve()),
                 ],
             ),
             {"cwd": None},
@@ -39,17 +43,17 @@ def test_prepare_pr_repo_clone_new(mock_exists, mock_run, manager):
         # 清理工作区
         (
             (["git", "reset", "--hard"],),
-            {"cwd": Path(".cache/repos/owner_a__repo_b")},
+            {"cwd": Path(".cache/repos/owner_a__repo_b").resolve()},
         ),
         # Fetch PR HEAD
         (
             (["git", "fetch", "origin", "pull/123/head"],),
-            {"cwd": Path(".cache/repos/owner_a__repo_b")},
+            {"cwd": Path(".cache/repos/owner_a__repo_b").resolve()},
         ),
         # Checkout PR Branch
         (
             (["git", "checkout", "-B", "pr-123", "FETCH_HEAD"],),
-            {"cwd": Path(".cache/repos/owner_a__repo_b")},
+            {"cwd": Path(".cache/repos/owner_a__repo_b").resolve()},
         ),
     ]
 
@@ -146,3 +150,40 @@ def test_prepare_base_worktree_replaces_stale_directory(
         str(expected_base),
         "base-sha",
     ]
+
+def test_default_cache_dir_respects_env(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("OPENREVIEW_CACHE_DIR", str(tmp_path / "cache"))
+    assert default_cache_dir() == (tmp_path / "cache").resolve()
+
+
+def test_prune_cache_evicts_oldest_repository(tmp_path: Path):
+    manager = RepoManager(cache_dir=tmp_path, max_cache_size_gb=0.000001)
+
+    old = tmp_path / "old__repo"
+    new = tmp_path / "new__repo"
+    old.mkdir()
+    new.mkdir()
+    (old / "blob").write_bytes(b"x" * 900)
+    (new / "blob").write_bytes(b"x" * 900)
+    os.utime(old, (1, 1))
+
+    manager._prune_cache()
+
+    assert not old.exists()
+    assert new.exists()
+
+
+@patch("subprocess.run")
+def test_clone_falls_back_to_full_clone(mock_run, tmp_path: Path):
+    manager = RepoManager(cache_dir=tmp_path, max_cache_size_gb=0)
+    mock_run.side_effect = [
+        MagicMock(returncode=1, stderr="filter unsupported", stdout=""),
+        MagicMock(returncode=0, stderr="", stdout=""),
+    ]
+
+    manager._clone_repo("https://github.com/org/repo.git", tmp_path / "repo")
+
+    first = mock_run.call_args_list[0].args[0]
+    second = mock_run.call_args_list[1].args[0]
+    assert "--filter=blob:none" in first
+    assert "--filter=blob:none" not in second
