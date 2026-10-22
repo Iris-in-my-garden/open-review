@@ -34,11 +34,16 @@ class GitHubAPIError(Exception):
     pass
 
 class GitHubClient:
-    def __init__(self, token: Optional[str] = None):
+    def __init__(
+        self,
+        token: Optional[str] = None,
+        transport: Optional[httpx.BaseTransport] = None,
+    ):
         self.token = token or os.getenv("GITHUB_TOKEN")
         self.client = httpx.Client(
             base_url="https://api.github.com",
-            headers=self._get_headers()
+            headers=self._get_headers(),
+            transport=transport,
         )
 
     def _get_headers(self) -> dict:

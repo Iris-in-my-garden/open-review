@@ -36,19 +36,24 @@ def test_prepare_pr_repo_clone_new(mock_exists, mock_run, manager):
             ),
             {"cwd": None},
         ),
-        # Fetch PR
+        # 清理工作区
         (
-            (["git", "fetch", "origin", "pull/123/head:pr-123"],),
+            (["git", "reset", "--hard"],),
             {"cwd": Path(".cache/repos/owner_a__repo_b")},
         ),
-        # Checkout PR branch
+        # Fetch PR HEAD
         (
-            (["git", "checkout", "pr-123"],),
+            (["git", "fetch", "origin", "pull/123/head"],),
+            {"cwd": Path(".cache/repos/owner_a__repo_b")},
+        ),
+        # Checkout PR Branch
+        (
+            (["git", "checkout", "-B", "pr-123", "FETCH_HEAD"],),
             {"cwd": Path(".cache/repos/owner_a__repo_b")},
         ),
     ]
 
-    assert mock_run.call_count == 3
+    assert mock_run.call_count == len(expected_calls)
     for idx, (args, kwargs) in enumerate(expected_calls):
         call_args = mock_run.call_args_list[idx]
         assert call_args.args[0] == args[0]
@@ -67,14 +72,20 @@ def test_prepare_pr_repo_fetch_existing(mock_exists, mock_run, manager):
 
     # 验证 git 命令调用顺序
     assert mock_run.call_count == 3
-    assert mock_run.call_args_list[0].args[0] == ["git", "fetch", "origin"]
+    assert mock_run.call_args_list[0].args[0] == ["git", "reset", "--hard"]
     assert mock_run.call_args_list[1].args[0] == [
         "git",
         "fetch",
         "origin",
-        "pull/456/head:pr-456",
+        "pull/456/head",
     ]
-    assert mock_run.call_args_list[2].args[0] == ["git", "checkout", "pr-456"]
+    assert mock_run.call_args_list[2].args[0] == [
+        "git",
+        "checkout",
+        "-B",
+        "pr-456",
+        "FETCH_HEAD",
+    ]
 
 
 @patch("subprocess.run")

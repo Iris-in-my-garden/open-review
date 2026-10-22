@@ -1,6 +1,14 @@
 from typing import List, Type, Dict, Any
 from pydantic import BaseModel, Field
 
+from openreview.review.assessment import (
+    SEVERITY_WEIGHTS,
+    assess_risk,
+    decide,
+    deduplicate_issues,
+    normalize_severity,
+    unique_files,
+)
 from openreview.review.report_writer import PotentialIssue, ReviewResult
 
 class PotentialIssueSchema(BaseModel):
@@ -60,37 +68,36 @@ class OutputParser:
             if data.issues:
                 all_issues.extend(data.issues)
 
+        # 同一问题可能被多个维度重复报告，先去重，避免重复计数抬高风险等级
+        all_issues = deduplicate_issues(all_issues)
+
+        # 统一严重级别，避免 High / HIGH / major 混排
+        for issue in all_issues:
+            issue.severity = normalize_severity(issue.severity)
+
         # 按照严重程度降序排序 (Critical/High 优先展示)
-        severity_weight = {"critical": 4, "high": 3, "medium": 2, "low": 1}
-        all_issues.sort(key=lambda x: severity_weight.get(x.severity.lower(), 0), reverse=True)
+        all_issues.sort(
+            key=lambda x: SEVERITY_WEIGHTS.get(normalize_severity(x.severity), 0),
+            reverse=True,
+        )
 
-        # 综合风险等级评估
-        has_critical = any(i.severity.lower() == "critical" for i in all_issues)
-        has_high = any(i.severity.lower() == "high" for i in all_issues)
-
-        risk_level = "LOW"
-        if has_critical:
-            risk_level = "CRITICAL"
-        elif has_high:
-            risk_level = "HIGH"
-        elif len(all_issues) > 3:
-            risk_level = "MEDIUM"
-
-        final_decision = "APPROVE" if risk_level in ["LOW", "MEDIUM"] else "REQUEST_CHANGES"
+        risk_level, risk_reason = assess_risk(all_issues)
+        final_decision = decide(risk_level)
 
         combined_summary = "\n".join(aspect_summaries)
 
         return ReviewResultSchema(
             summary=combined_summary,
             risk_level=risk_level,
-            risk_reason=f"基于多维度（Clean Code、逻辑Bug、性能优化、安全漏洞）分析，共发现 {len(all_issues)} 个潜在问题。",
+            risk_reason=risk_reason,
             key_changes=["多维度并行代码评审已完成"],
             potential_issues=all_issues,
             missing_test_suggestions=["建议针对本次审查发现的边界条件与潜在逻辑漏洞补充自动化单元测试。"],
-            evidence=[issue.file for issue in all_issues],
+            evidence=unique_files(all_issues),
             final_decision=final_decision,
             final_summary=f"多维度评审结束。最终决策: {final_decision} (风险等级: {risk_level})"
         )
+
 
     def build_final_result(self, review_data: ReviewResultSchema, metadata: dict) -> ReviewResult:
         return ReviewResult(

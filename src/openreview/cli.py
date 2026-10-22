@@ -31,7 +31,19 @@ def review(
         None,
         "--token",
         envvar="GITHUB_TOKEN",
-        help="GitHub Personal Access Token",
+        help="GitHub Personal Access Token (仅用于访问 GitHub API)",
+    ),
+    llm_model: str = typer.Option(
+        None,
+        "--model",
+        envvar="OPENAI_MODEL",
+        help="LLM model name (default: gpt-4o)",
+    ),
+    llm_base_url: str = typer.Option(
+        None,
+        "--base-url",
+        envvar="OPENAI_BASE_URL",
+        help="OpenAI-compatible API base URL",
     ),
     mock_llm: bool = typer.Option(
         False,
@@ -43,7 +55,12 @@ def review(
         typer.secho(f"--> [{step}/7] {msg}", fg=typer.colors.CYAN)
 
     try:
-        pipeline = ReviewPipeline(github_token=github_token, mock_llm=mock_llm)
+        pipeline = ReviewPipeline(
+            github_token=github_token,
+            llm_model=llm_model,
+            llm_base_url=llm_base_url,
+            mock_llm=mock_llm,
+        )
         report_path = pipeline.run(
             pr_url, output, progress_cb=print_progress
         )

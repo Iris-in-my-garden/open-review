@@ -1,15 +1,31 @@
+import logging
 import subprocess
 from pathlib import Path
-from typing import List, Set, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # 引入 tree-sitter
-from tree_sitter import Language, Parser, Node
+from tree_sitter import Language, Parser, Node, Tree
 
 from openreview.repo.diff_parser import ParsedDiff
 from openreview.retriever.code_context import CodeContext
 
+logger = logging.getLogger(__name__)
+
 MAX_CONTEXT_COUNT = 20
 MAX_FILE_SIZE = 500 * 1024  # 500 KB 限制
+MAX_SEARCH_TARGETS = 200
+
+# 打分：变更行所在的函数/类 > 符号定义 > 符号引用
+SCORE_ENCLOSING = 0.95
+SCORE_DEFINITION = 0.90
+SCORE_REFERENCE = 0.65
+
+DEFINITION_TYPES = {
+    "function_definition", "class_definition", "method_definition",  # Python
+    "function_declaration", "method_declaration", "type_declaration",  # Golang
+}
+
+LoadedFile = Tuple[str, List[str], bytes, Tree]
 
 
 class TreeSitterLocalRetriever:
@@ -38,31 +54,138 @@ class TreeSitterLocalRetriever:
             pass
 
     def retrieve(self, repo_path: Path, parsed_diff: ParsedDiff) -> List[CodeContext]:
-        print(f"[DEBUG] TreeSitterLocalRetriever parsed_diff: {parsed_diff}, repo_path: {repo_path}")
         repo_path = Path(repo_path).resolve()
         if not repo_path.exists() or not repo_path.is_dir():
             return []
 
-        search_targets = self._extract_search_targets(parsed_diff)
-        print(f"[DEBUG] TreeSitterLocalRetriever search_targets: {search_targets}")
-        if not search_targets:
-            return []
+        # 同一次检索内复用已读取/已解析的文件，避免同一文件被反复 parse
+        file_cache: Dict[Path, Optional[LoadedFile]] = {}
+        seen_node_ranges: Set[Tuple[str, int, int]] = set()
 
-        contexts = self._search_with_git_grep(repo_path, search_targets)
+        # 1. 先处理“变更行所在的函数/类”。即使 PR 只改了函数体、没有改签名，
+        #    也能拿到完整上下文（修复只改函数体时检索为空的问题）。
+        enclosing_contexts, enclosing_names = self._collect_changed_line_contexts(
+            repo_path, parsed_diff, seen_node_ranges, file_cache
+        )
+
+        # 2. 再用符号做全局检索。把变更行所属的函数/类也加入搜索目标，
+        #    这样能顺带找到它的调用方。
+        search_targets = self._extract_search_targets(parsed_diff) | enclosing_names
+        logger.debug("Search targets: %s", sorted(search_targets))
+
+        contexts = enclosing_contexts + self._search_with_git_grep(
+            repo_path, search_targets, seen_node_ranges, file_cache
+        )
 
         contexts.sort(key=lambda x: x.score, reverse=True)
-        print(f"[DEBUG] TreeSitterLocalRetriever Contexts count: {len(contexts)}")
+        logger.debug("Retrieved %d contexts", len(contexts))
         return contexts[:MAX_CONTEXT_COUNT]
 
     def _extract_search_targets(self, parsed_diff: ParsedDiff) -> Set[str]:
-        """从 Diff 中收集所有变更符号与上下文符号"""
+        """从 Diff 中收集所有变更/删除符号与 Hunk 上下文符号。"""
         targets: Set[str] = set()
         for file_diff in parsed_diff.files:
-            if hasattr(file_diff, "changed_symbols") and file_diff.changed_symbols:
-                targets.update(file_diff.changed_symbols)
-            if hasattr(file_diff, "enclosing_contexts") and file_diff.enclosing_contexts:
-                targets.update(file_diff.enclosing_contexts)
-        return targets
+            targets.update(file_diff.changed_symbols or [])
+            targets.update(getattr(file_diff, "removed_symbols", []) or [])
+            targets.update(file_diff.enclosing_contexts or [])
+        return {target.strip() for target in targets if target and target.strip()}
+
+    def _collect_changed_line_contexts(
+        self,
+        repo_path: Path,
+        parsed_diff: ParsedDiff,
+        seen_node_ranges: Set[Tuple[str, int, int]],
+        file_cache: Dict[Path, Optional[LoadedFile]],
+    ) -> Tuple[List[CodeContext], Set[str]]:
+        """把每个变更行映射到其所在的函数/类，并抽取完整 AST 片段。"""
+        contexts: List[CodeContext] = []
+        definition_names: Set[str] = set()
+
+        for file_diff in parsed_diff.files:
+            if not file_diff.changed_lines or file_diff.status == "removed":
+                continue
+            if Path(file_diff.filename).suffix not in self.parsers:
+                continue
+
+            abs_path = self._resolve_repo_file(repo_path, file_diff.filename)
+            if abs_path is None:
+                continue
+
+            loaded = self._load_file(abs_path, file_cache)
+            if loaded is None:
+                continue
+
+            _, lines, source, tree = loaded
+            for line_number in file_diff.changed_lines:
+                target_idx = line_number - 1
+                if target_idx < 0 or target_idx >= len(lines):
+                    continue
+
+                node = self._find_enclosing_definition(tree.root_node, target_idx)
+                if node is None:
+                    continue
+
+                name = self._definition_name(node, source)
+                if name:
+                    definition_names.add(name)
+
+                unique_key = (file_diff.filename, node.start_point[0], node.end_point[0])
+                if unique_key in seen_node_ranges:
+                    continue
+                seen_node_ranges.add(unique_key)
+
+                start_row, end_row = node.start_point[0], node.end_point[0]
+                snippet = "\n".join(lines[start_row:end_row + 1])
+                display_name = name or "unknown"
+                contexts.append(
+                    CodeContext(
+                        file_path=file_diff.filename,
+                        reason=(
+                            f"Enclosing {node.type} '{display_name}' of changed line "
+                            f"{line_number} (lines {start_row + 1}-{end_row + 1})"
+                        ),
+                        snippet=snippet,
+                        score=SCORE_ENCLOSING,
+                    )
+                )
+
+        return contexts, definition_names
+
+    def _resolve_repo_file(self, repo_path: Path, rel_path_str: str) -> Optional[Path]:
+        """把仓库相对路径解析为绝对路径，并阻止 ../ 越界。"""
+        candidate = (repo_path / rel_path_str).resolve()
+        try:
+            candidate.relative_to(repo_path)
+        except ValueError:
+            logger.warning("Skip path outside repository: %s", rel_path_str)
+            return None
+        return candidate
+
+    def _load_file(
+        self, file_path: Path, cache: Dict[Path, Optional[LoadedFile]]
+    ) -> Optional[LoadedFile]:
+        if file_path in cache:
+            return cache[file_path]
+
+        parser = self.parsers.get(file_path.suffix)
+        if parser is None:
+            cache[file_path] = None
+            return None
+
+        try:
+            if not file_path.exists() or file_path.stat().st_size > MAX_FILE_SIZE:
+                cache[file_path] = None
+                return None
+            text = file_path.read_text(encoding="utf-8", errors="ignore")
+            source = text.encode("utf-8")
+            tree = parser.parse(source)
+            loaded: LoadedFile = (text, text.splitlines(), source, tree)
+            cache[file_path] = loaded
+            return loaded
+        except OSError as exc:
+            logger.debug("Failed to read %s: %s", file_path, exc)
+            cache[file_path] = None
+            return None
 
     def _is_valid_source_file(self, rel_path_str: str) -> bool:
         """【通用路径剪枝】仅基于目录结构过滤文档与缓存，不硬编码任何具体文件名"""
@@ -70,163 +193,177 @@ class TreeSitterLocalRetriever:
         parts = path.parts
 
         # 排除常见文档、打包、虚机及缓存目录
-        excluded_dirs = {"docs", "site-packages", ".cache", "examples", "node_modules", "dist", "build"}
+        excluded_dirs = {
+            ".git", ".idea", ".tox", ".venv", "__pycache__", "venv",
+            "docs", "site-packages", ".cache", "examples", "node_modules",
+            "dist", "build",
+        }
         if any(p in parts for p in excluded_dirs):
             return False
 
         # 仅放行支持的源码文件后缀
         return path.suffix in self.parsers
 
-    def _search_with_git_grep(self, repo_path: Path, targets: Set[str]) -> List[CodeContext]:
+    def _search_with_git_grep(
+        self,
+        repo_path: Path,
+        targets: Set[str],
+        seen_node_ranges: Set[Tuple[str, int, int]],
+        file_cache: Dict[Path, Optional[LoadedFile]],
+    ) -> List[CodeContext]:
         contexts: List[CodeContext] = []
-        # 使用 AST 节点范围作为去重 Key，消除同一代码块多行命中引起的重复
-        seen_node_ranges: Set[Tuple[str, int, int]] = set()
 
-        valid_targets = [s.strip() for s in targets if s and s.strip()]
+        valid_targets = sorted(target for target in targets if target and target.strip())
         if not valid_targets:
             return []
 
-        cmd = [
-            "git",
-            "-C", str(repo_path),
-            "grep",
-            "-n",
-            "-I",
-            "-w"
-        ]
+        if len(valid_targets) > MAX_SEARCH_TARGETS:
+            logger.warning(
+                "Too many search targets (%d), truncating to %d",
+                len(valid_targets),
+                MAX_SEARCH_TARGETS,
+            )
+            valid_targets = valid_targets[:MAX_SEARCH_TARGETS]
 
-        for sym in valid_targets:
-            cmd.extend(["-e", sym])
+        cmd = ["git", "-C", str(repo_path), "grep", "-n", "-I", "-w"]
+        for symbol in valid_targets:
+            cmd.extend(["-e", symbol])
 
         try:
             process = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if process.returncode not in (0, 1):
+                logger.warning("git grep failed with code %d", process.returncode)
                 return []
+        except FileNotFoundError as exc:
+            raise RuntimeError("Git is required but not found in system path.") from exc
 
-            for line in process.stdout.splitlines():
-                try:
-                    parts = line.split(":", 2)
-                    if len(parts) < 3:
-                        continue
+        for line in process.stdout.splitlines():
+            try:
+                rel_path_str, line_str, _ = line.split(":", 2)
 
-                    rel_path_str, line_str, _ = parts
-
-                    if not self._is_valid_source_file(rel_path_str):
-                        continue
-
-                    try:
-                        line_number = int(line_str)
-                    except ValueError:
-                        continue
-
-                    abs_file_path = (repo_path / rel_path_str).resolve()
-                    if not abs_file_path.exists() or abs_file_path.stat().st_size > MAX_FILE_SIZE:
-                        continue
-
-                    # 核心：通过 Tree-sitter 提取 AST 边界并判断定义/引用
-                    snippet, reason, is_def, node_range = self._extract_snippet_with_ast(
-                        abs_file_path, line_number, valid_targets
-                    )
-
-                    if not snippet or not node_range:
-                        continue
-
-                    unique_key = (rel_path_str, node_range[0], node_range[1])
-                    if unique_key not in seen_node_ranges:
-                        seen_node_ranges.add(unique_key)
-
-                        # 定义给予较高权重，引用给予基础权重
-                        score = 0.90 if is_def else 0.65
-
-                        contexts.append(
-                            CodeContext(
-                                file_path=rel_path_str,
-                                reason=reason,
-                                snippet=snippet,
-                                score=score
-                            )
-                        )
-                except Exception as e:
-                    print(f"[DEBUG] error parsing grep line: {e}")
+                if not self._is_valid_source_file(rel_path_str):
                     continue
 
-        except FileNotFoundError:
-            raise RuntimeError("Git is required but not found in system path.")
+                try:
+                    line_number = int(line_str)
+                except ValueError:
+                    continue
+
+                abs_file_path = self._resolve_repo_file(repo_path, rel_path_str)
+                if abs_file_path is None:
+                    continue
+
+                # 核心：通过 Tree-sitter 提取 AST 边界并判断定义/引用
+                snippet, reason, is_def, node_range = self._extract_snippet_with_ast(
+                    abs_file_path, line_number, valid_targets, file_cache
+                )
+
+                if not snippet or not node_range:
+                    continue
+
+                unique_key = (rel_path_str, node_range[0], node_range[1])
+                if unique_key in seen_node_ranges:
+                    continue
+                seen_node_ranges.add(unique_key)
+
+                # 定义给予较高权重，引用给予基础权重
+                score = SCORE_DEFINITION if is_def else SCORE_REFERENCE
+
+                contexts.append(
+                    CodeContext(
+                        file_path=rel_path_str,
+                        reason=reason,
+                        snippet=snippet,
+                        score=score,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - 单行解析失败不应中断整体检索
+                logger.debug("Failed to parse git grep line %r: %s", line, exc)
+                continue
 
         return contexts
 
     def _extract_snippet_with_ast(
-            self, file_path: Path, line_number: int, targets: List[str]
+        self,
+        file_path: Path,
+        line_number: int,
+        targets: List[str],
+        file_cache: Dict[Path, Optional[LoadedFile]],
     ) -> Tuple[str, str, bool, Optional[Tuple[int, int]]]:
         """利用 Tree-sitter 纯语法结构分析，截取边界并判定 Definition / Reference"""
-        try:
-            text = file_path.read_text(encoding="utf-8", errors="ignore")
-            lines = text.splitlines()
-            target_idx = line_number - 1
-
-            suffix = file_path.suffix
-            parser = self.parsers.get(suffix)
-            if not parser:
-                return "", "", False, None
-
-            tree = parser.parse(text.encode("utf-8"))
-            root_node = tree.root_node
-
-            # 寻找包含目标行的最小定义节点
-            target_node = self._find_enclosing_definition(root_node, target_idx)
-
-            # 如果不在任何函数/类定义内（例如顶层代码），可根据需要决定是否降级，这里采用稳妥的行窗口兜底或直接过滤
-            if not target_node:
-                # 纯通用兜底：以目标行为中心切片 15 行
-                start_row = max(0, target_idx - 7)
-                end_row = min(len(lines) - 1, target_idx + 7)
-                snippet = "\n".join(lines[start_row:end_row + 1])
-                target_line = lines[target_idx] if 0 <= target_idx < len(lines) else ""
-                matched = next((t for t in targets if t in target_line), "unknown")
-                return snippet, f"Fallback snippet around line {line_number} for '{matched}'", False, (start_row,
-                                                                                                       end_row)
-
-            start_row = target_node.start_point[0]
-            end_row = target_node.end_point[0]
-
-            snippet_lines = lines[start_row: end_row + 1]
-            snippet = "\n".join(snippet_lines)
-
-            target_line = lines[target_idx] if 0 <= target_idx < len(lines) else ""
-            matched_target = next((t for t in targets if t in target_line), "unknown")
-
-            # 纯 AST 节点类型判定
-            definition_types = {
-                "function_definition", "class_definition", "method_definition",  # Python
-                "function_declaration", "method_declaration", "type_declaration"  # Golang
-            }
-
-            is_def = target_node.type in definition_types
-
-            reason = (
-                f"AST-enclosed definition of '{matched_target}' (lines {start_row + 1}-{end_row + 1})"
-                if is_def
-                else f"AST-enclosed reference to '{matched_target}' (lines {start_row + 1}-{end_row + 1})"
-            )
-            return snippet, reason, is_def, (start_row, end_row)
-
-        except Exception as e:
-            print(f"[DEBUG] AST extraction failed exception: {e}")
+        loaded = self._load_file(file_path, file_cache)
+        if loaded is None:
             return "", "", False, None
+
+        _, lines, source, tree = loaded
+        target_idx = line_number - 1
+        if target_idx < 0 or target_idx >= len(lines):
+            return "", "", False, None
+
+        target_line = lines[target_idx]
+        target_node = self._find_enclosing_definition(tree.root_node, target_idx)
+
+        # 如果不在任何函数/类定义内（例如顶层代码），采用行窗口兜底
+        if not target_node:
+            start_row = max(0, target_idx - 7)
+            end_row = min(len(lines) - 1, target_idx + 7)
+            snippet = "\n".join(lines[start_row:end_row + 1])
+            matched = next((t for t in targets if t in target_line), "unknown")
+            return (
+                snippet,
+                f"Fallback snippet around line {line_number} for '{matched}'",
+                False,
+                (start_row, end_row),
+            )
+
+        start_row, end_row = target_node.start_point[0], target_node.end_point[0]
+        snippet = "\n".join(lines[start_row:end_row + 1])
+
+        definition_name = self._definition_name(target_node, source)
+        matched_target = next(
+            (t for t in targets if t in target_line),
+            definition_name or "unknown",
+        )
+
+        # 关键修复：只有“命中行就是该定义节点的声明行”时才算 Definition。
+        # 原实现只要命中行位于某个函数内部就判为 Definition，导致所有引用都被
+        # 打成 0.90 分，检索排序失真。
+        is_def = (
+            definition_name in targets
+            and target_node.start_point[0] == target_idx
+        )
+
+        reason = (
+            f"AST-enclosed definition of '{matched_target}' "
+            f"(lines {start_row + 1}-{end_row + 1})"
+            if is_def
+            else f"AST-enclosed reference to '{matched_target}' "
+            f"(lines {start_row + 1}-{end_row + 1})"
+        )
+        return snippet, reason, is_def, (start_row, end_row)
+
+    @staticmethod
+    def _definition_name(node: Node, source: bytes) -> Optional[str]:
+        """读取定义节点的名字。Go 的 type_declaration 需要再下钻一层 type_spec。"""
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            for child in node.children:
+                if child.type in {"type_spec", "type_alias"}:
+                    name_node = child.child_by_field_name("name")
+                    if name_node is not None:
+                        break
+        if name_node is None:
+            return None
+        return source[name_node.start_byte:name_node.end_byte].decode("utf-8", "ignore")
 
     def _find_enclosing_definition(self, node: Node, target_row: int) -> Optional[Node]:
         """递归遍历 AST，寻找包含 target_row 的最小定义节点"""
         best_match = None
 
-        definition_types = {
-            "function_definition", "class_definition", "method_definition",
-            "function_declaration", "method_declaration", "type_declaration"
-        }
-
         def traverse(curr: Node):
             nonlocal best_match
             if curr.start_point[0] <= target_row <= curr.end_point[0]:
-                if curr.type in definition_types:
+                if curr.type in DEFINITION_TYPES:
                     best_match = curr
                 for child in curr.children:
                     traverse(child)

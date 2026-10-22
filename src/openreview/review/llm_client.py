@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Optional, Type, TypeVar, Protocol
 from pydantic import BaseModel
 from openai import OpenAI
@@ -20,11 +21,39 @@ class AbstractLLMClient(Protocol):
 
 
 class LLMClient:
-    """真实的 OpenAI 客户端"""
-    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o"):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY", "mock-key")
-        self.model = model
-        self._client = OpenAI(api_key=self.api_key)
+    """真实的 OpenAI 客户端。
+
+    配置与 GitHub Token 完全解耦：
+    - api_key:OPENAI_API_KEY
+    - model: OPENAI_MODEL，默认 gpt-4o
+    - base_url: OPENAI_BASE_URL（用于兼容 OpenAI 协议的第三方服务）
+    """
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        timeout: float = 60.0,
+        max_retries: int = 2,
+    ):
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "缺少 OpenAI API Key。请设置环境变量 OPENAI_API_KEY，"
+                "或使用 `openreview review <PR_URL> --mock_llm` 进行离线演示。"
+            )
+
+        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o")
+        self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
+
+        client_kwargs = {
+            "api_key": self.api_key,
+            "timeout": timeout,
+            "max_retries": max_retries,
+        }
+        if self.base_url:
+            client_kwargs["base_url"] = self.base_url
+        self._client = OpenAI(**client_kwargs)
 
     def generate_structured(
         self,
@@ -74,10 +103,20 @@ class MockLLMClient:
 
         # 2. 针对单维度审查的 Schema (AspectReviewOutputSchema)
         if "AspectReviewOutputSchema" in schema_name:
+            # 从 User Prompt 的 Patch 区块中取出真实文件名，
+            # 避免 Mock 问题因“文件不在 Diff 中”被校验器全部过滤掉。
+            changed_files = re.findall(
+                r"^### (.+?)\n```diff", user_prompt, flags=re.MULTILINE
+            )
+            primary_file = changed_files[0] if changed_files else "src/example.py"
+            secondary_file = (
+                changed_files[1] if len(changed_files) > 1 else primary_file
+            )
+
             # 依据不同情况塞入模拟的 PotentialIssueSchema 列表
             mock_issues = [
                 PotentialIssueSchema(
-                    file="src/auth/service.py",
+                    file=primary_file,
                     severity="high",
                     category="security",
                     confidence=0.92,
@@ -85,7 +124,7 @@ class MockLLMClient:
                     suggestion="请将密钥移除，并改用环境变量（如 os.environ.get('JWT_SECRET')）进行加载。"
                 ),
                 PotentialIssueSchema(
-                    file="src/utils/helper.py",
+                    file=secondary_file,
                     severity="medium",
                     category="clean_code",
                     confidence=0.85,

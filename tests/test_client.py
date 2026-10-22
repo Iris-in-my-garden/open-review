@@ -1,24 +1,32 @@
+import httpx
 import pytest
+
 from openreview.github.client import GitHubClient, GitHubPRRef, GitHubAPIError
 
 
-def test_get_pull_request_success(respx_mock):
+def _client_with_handler(handler, token: str | None = None) -> GitHubClient:
+    """用 httpx.MockTransport 替代真实网络，避免引入 respx 依赖。"""
+    return GitHubClient(token=token, transport=httpx.MockTransport(handler))
+
+
+def test_get_pull_request_success():
     ref = GitHubPRRef(owner="octocat", repo="Hello-World", pr_number=1342)
-    url = "https://api.github.com/repos/octocat/Hello-World/pulls/1342"
 
-    respx_mock.get(url).respond(
-        200,
-        json={
-            "title": "Add new feature",
-            "body": "Description of the feature",
-            "base": {"ref": "main", "sha": "base_sha_abc"},
-            "head": {"ref": "feature", "sha": "head_sha_xyz"},
-            "html_url": "https://github.com/octocat/Hello-World/pull/1342",
-        },
-    )
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/octocat/Hello-World/pulls/1342"
+        return httpx.Response(
+            200,
+            json={
+                "title": "Add new feature",
+                "body": "Description of the feature",
+                "base": {"ref": "main", "sha": "base_sha_abc"},
+                "head": {"ref": "feature", "sha": "head_sha_xyz"},
+                "html_url": "https://github.com/octocat/Hello-World/pull/1342",
+            },
+        )
 
-    client = GitHubClient(token="test-token")
-    pr_info = client.get_pull_request(ref)
+    with _client_with_handler(handler, token="test-token") as client:
+        pr_info = client.get_pull_request(ref)
 
     assert pr_info.title == "Add new feature"
     assert pr_info.base_branch == "main"
@@ -28,38 +36,40 @@ def test_get_pull_request_success(respx_mock):
     assert pr_info.html_url == "https://github.com/octocat/Hello-World/pull/1342"
 
 
-def test_get_pull_request_api_error(respx_mock):
+def test_get_pull_request_api_error():
     ref = GitHubPRRef(owner="octocat", repo="Hello-World", pr_number=999)
-    url = "https://api.github.com/repos/octocat/Hello-World/pulls/999"
 
-    respx_mock.get(url).respond(404, json={"message": "Not Found"})
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"message": "Not Found"})
 
-    client = GitHubClient()
-    with pytest.raises(GitHubAPIError):
-        client.get_pull_request(ref)
+    with _client_with_handler(handler) as client:
+        with pytest.raises(GitHubAPIError):
+            client.get_pull_request(ref)
 
 
-def test_list_changed_files_pagination(respx_mock):
+def test_list_changed_files_pagination():
     ref = GitHubPRRef(owner="octocat", repo="Hello-World", pr_number=1342)
-    url = "https://api.github.com/repos/octocat/Hello-World/pulls/1342/files"
 
-    # Mock page 1 (returns 1 item, assuming per_page < 100 or final page)
-    respx_mock.get(url, params={"page": 1, "per_page": 100}).respond(
-        200,
-        json=[
-            {
-                "filename": "main.py",
-                "status": "modified",
-                "additions": 5,
-                "deletions": 2,
-                "changes": 7,
-                "patch": "@@ -1,3 +1,6 @@",
-            }
-        ],
-    )
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/octocat/Hello-World/pulls/1342/files"
+        assert request.url.params["page"] == "1"
+        assert request.url.params["per_page"] == "100"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "filename": "main.py",
+                    "status": "modified",
+                    "additions": 5,
+                    "deletions": 2,
+                    "changes": 7,
+                    "patch": "@@ -1,3 +1,6 @@",
+                }
+            ],
+        )
 
-    client = GitHubClient()
-    files = client.list_changed_files(ref)
+    with _client_with_handler(handler) as client:
+        files = client.list_changed_files(ref)
 
     assert len(files) == 1
     assert files[0].filename == "main.py"

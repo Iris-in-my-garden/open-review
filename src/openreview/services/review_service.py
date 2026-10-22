@@ -17,15 +17,31 @@ from openreview.review.llm_client import LLMClient, MockLLMClient
 
 class ReviewPipeline:
 
-    def __init__(self, mock_llm: bool = False, github_token: Optional[str] = None):
+    def __init__(
+        self,
+        mock_llm: bool = False,
+        github_token: Optional[str] = None,
+        llm_api_key: Optional[str] = None,
+        llm_model: Optional[str] = None,
+        llm_base_url: Optional[str] = None,
+    ):
         self.gh_client = GitHubClient(token=github_token)
         self.repo_mgr = RepoManager()
         self.diff_parser = DiffParser()
         # self.retriever = GrepRetriever()
         self.retriever = TreeSitterLocalRetriever()
 
-        # 根据标志直接切换实例，不需要用 MagicMock 动态拼装
-        llm_client = MockLLMClient() if mock_llm else LLMClient(api_key=github_token)
+        # 根据标志直接切换实例，不需要用 MagicMock 动态拼装。
+        # 注意：GitHub Token 与 LLM API Key 是两套完全独立的凭证。
+        llm_client = (
+            MockLLMClient()
+            if mock_llm
+            else LLMClient(
+                api_key=llm_api_key,
+                model=llm_model,
+                base_url=llm_base_url,
+            )
+        )
         self.reviewer = ReviewOrchestrator(prompt_builder=PromptBuilder(), llm_client=llm_client, output_parser=OutputParser(),
                                  validator=FindingValidator())
 
