@@ -5,14 +5,13 @@ from typing import Callable, Optional
 from openreview.repo.diff_parser import DiffParser
 from openreview.github.client import GitHubClient
 from openreview.github.pr_url import  parse_pr_url
-from openreview.retriever.grep_retriever import GrepRetriever
 from openreview.repo.manager import RepoManager
 from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
+from openreview.review.aspect_reviewer import ReviewOrchestrator
 from openreview.review.finding_validator import FindingValidator
 from openreview.review.output_parser import OutputParser
 from openreview.review.prompt_builder import PromptBuilder
 from openreview.review.report_writer import ReportWriter
-from openreview.review.reviewer import Reviewer
 from openreview.review.llm_client import LLMClient, MockLLMClient
 
 
@@ -24,11 +23,11 @@ class ReviewPipeline:
         self.diff_parser = DiffParser()
         # self.retriever = GrepRetriever()
         self.retriever = TreeSitterLocalRetriever()
-        self.reviewer = Reviewer()
 
         # 根据标志直接切换实例，不需要用 MagicMock 动态拼装
         llm_client = MockLLMClient() if mock_llm else LLMClient(api_key=github_token)
-        self.reviewer = Reviewer(prompt_builder=PromptBuilder(),llm_client=llm_client, output_parser=OutputParser(), validator=FindingValidator())
+        self.reviewer = ReviewOrchestrator(prompt_builder=PromptBuilder(), llm_client=llm_client, output_parser=OutputParser(),
+                                 validator=FindingValidator())
 
     def run(
         self,

@@ -83,12 +83,40 @@ DEFAULT_SYSTEM_PROMPT = """你是一位资深、严谨的软件架构师和 Code
 
 """
 
+# 定义四大审查维度的专业 System Prompt
+ASPECT_SYSTEM_PROMPTS = {
+    "clean_code": (
+        "你是一位资深的 Clean Code 与软件架构专家。你的任务是专注于检查代码的可读性、"
+        "命名规范（如语义是否直观）、函数是否过大（违反单一职责原则 SRP）、重复代码（DRY），"
+        "以及是否存在不必要的魔法数字（Magic Number）。请提供具体的重构建议。"
+    ),
+    "bugs": (
+        "你是一位资深的 QA 与软件测试工程师。你的任务是找出代码中隐藏的逻辑漏洞、"
+        "未处理的边界条件（Edge Cases，如空值、负数、极限值）、Null/Undefined 异常、"
+        "异步处理遗漏 await、以及未妥善捕获的 Exception 异常。"
+    ),
+    "performance": (
+        "你是一位高并发与系统性能优化专家。你的任务是评估代码的时间与空间复杂度、"
+        "找出潜在的性能瓶颈（如嵌套循环导致的 O(n^2)、数据库 N+1 查询问题、"
+        "不必要的内存拷贝、昂贵的同步阻塞操作），并提供优化方案。"
+    ),
+    "security": (
+        "你是一位应用安全专家（AppSec Engineer）。你的任务是严格审查 OWASP Top 10 安全风险，"
+        "特别关注 SQL 注入、跨站脚本（XSS）、硬编码密钥（Hardcoded Secrets / API Keys）、"
+        "不安全的反序列化以及鉴权与权限校验（Authorization/Authentication）漏洞。"
+    )
+}
+
 class PromptBuilder:
     def __init__(self, system_prompt: str = DEFAULT_SYSTEM_PROMPT):
         self.system_prompt = system_prompt
 
     def build_system_prompt(self) -> str:
         return self.system_prompt
+
+    def build_system_prompt_for_aspect(self, aspect: str) -> str:
+        """根据维度获取专属的 System Prompt"""
+        return ASPECT_SYSTEM_PROMPTS.get(aspect, self.system_prompt)
 
     def build_user_prompt(
         self,
@@ -133,3 +161,24 @@ class PromptBuilder:
 5. Retrieved Context Snippets:
 {context_str}
 """
+
+    def build_user_prompt_for_aspect(
+            self,
+            aspect: str,
+            pr_info: PullRequestInfo,
+            parsed_diff: ParsedDiff,
+            contexts: List[CodeContext],
+    ) -> str:
+        """针对特定维度追加专属审查指令的 User Prompt"""
+        base_prompt = self.build_user_prompt(pr_info, parsed_diff, contexts)
+
+        aspect_instructions = {
+            "clean_code": "【审查重点】请严格检查此 PR 的代码规范、命名可读性与架构合理性。",
+            "bugs": "【审查重点】请彻底排查此 PR 可能引入的逻辑错误、异常分支与边界条件。",
+            "performance": "【审查重点】请评估此 PR 的算法复杂度、数据库交互与潜在的性能瓶颈。",
+            "security": "【审查重点】请地毯式检查此 PR 是否包含安全漏洞、敏感信息泄露或权限缺陷。"
+        }
+
+        instruction = aspect_instructions.get(aspect, "请进行全面审查。")
+
+        return f"{base_prompt}\n\n### 【当前任务指令】\n{instruction}"

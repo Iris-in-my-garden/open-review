@@ -4,7 +4,7 @@ import pytest
 
 from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
 from openreview.retriever.grep_retriever import CodeContext
-from openreview.review.reviewer import Reviewer, ReviewResultSchema, PotentialIssueSchema
+from openreview.review.simple_reviewer import Reviewer, ReviewResultSchema, PotentialIssueSchema
 
 
 @patch("openreview.reviewer.OpenAI")

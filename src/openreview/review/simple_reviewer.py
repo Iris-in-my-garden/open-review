@@ -1,4 +1,4 @@
-# openreview/reviewer.py
+# openreview/simple_reviewer.py
 from typing import List, Optional
 
 from openreview.github.client import PullRequestInfo

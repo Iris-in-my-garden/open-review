@@ -1,24 +1,34 @@
 # PR Review Report
 
 ## 1. PR Summary
-[MOCK] 这是一个测试 PR Review 总结
+[PERFORMANCE] [MOCK] 该维度的代码检查完成，发现了一些需要注意的潜在问题。
+[BUGS] [MOCK] 该维度的代码检查完成，发现了一些需要注意的潜在问题。
+[CLEAN_CODE] [MOCK] 该维度的代码检查完成，发现了一些需要注意的潜在问题。
+[SECURITY] [MOCK] 该维度的代码检查完成，发现了一些需要注意的潜在问题。
 
 ## 2. Risk Level
-- **Risk Level**: LOW
-- **Reason**: [MOCK] 修改量较小，无敏感模块变更
+- **Risk Level**: HIGH
+- **Reason**: 基于多维度（Clean Code、逻辑Bug、性能优化、安全漏洞）分析，共发现 8 个潜在问题。
 
 ## 3. Key Changes
-- [MOCK] 调整了代码结构与参数传递
+- 多维度并行代码评审已完成
 
 ## 4. Potential Issues
 No high-confidence issues found.
 
 ## 5. Missing Test Suggestions
-- [MOCK] 建议补充单元测试
+- 建议针对本次审查发现的边界条件与潜在逻辑漏洞补充自动化单元测试。
 
 ## 6. Evidence
-No specific evidence attached.
+- src/auth/service.py
+- src/auth/service.py
+- src/auth/service.py
+- src/auth/service.py
+- src/utils/helper.py
+- src/utils/helper.py
+- src/utils/helper.py
+- src/utils/helper.py
 
 ## 7. Final Recommendation
-- **Decision**: APPROVE
-- **Summary**: [MOCK] 代码质量良好，通过审查
+- **Decision**: REQUEST_CHANGES
+- **Summary**: 多维度评审结束。最终决策: REQUEST_CHANGES (风险等级: HIGH)
