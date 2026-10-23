@@ -119,6 +119,22 @@ class MockLLMClient:
 
         schema_name = response_schema.__name__
 
+        # Verifier 的 Mock：默认认为所有候选问题都成立，方便离线跑通。
+        if "VerifierBatchOutput" in schema_name:
+            issue_ids = re.findall(r'"id"\s*:\s*"([^"]+)"', user_prompt)
+            return response_schema(
+                results=[
+                    {
+                        "issue_id": issue_id,
+                        "verdict": "verified",
+                        "confidence": 0.8,
+                        "reason": "[MOCK] 证据可定位。",
+                        "evidence": "",
+                    }
+                    for issue_id in issue_ids
+                ]
+            )
+
         # 2. 针对单维度审查的 Schema (AspectReviewOutputSchema)
         if "AspectReviewOutputSchema" in schema_name:
             # 从 User Prompt 的 Patch 区块中取出真实文件名，
