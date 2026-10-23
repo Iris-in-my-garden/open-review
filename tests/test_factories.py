@@ -1,6 +1,9 @@
-from openreview.retriever.factory import build_retriever
+from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
+from openreview.retriever.factory import (
+    AstWithGrepFallbackRetriever,
+    build_retriever,
+)
 from openreview.retriever.grep_retriever import GrepRetriever
-from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
 from openreview.review.aspect_reviewer import ReviewOrchestrator
 from openreview.review.finding_validator import FindingValidator
 from openreview.review.llm_client import MockLLMClient
@@ -19,8 +22,8 @@ def _reviewer_kwargs():
     }
 
 
-def test_retriever_factory_builds_ast_and_grep_baseline():
-    assert isinstance(build_retriever("tree_sitter"), TreeSitterLocalRetriever)
+def test_retriever_factory_builds_ast_with_fallback_and_grep():
+    assert isinstance(build_retriever("tree_sitter"), AstWithGrepFallbackRetriever)
     assert isinstance(build_retriever("grep"), GrepRetriever)
 
 
@@ -31,6 +34,26 @@ def test_retriever_factory_rejects_unknown_name():
         assert "Unknown retriever" in str(exc)
     else:
         raise AssertionError("Expected ValueError")
+
+
+def test_ast_retriever_falls_back_to_grep_for_unsupported_language(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.js").write_text("function doWork() {}\n", encoding="utf-8")
+    (tmp_path / "src" / "b.js").write_text("doWork();\n", encoding="utf-8")
+    parsed = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="src/a.js",
+                status="modified",
+                changed_symbols=["doWork"],
+                changed_lines=[1],
+            )
+        ]
+    )
+
+    contexts = build_retriever("tree_sitter").retrieve(tmp_path, parsed)
+
+    assert any(context.file_path == "src/b.js" for context in contexts)
 
 
 def test_reviewer_factory_builds_multi_and_single_modes():

@@ -70,12 +70,72 @@ def review(
     retriever: str = typer.Option(
         "tree_sitter",
         "--retriever",
-        help="Context retriever: tree_sitter (default) or grep (ablation baseline)",
+        help="Context retriever: tree_sitter (default) or grep (fallback)",
     ),
     reviewer_mode: str = typer.Option(
         "multi",
         "--reviewer",
-        help="Reviewer mode: multi (4 aspects, default) or single (ablation baseline)",
+        help="Reviewer mode: multi (4 aspects, default) or single (low-cost mode)",
+    ),
+    triage_enabled: bool = typer.Option(
+        True,
+        "--triage/--no-triage",
+        help="Enable rule-based triage (skip docs-only PRs, narrow aspects)",
+    ),
+    impact_enabled: bool = typer.Option(
+        True,
+        "--impact/--no-impact",
+        help="Inject cross-file references of changed symbols as context",
+    ),
+    static_analysis_enabled: bool = typer.Option(
+        False,
+        "--static-analysis/--no-static-analysis",
+        help="Run ruff/mypy on changed files and inject findings (executes local tools)",
+    ),
+    static_tools: str = typer.Option(
+        "ruff",
+        "--static-tools",
+        help="Comma separated static analysis tools: ruff,mypy",
+    ),
+    verifier_enabled: bool = typer.Option(
+        True,
+        "--verifier/--no-verifier",
+        help="Run a second-pass semantic verifier on critical/high findings",
+    ),
+    budget_calls: int = typer.Option(
+        0,
+        "--budget-calls",
+        help="Hard cap on LLM calls per review (0 = unlimited)",
+    ),
+    budget_tokens: int = typer.Option(
+        0,
+        "--budget-tokens",
+        help="Hard cap on estimated input tokens per review (0 = unlimited)",
+    ),
+    budget_seconds: float = typer.Option(
+        0.0,
+        "--budget-seconds",
+        help="Hard wall-clock budget for LLM work (0 = unlimited)",
+    ),
+    cache_review: bool = typer.Option(
+        False,
+        "--cache-review/--no-cache-review",
+        help="Reuse a previous review for the same PR head SHA",
+    ),
+    cache_dir: str = typer.Option(
+        None,
+        "--cache-dir",
+        help="Review cache directory (default: platform cache dir)",
+    ),
+    llm_cache_dir: str = typer.Option(
+        None,
+        "--llm-cache-dir",
+        help="Record/replay LLM responses into this directory",
+    ),
+    llm_cache_mode: str = typer.Option(
+        "auto",
+        "--llm-cache-mode",
+        help="LLM cache mode: auto | record | replay",
     ),
     verbose: bool = typer.Option(
         False,
@@ -106,6 +166,20 @@ def review(
             max_workers=max_workers,
             retriever=retriever,
             reviewer_mode=reviewer_mode,
+            triage_enabled=triage_enabled,
+            impact_enabled=impact_enabled,
+            static_analysis_enabled=static_analysis_enabled,
+            static_tools=tuple(
+                tool.strip() for tool in static_tools.split(",") if tool.strip()
+            ),
+            verifier_enabled=verifier_enabled,
+            budget_calls=budget_calls,
+            budget_tokens=budget_tokens,
+            budget_seconds=budget_seconds,
+            review_cache_enabled=cache_review,
+            review_cache_dir=cache_dir,
+            llm_cache_dir=llm_cache_dir,
+            llm_cache_mode=llm_cache_mode,
         )
         report_path = pipeline.run(
             pr_url,

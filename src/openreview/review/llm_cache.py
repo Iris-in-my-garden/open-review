@@ -39,6 +39,15 @@ class FileLLMCacheClient:
         self.hits = 0
         self.misses = 0
 
+    @property
+    def model(self) -> str:
+        """把内层客户端的模型名透出去，供 review cache key 使用。"""
+        return str(getattr(self.inner, "model", type(self.inner).__name__))
+
+    @property
+    def usage(self) -> dict:
+        return getattr(self.inner, "usage", {})
+
     def generate_structured(
         self,
         system_prompt: str,

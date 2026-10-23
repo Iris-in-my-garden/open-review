@@ -59,9 +59,14 @@ class StaticAnalysisReport(BaseModel):
             notes.append(f"[static] 其余 {len(self.findings) - 10} 条已省略。")
         return notes
 
-    def to_contexts(self, repo_path: Path) -> List[CodeContext]:
+    def to_contexts(
+        self, repo_path: Path, filenames: Optional[Iterable[str]] = None
+    ) -> List[CodeContext]:
+        allowed = set(filenames) if filenames is not None else None
         contexts: List[CodeContext] = []
         for item in self.findings[:MAX_STATIC_CONTEXTS]:
+            if allowed is not None and item.file not in allowed:
+                continue
             snippet = _read_snippet(repo_path, item.file, item.line)
             if not snippet:
                 continue
@@ -109,9 +114,10 @@ class StaticAnalysisRunner:
                 findings.extend(self._run_ruff(executable, repo_path, python_files, errors))
             elif tool == "mypy":
                 findings.extend(self._run_mypy(executable, repo_path, python_files, errors))
-            if len(findings) >= self.max_findings:
-                break
 
+        # 只保留落在 diff 可见行上的信号：同一文件里历史遗留的 lint 问题
+        # 不是本次 PR 引入的，注入给模型只会制造噪音。
+        findings = _filter_to_changed_lines(findings, parsed_diff)
         return StaticAnalysisReport(findings=findings[: self.max_findings], errors=errors)
 
     def _run_ruff(
@@ -143,7 +149,7 @@ class StaticAnalysisRunner:
                 findings.append(
                     StaticFinding(
                         tool="ruff",
-                        file=item["filename"],
+                        file=_as_repo_relative(repo_path, item["filename"]),
                         line=int(item["location"]["row"]),
                         code=item.get("code") or "",
                         message=item.get("message", ""),
@@ -181,7 +187,7 @@ class StaticAnalysisRunner:
             findings.append(
                 StaticFinding(
                     tool="mypy",
-                    file=match.group("file"),
+                    file=_as_repo_relative(repo_path, match.group("file")),
                     line=int(match.group("line")),
                     code="mypy",
                     message=match.group("msg"),
@@ -214,6 +220,34 @@ class StaticAnalysisRunner:
             )
             return None
         return result
+
+
+def _filter_to_changed_lines(
+    findings: List[StaticFinding], parsed_diff: ParsedDiff
+) -> List[StaticFinding]:
+    allowed: dict[str, set[int]] = {}
+    for file_diff in parsed_diff.files:
+        lines = set(file_diff.visible_lines or file_diff.changed_lines or [])
+        if lines:
+            allowed[file_diff.filename] = lines
+    if not allowed:
+        return findings
+    return [
+        item
+        for item in findings
+        if item.file not in allowed or item.line in allowed[item.file]
+    ]
+
+
+def _as_repo_relative(repo_path: Path, filename: str) -> str:
+    """ruff/mypy 可能返回绝对路径，统一收敛成仓库相对路径。"""
+    path = Path(filename)
+    if not path.is_absolute():
+        return str(path)
+    try:
+        return str(path.resolve().relative_to(Path(repo_path).resolve()))
+    except ValueError:
+        return str(path)
 
 
 def _ruff_severity(code: str) -> Severity:

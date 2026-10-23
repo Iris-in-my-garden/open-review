@@ -115,9 +115,13 @@ class ReviewState:
 
     impact_findings: List[str] = field(default_factory=list)
     static_findings: List[str] = field(default_factory=list)
+    impact_count: int = 0
+    static_count: int = 0
     verifier_stats: Dict[str, int] = field(default_factory=dict)
     cache_hits: int = 0
     cache_misses: int = 0
+    cache_hit: bool = False
+    cache_key: str = ""
 
     review_result: Optional[ReviewResult] = None
     report_path: Optional[Path] = None

@@ -34,7 +34,9 @@ class Reviewer:
         parsed_diff: ParsedDiff,
         contexts: List[CodeContext],
         repo_path: Optional[Path] = None,
+        aspects: Optional[List[str]] = None,
     ) -> ReviewResult:
+        _ = aspects  # 单 Prompt 模式不使用维度选择，保持与其他 Reviewer 一致的接口
         # 1. 组装 Prompt
         system_prompt = self.prompt_builder.build_system_prompt()
         user_prompt = self.prompt_builder.build_user_prompt(pr_info, parsed_diff, contexts)

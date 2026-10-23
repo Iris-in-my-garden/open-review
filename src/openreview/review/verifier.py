@@ -140,10 +140,10 @@ class FindingVerifier:
 
         kept: List[PotentialIssue] = []
         for issue in result.potential_issues:
-            issue_id = next(
+            matched_id = next(
                 (key for key, candidate in candidates if candidate is issue), None
             )
-            decision = decisions.get(issue_id or "")
+            decision = decisions.get(matched_id or "")
             if decision is None:
                 kept.append(issue)
                 continue

@@ -26,6 +26,7 @@ class ReviewerProtocol(Protocol):
         parsed_diff: ParsedDiff,
         contexts: List[CodeContext],
         repo_path: Optional[Path] = None,
+        aspects: Optional[List[str]] = None,
     ) -> ReviewResult:
         ...
 

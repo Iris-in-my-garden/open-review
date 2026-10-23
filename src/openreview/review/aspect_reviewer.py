@@ -89,7 +89,11 @@ class ReviewOrchestrator:
             parsed_diff: ParsedDiff,
             contexts: List[CodeContext],
             repo_path=None,
+            aspects: Optional[List[str]] = None,
     ) -> ReviewResult:
+
+        # triage 会在运行时收窄维度；不传则使用构造时的默认维度。
+        selected_aspects = list(aspects) if aspects else list(self.aspects)
 
         # 1. 初始化各個維度的 Worker
         workers = [
@@ -99,7 +103,7 @@ class ReviewOrchestrator:
                 llm_client=self.llm_client,
                 output_parser=self.output_parser
             )
-            for aspect in self.aspects
+            for aspect in selected_aspects
         ]
 
         all_aspect_results: List[AspectReviewTaskResult] = []
@@ -147,7 +151,7 @@ class ReviewOrchestrator:
             )
 
         # 保证报告顺序稳定，不受并发完成顺序影响
-        aspect_order = {aspect: index for index, aspect in enumerate(self.aspects)}
+        aspect_order = {aspect: index for index, aspect in enumerate(selected_aspects)}
         all_aspect_results.sort(
             key=lambda item: aspect_order.get(item.aspect, len(aspect_order))
         )

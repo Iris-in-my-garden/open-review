@@ -19,10 +19,12 @@ from typing import Iterable, List, Optional
 from pydantic import BaseModel, Field
 
 from openreview.repo.diff_parser import ParsedDiff
+from openreview.retriever.code_context import CodeContext
 
 logger = logging.getLogger(__name__)
 
 MAX_IMPACT_FINDINGS = 30
+MAX_IMPACT_CONTEXTS = 12
 MAX_SYMBOLS = 40
 EXCLUDED_DIRS = {
     ".git",
@@ -73,6 +75,26 @@ class ImpactReport(BaseModel):
         if self.truncated:
             notes.append("[impact] 影响分析结果过多，已截断。")
         return notes
+
+    def to_contexts(self, repo_path: Path) -> List[CodeContext]:
+        """把跨文件引用转成 Prompt 可用的上下文片段。
+
+        这些引用通常位于变更文件之外，正是“只看 diff 会漏掉”的部分。
+        """
+        contexts: List[CodeContext] = []
+        for item in self.findings[:MAX_IMPACT_CONTEXTS]:
+            snippet = _read_snippet(repo_path, item.file, item.line)
+            if not snippet:
+                snippet = item.code
+            contexts.append(
+                CodeContext(
+                    file_path=item.file,
+                    reason=f"impact:reference to '{item.symbol}' from changed file",
+                    snippet=snippet,
+                    score=item.confidence,
+                )
+            )
+        return contexts
 
 
 class ImpactAnalyzer:
@@ -149,7 +171,7 @@ class ImpactAnalyzer:
     @staticmethod
     def _confidence(symbol: str, code: str) -> float:
         # 定义行/导入行通常比普通调用更有信息量；短名字降低置信度。
-        if re.match(rf"\s*(def|class|func|type|import|from)\b", code):
+        if re.match(r"\s*(def|class|func|type|import|from)\b", code):
             return 0.8
         if len(symbol) <= 4:
             return 0.55
@@ -208,3 +230,20 @@ class ImpactAnalyzer:
                     if len(matches) >= MAX_IMPACT_FINDINGS * 4:
                         return matches
         return matches
+
+
+def _read_snippet(repo_path: Path, filename: str, line: int, radius: int = 6) -> str:
+    """读取引用位置附近的代码，作为 impact 上下文。"""
+    repo_path = Path(repo_path).resolve()
+    candidate = (repo_path / filename).resolve()
+    try:
+        candidate.relative_to(repo_path)
+    except ValueError:
+        return ""
+    try:
+        lines = candidate.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return ""
+    start = max(0, line - radius)
+    end = min(len(lines), line + radius)
+    return "\n".join(f"{idx + 1}: {lines[idx]}" for idx in range(start, end))

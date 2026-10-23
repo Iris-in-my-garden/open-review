@@ -1,6 +1,7 @@
 import os
 import re
-from typing import Any, Optional, Protocol, Type, TypeVar
+import threading
+from typing import Any, Dict, Optional, Protocol, Type, TypeVar
 
 from openai import OpenAI
 from pydantic import BaseModel
@@ -56,6 +57,27 @@ class LLMClient:
             client_kwargs["base_url"] = self.base_url
         self._client = OpenAI(**client_kwargs)
 
+        # 真实用量：报告里的成本估算不能只靠字符数猜测。
+        self._usage_lock = threading.Lock()
+        self.usage: Dict[str, int] = {
+            "calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    def _record_usage(self, usage: Any) -> None:
+        if usage is None:
+            return
+        prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion = int(getattr(usage, "completion_tokens", 0) or 0)
+        total = int(getattr(usage, "total_tokens", 0) or 0) or prompt + completion
+        with self._usage_lock:
+            self.usage["calls"] += 1
+            self.usage["prompt_tokens"] += prompt
+            self.usage["completion_tokens"] += completion
+            self.usage["total_tokens"] += total
+
     def generate_structured(
         self,
         system_prompt: str,
@@ -72,6 +94,7 @@ class LLMClient:
         )
 
         message = response.choices[0].message
+        self._record_usage(getattr(response, "usage", None))
 
         # 检查模型是否拒绝了请求
         if message.refusal:
@@ -89,6 +112,14 @@ class MockLLMClient:
 
     def __init__(self, custom_schema: Optional[BaseModel] = None):
         self.custom_schema = custom_schema
+        self.model = "mock"
+        # 与真实客户端保持同一接口，方便报告统一读取。
+        self.usage: Dict[str, int] = {
+            "calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
 
     @staticmethod
     def _extract_anchor(user_prompt: str, filename: str) -> tuple[Optional[int], Optional[str]]:
@@ -113,6 +144,8 @@ class MockLLMClient:
             user_prompt: str,
             response_schema: Type[T],
     ) -> T:
+        self.usage["calls"] += 1
+
         # 1. 如果用户自定义了匹配的实例，优先返回
         if self.custom_schema and isinstance(self.custom_schema, response_schema):
             return self.custom_schema

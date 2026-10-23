@@ -6,8 +6,9 @@ from openreview.services.review_service import ReviewPipeline
 
 
 class FakeGitHubClient:
-    def __init__(self):
+    def __init__(self, files=None):
         self.reviews = []
+        self.files = files
 
     def get_pull_request(self, ref):
         return PullRequestInfo(
@@ -24,6 +25,8 @@ class FakeGitHubClient:
         )
 
     def list_changed_files(self, ref):
+        if self.files is not None:
+            return self.files
         return [
             ChangedFile(
                 filename=f"src/file_{index}.py",
@@ -78,7 +81,7 @@ class FakeReviewer:
     def __init__(self):
         self.calls = []
 
-    def review(self, pr_info, parsed_diff, contexts, repo_path=None):
+    def review(self, pr_info, parsed_diff, contexts, repo_path=None, aspects=None):
         self.calls.append((parsed_diff, repo_path))
         return ReviewResult(
             owner=pr_info.owner,
@@ -138,3 +141,75 @@ def test_pipeline_batches_merges_and_posts_comments(tmp_path: Path):
     assert review["comments"][0]["line"] == 1
 
     pipeline.close()
+
+
+def test_pipeline_triage_skips_llm_for_docs_only_pr(tmp_path: Path):
+    pipeline = ReviewPipeline(mock_llm=True)
+    pipeline.gh_client = FakeGitHubClient(
+        files=[
+            ChangedFile(
+                filename="README.md",
+                status="modified",
+                additions=1,
+                deletions=0,
+                changes=1,
+                patch="@@ -0,0 +1,1 @@\n+docs\n",
+            )
+        ]
+    )
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+    pipeline.reviewer = FakeReviewer()
+
+    report_path = pipeline.run(
+        "https://github.com/org/repo/pull/1", tmp_path / "reports"
+    )
+
+    content = report_path.read_text(encoding="utf-8")
+    assert pipeline.reviewer.calls == []
+    assert pipeline.retriever.calls == []
+    assert "未运行 LLM 审查" in content
+    assert "**LLM Calls**: 0" in content
+
+
+def test_pipeline_degrades_gracefully_when_call_budget_runs_out(tmp_path: Path):
+    pipeline = ReviewPipeline(mock_llm=True, max_batch_tokens=1, budget_calls=2)
+    pipeline.gh_client = FakeGitHubClient()
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+    pipeline.reviewer = FakeReviewer()
+
+    report_path = pipeline.run(
+        "https://github.com/org/repo/pull/1", tmp_path / "reports"
+    )
+
+    content = report_path.read_text(encoding="utf-8")
+    # 第一个批次用 2 个维度的预算跑完，第二个批次因预算耗尽被跳过
+    assert len(pipeline.reviewer.calls) == 1
+    assert "预算" in content
+
+
+def test_pipeline_review_cache_skips_second_run(tmp_path: Path):
+    pipeline = ReviewPipeline(
+        mock_llm=True,
+        review_cache_enabled=True,
+        review_cache_dir=str(tmp_path / "cache"),
+    )
+    pipeline.gh_client = FakeGitHubClient()
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+    pipeline.reviewer = FakeReviewer()
+
+    first = pipeline.run(
+        "https://github.com/org/repo/pull/1", tmp_path / "reports"
+    )
+    second = pipeline.run(
+        "https://github.com/org/repo/pull/1", tmp_path / "reports"
+    )
+
+    assert first == second
+    assert len(pipeline.reviewer.calls) == 1
+    assert pipeline.repo_mgr.base_calls == 1
+    content = second.read_text(encoding="utf-8")
+    assert "命中本地 review 缓存" in content
+

@@ -163,7 +163,23 @@ class ReportWriter:
                 ):
                     if key in metrics:
                         md_lines.append(f"- **{label}**: {metrics[key]}")
-            md_lines.append("")
+
+                for key, label in (
+                    ("triage", "Triage"),
+                    ("impact", "Impact Analysis"),
+                    ("static_analysis", "Static Analysis"),
+                    ("verifier", "Verifier"),
+                    ("cache", "Cache"),
+                    ("budget", "Budget"),
+                    ("llm_usage", "LLM Usage"),
+                ):
+                    value = metrics.get(key)
+                    if isinstance(value, dict) and value:
+                        rendered = ", ".join(
+                            f"{name}={item}" for name, item in value.items()
+                        )
+                        md_lines.append(f"- **{label}**: {rendered}")
+                md_lines.append("")
 
         return "\n".join(md_lines)
 

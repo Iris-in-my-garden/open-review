@@ -16,32 +16,6 @@ from openreview.review.report_writer import ReviewResult
 ALL_ASPECTS = ["clean_code", "bugs", "performance", "security"]
 TEST_ONLY_ASPECTS = ["clean_code", "bugs"]
 
-SECURITY_PATH_MARKERS = (
-    "auth",
-    "security",
-    "crypto",
-    "permission",
-    "acl",
-    "token",
-    "secret",
-    "password",
-    "oauth",
-    "jwt",
-    "session",
-)
-SECURITY_TEXT_MARKERS = (
-    "password",
-    "secret",
-    "token",
-    "auth",
-    "permission",
-    "sql",
-    "exec(",
-    "eval(",
-    "subprocess",
-    "pickle",
-)
-
 
 @dataclass(frozen=True)
 class TriageDecision:
@@ -70,21 +44,8 @@ def triage(parsed_diff: ParsedDiff) -> TriageDecision:
             "仅包含测试变更，关闭 performance/security 维度",
         )
 
-    selected = list(ALL_ASPECTS)
-    sensitive = any(
-        marker in item.filename.lower()
-        for item in code_files
-        for marker in SECURITY_PATH_MARKERS
-    )
-    if not sensitive:
-        lowered_patches = "\n".join(item.patch or "" for item in code_files).lower()
-        sensitive = any(marker in lowered_patches for marker in SECURITY_TEXT_MARKERS)
-
-    # security 始终保留：漏掉安全问题的代价通常高于一次安全审查调用。
-    if sensitive and "security" not in selected:
-        selected.append("security")
-
-    return TriageDecision(selected, False, "常规代码变更，运行多维度审查")
+    # 常规代码变更：security 始终保留，漏掉安全问题的代价高于一次调用。
+    return TriageDecision(ALL_ASPECTS, False, "常规代码变更，运行多维度审查")
 
 
 def build_skipped_result(
