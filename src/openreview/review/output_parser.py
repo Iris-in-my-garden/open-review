@@ -1,6 +1,7 @@
 from typing import List, Optional, Type
 
 from pydantic import BaseModel, Field, field_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from openreview.review.assessment import (
     SEVERITY_WEIGHTS,
@@ -39,6 +40,12 @@ class PotentialIssueSchema(BaseModel):
         default=None,
         description="可直接应用的 unified diff 修复片段（可选）",
     )
+    # 内部字段：由聚合层写入，不暴露给模型（SkipJsonSchema），也不参与序列化。
+    source_aspects: SkipJsonSchema[List[str]] = Field(
+        default_factory=list,
+        exclude=True,
+        description="报告该问题的审查维度，用于评测归因",
+    )
 
     @field_validator("severity", mode="before")
     @classmethod
@@ -69,10 +76,6 @@ class ReviewResultSchema(BaseModel):
 
 
 class OutputParser:
-    @property
-    def schema(self) -> Type[ReviewResultSchema]:
-        return ReviewResultSchema
-
     def schema_for_aspect(self, aspect: str) -> Type[AspectReviewOutputSchema]:
         """所有 Worker 维度统一使用该 Schema，确保 LLM 结构化输出稳定性"""
         return AspectReviewOutputSchema
@@ -93,6 +96,12 @@ class OutputParser:
 
             aspect_summaries.append(f"[{aspect.upper()}] {data.aspect_summary}")
             if data.issues:
+                # 在去重前记录来源维度：去重会保留 severity 最高的一条，
+                # 如果不记来源，clean_code 等低严重级别维度的贡献会被系统性吞掉。
+                for issue in data.issues:
+                    issue.source_aspects = list(
+                        dict.fromkeys([*issue.source_aspects, aspect])
+                    )
                 all_issues.extend(data.issues)
 
         # 同一问题可能被多个维度重复报告，先去重，避免重复计数抬高风险等级
@@ -147,6 +156,7 @@ class OutputParser:
                     end_line=issue.end_line,
                     evidence=issue.evidence,
                     suggested_patch=issue.suggested_patch,
+                    source_aspects=list(issue.source_aspects),
                 )
                 for issue in review_data.potential_issues
             ],

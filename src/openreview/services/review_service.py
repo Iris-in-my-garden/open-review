@@ -9,8 +9,10 @@ from openreview.github.client import GitHubClient
 from openreview.github.pr_url import parse_pr_url
 from openreview.repo.diff_parser import DiffParser
 from openreview.repo.manager import RepoCommandError, RepoManager
+from openreview.retriever.base import Retriever
 from openreview.retriever.code_context import CodeContext
-from openreview.retriever.factory import build_retriever
+from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
+from openreview.review.aspect_reviewer import ReviewOrchestrator
 from openreview.review.assessment import merge_review_results
 from openreview.review.cache import PROMPT_VERSION, ReviewCache, fingerprint
 from openreview.review.comment_builder import (
@@ -24,7 +26,6 @@ from openreview.review.llm_client import AbstractLLMClient, LLMClient, MockLLMCl
 from openreview.review.output_parser import OutputParser
 from openreview.review.prompt_builder import PromptBuilder
 from openreview.review.report_writer import ReportWriter, ReviewResult
-from openreview.review.reviewer_factory import build_reviewer
 from openreview.review.static_analysis import StaticAnalysisRunner
 from openreview.review.token_budget import estimate_tokens, split_parsed_diff
 from openreview.review.triage import (
@@ -64,8 +65,6 @@ class ReviewPipeline:
         max_context_tokens: int = 16000,
         max_workers: int = 4,
         aspect_timeout: float = 90.0,
-        retriever: str = "tree_sitter",
-        reviewer_mode: str = "multi",
         triage_enabled: bool = True,
         impact_enabled: bool = True,
         static_analysis_enabled: bool = False,
@@ -83,9 +82,8 @@ class ReviewPipeline:
         self.gh_client = GitHubClient(token=github_token)
         self.repo_mgr = RepoManager()
         self.diff_parser = DiffParser()
-        self.retriever = build_retriever(retriever)
-        self.retriever_name = retriever
-        self.reviewer_mode = reviewer_mode
+        # 只支持 Python / Go：没有独立 grep 检索器，tree-sitter 是唯一上下文来源。
+        self.retriever: Retriever = TreeSitterLocalRetriever()
         self.max_batch_tokens = max_batch_tokens
 
         self.triage_enabled = triage_enabled
@@ -116,8 +114,7 @@ class ReviewPipeline:
             )
         self.llm_client = base_client
 
-        self.reviewer = build_reviewer(
-            reviewer_mode,
+        self.reviewer = ReviewOrchestrator(
             prompt_builder=PromptBuilder(
                 max_patch_tokens=max_patch_tokens,
                 max_context_tokens=max_context_tokens,
@@ -352,7 +349,7 @@ class ReviewPipeline:
                 estimated_tokens = sum(
                     estimate_tokens(context.snippet) for context in contexts
                 ) + sum(estimate_tokens(file.patch or "") for file in batch.files)
-                aspects = state.selected_aspects or ["single_prompt"]
+                aspects = state.selected_aspects or list(ALL_ASPECTS)
                 # 先用“剩余调用数”收窄维度，再检查 token / 时间预算。
                 # 这样小预算至少能产出部分维度，而不是整单失败。
                 remaining_calls = state.budget.remaining_calls()
@@ -559,8 +556,6 @@ class ReviewPipeline:
             state.pr_info.head_sha,
             str(getattr(self.llm_client, "model", "unknown")),
             PROMPT_VERSION,
-            self.reviewer_mode,
-            self.retriever_name,
             f"triage={int(self.triage_enabled)}",
             f"impact={int(self.impact_enabled)}",
             f"static={int(self.static_analysis_enabled)}",

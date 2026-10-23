@@ -116,6 +116,25 @@ def _result(issues, notes=None) -> ReviewResult:
     )
 
 
+class AlwaysSameIssueLLM:
+    """每个维度都返回同一个问题，用于验证跨维度归因。"""
+
+    def generate_structured(self, system_prompt, user_prompt, response_schema):
+        return response_schema(aspect_summary="ok", issues=[_issue()])
+
+
+def test_aggregate_merges_source_aspects_for_duplicate_findings():
+    orchestrator = ReviewOrchestrator(
+        llm_client=AlwaysSameIssueLLM(),
+        aspects=["bugs", "security"],
+    )
+
+    result = orchestrator.review(_pr(), _diff(), [])
+
+    assert len(result.potential_issues) == 1
+    assert set(result.potential_issues[0].source_aspects) == {"bugs", "security"}
+
+
 def test_merge_review_results_deduplicates_and_recomputes():
     duplicate_high = PotentialIssue(
         file="src/a.py",

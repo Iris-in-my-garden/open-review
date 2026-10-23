@@ -1,4 +1,4 @@
-"""Retriever 协议：让 grep 基线与 AST 检索可以互相替换，用于 ablation。"""
+"""Retriever 协议：上下文检索器的统一接口，便于测试时替换实现。"""
 
 from pathlib import Path
 from typing import List, Optional, Protocol

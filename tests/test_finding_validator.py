@@ -85,6 +85,7 @@ def test_validate_deduplicates_cross_aspect_findings():
         confidence=0.9,
         reasoning="Hardcoded  secret in login().",
         suggestion="Use env vars.",
+        source_aspects=["security"],
     )
     from_bugs = PotentialIssue(
         file="src/auth.py",
@@ -93,6 +94,7 @@ def test_validate_deduplicates_cross_aspect_findings():
         confidence=0.8,
         reasoning="hardcoded secret in login().",
         suggestion="Remove the key.",
+        source_aspects=["bugs"],
     )
 
     result = FindingValidator().validate(
@@ -105,6 +107,9 @@ def test_validate_deduplicates_cross_aspect_findings():
     assert result.potential_issues[0].severity == "critical"
     assert result.risk_level == "CRITICAL"
     assert result.final_decision == "REQUEST_CHANGES"
+    # 代表项保留 severity 最高的那条，但归因必须合并两个来源维度，
+    # 否则评测时低严重级别维度的贡献会被系统性低估。
+    assert result.potential_issues[0].source_aspects == ["bugs", "security"]
 
 
 def _diff_with_patch() -> ParsedDiff:

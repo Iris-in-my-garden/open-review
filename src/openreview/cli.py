@@ -67,16 +67,6 @@ def review(
         "--max-workers",
         help="Max parallel aspect reviewers",
     ),
-    retriever: str = typer.Option(
-        "tree_sitter",
-        "--retriever",
-        help="Context retriever: tree_sitter (default) or grep (fallback)",
-    ),
-    reviewer_mode: str = typer.Option(
-        "multi",
-        "--reviewer",
-        help="Reviewer mode: multi (4 aspects, default) or single (low-cost mode)",
-    ),
     triage_enabled: bool = typer.Option(
         True,
         "--triage/--no-triage",
@@ -164,8 +154,6 @@ def review(
             mock_llm=mock_llm,
             max_batch_tokens=max_batch_tokens,
             max_workers=max_workers,
-            retriever=retriever,
-            reviewer_mode=reviewer_mode,
             triage_enabled=triage_enabled,
             impact_enabled=impact_enabled,
             static_analysis_enabled=static_analysis_enabled,

@@ -15,7 +15,7 @@
   - 区分“符号定义”和“符号引用”，分别赋分
   - 关联测试文件检索，用于真实的测试缺口分析
   - base worktree 检索被删除符号的历史实现
-  - 支持 Python / Go；其他语言自动降级到 grep 兜底，避免返回空上下文
+  - 仅支持 Python / Go（刻意收窄范围）；其他语言只使用 diff，不注入结构上下文
 - **跨文件影响分析**：变更/删除的符号在其他文件中的引用会被抽成上下文；删除符号仍有残留调用时，reviewer 能看到调用点
 - **可选静态分析证据源**：对变更文件跑 ruff/mypy，只保留落在 diff 可见行上的信号（默认关闭；会执行本地工具，接入 CI 时需注意不可信代码的执行风险）
 - **语义 verifier**：对 `critical` / `high` 结论做二次校验，过滤“看起来很像真的”的过度解读；最多回炉一次
@@ -32,7 +32,7 @@
 - **Prompt Injection 防护**：不可信内容统一包裹 + 标签转义 + 输出证据校验 + 命中规则提示
 - **GitHub API 重试/限流处理**，单维度失败不影响整体，失败信息写入报告
 - **仓库缓存并发安全**：仓库级 `FileLock` + blobless partial clone + 平台缓存目录 + 按 mtime 淘汰
-- **检索兜底与低成本模式**：Python/Go 走 AST，其他语言自动降级到 grep；`--reviewer single` 提供单 Prompt 的低成本模式（默认仍是 multi）
+- **单一检索与审查路径**：tree-sitter AST 是唯一上下文来源，四维度并行是唯一审查模式，避免维护未评测的实现
 - **可观测性**：`logging` + 阶段耗时 / 批次 / LLM 调用次数 / 真实 token 用量 / 预算与缓存命中，统一写入报告 `Run Metrics`
 - **严重级别收口**：`critical|high|medium|low` 使用 `Literal` 校验，兼容 `HIGH`、`严重` 等别名后再归一化
 - **工程化**：ruff + mypy + pre-commit + GitHub Actions
@@ -72,7 +72,7 @@ GitHub PR URL
 │ Evidence Collectors          │
 │ 1. ImpactAnalyzer：跨文件引用 │
 │ 2. StaticAnalysis：ruff/mypy │
-│ 3. Retriever：AST + grep 兜底 │
+│ 3. Retriever：tree-sitter AST │
 └────────┬─────────────────────┘
          ▼
 ┌──────────────────────────────┐
@@ -162,9 +162,6 @@ openreview review https://github.com/owner/repo/pull/123 \
   --llm-cache-dir .cache/llm \
   --llm-cache-mode record
 
-# 强制走纯文本检索（排查 AST 解析异常时使用）
-openreview review https://github.com/owner/repo/pull/123 --retriever grep
-
 # 打开 debug 日志（阶段耗时、检索数量、重试等）
 openreview review https://github.com/owner/repo/pull/123 --verbose
 ```
@@ -184,8 +181,6 @@ src/openreview/
 │   └── diff_parser.py         # Hunk、变更行、可见行、符号提取
 ├── retriever/
 │   ├── base.py                # Retriever 协议
-│   ├── factory.py             # AST 优先 + 不支持语言自动降级 grep
-│   ├── grep_retriever.py      # 纯文本检索（兜底 / 排查 AST 异常）
 │   └── tree_sitter_retriever.py  # AST 边界 + 定义/引用 + 测试文件 + base 检索
 ├── review/
 │   ├── prompt_builder.py      # 带行号 Patch、不可信数据包裹、token 预算
@@ -195,8 +190,6 @@ src/openreview/
 │   ├── impact.py              # 跨文件符号引用分析
 │   ├── static_analysis.py     # ruff/mypy 证据源（默认关闭）
 │   ├── aspect_reviewer.py     # 多维度并行编排、超时/重试/失败上报
-│   ├── simple_reviewer.py     # 单 Prompt 低成本模式
-│   ├── reviewer_factory.py    # multi / single 工厂
 │   ├── output_parser.py       # 结构化 Schema、严重级别校验与聚合
 │   ├── finding_validator.py   # 行号 / evidence 校验与结论重算
 │   ├── verifier.py            # critical/high 语义复核
@@ -212,8 +205,8 @@ src/openreview/
 
 ## 设计取舍
 
-**为什么 AST 优先，而不是只做 grep？**
-grep 只能告诉你“某一行命中了符号”，无法给出函数/类边界，也无法区分定义和引用。AST 能抽取完整函数/类，并按“变更行所属定义 > 定义 > 引用”排序。这里不再把“AST 比 grep 强多少”当成需要实验证明的卖点，而是把 grep 放在兜底位置：Python/Go 走 AST，其他语言自动降级，保证不会因为 parser 缺失而完全没有上下文。
+**为什么只支持 Python / Go？**
+grep 只能告诉你“某一行命中了符号”，无法给出函数/类边界，也无法区分定义和引用；tree-sitter 能抽取完整函数/类，并按“变更行所属定义 > 定义 > 引用”排序。与其用 grep 假装支持 10 种语言，不如把两种语言做深：没有 parser 的语言只保留 diff 上下文，并在报告中明确说明。这是一次刻意的范围收窄——多语言的代价是每种语言一套 parser、检索策略和测试，收益不足以支撑当前阶段。
 
 **为什么 triage 只用规则、不用模型？**
 triage 的目标是省钱，不是做判断。用一次 LLM 调用决定“要不要调用 LLM”在成本上不成立；docs-only / test-only 这类信号用文件后缀和 diff 元数据就能确定性判断，也更容易测试。
@@ -279,7 +272,7 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 - [x] Prompt Injection 防护与红队测试
 - [x] RepoManager：FileLock、blobless clone、平台缓存目录、LRU 式缓存淘汰
 - [x] GitHub API 429/5xx/限流重试，CLI `finally` 关闭 HTTP 连接
-- [x] `Retriever` / `Reviewer` 协议与工厂：AST 优先，grep 作为不支持语言的兜底；single 作为低成本模式
+- [x] 单一检索与审查路径：tree-sitter AST 检索 + 四维度并行 Review，移除未评测的 grep / single 分支
 - [x] 有界工作流（`workflow.py`）：条件节点、`ReviewBudget`、trace
 - [x] 规则 triage：docs-only 跳过、test-only 收窄维度
 - [x] 跨文件影响分析（`impact.py`）
@@ -298,6 +291,7 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 - [ ] 行内评论幂等（同一 head SHA 重跑不重复发评论）
 
 已知限制：
+- 只支持 Python / Go；其他语言没有 AST 上下文，效果未做承诺
 - patch/context 的 token 数仍是保守估算（1 token ≈ 3 字符），用于预算与截断；真实用量单独记录
 - 行内评论只能落在 diff 可见行；不在 diff 内的问题会退化为文件级描述
 - 单文件极大时会在 Prompt 层截断，可能漏掉文件后半部分的问题

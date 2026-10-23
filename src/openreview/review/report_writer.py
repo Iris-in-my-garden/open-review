@@ -18,6 +18,9 @@ class PotentialIssue(BaseModel):
     end_line: Optional[int] = None
     evidence: Optional[str] = None
     suggested_patch: Optional[str] = None
+    # 内部归因：哪些审查维度报告过这个问题（跨维度去重时合并）。
+    # 不参与渲染，供评测统计“维度贡献度”使用。
+    source_aspects: List[str] = Field(default_factory=list)
 
     @field_validator("severity", mode="before")
     @classmethod

@@ -117,8 +117,30 @@ def _fingerprint(issue: IssueLike) -> tuple[str, ...]:
     return (file_key, line_key, category, suggestion)
 
 
+def _merge_source_aspects(target: IssueLike, *others: IssueLike) -> None:
+    """把重复问题命中的维度合并到保留的那一条上。
+
+    去重按 severity/confidence 选代表，但归因必须保留全部报告者，否则
+    clean_code 这类低严重级别维度的贡献会被系统性低估。
+    """
+    merged = list(getattr(target, "source_aspects", []) or [])
+    for other in others:
+        for aspect in getattr(other, "source_aspects", []) or []:
+            if aspect not in merged:
+                merged.append(aspect)
+    try:
+        target.source_aspects = merged  # type: ignore[attr-defined]
+    except (AttributeError, TypeError, ValueError):
+        # 第三方/测试替身可能不允许写属性；归因缺失不应影响去重结果。
+        pass
+
+
 def deduplicate_issues(issues: Iterable[IssueLike]) -> list:
-    """跨维度去重，保留严重级别更高（同级则置信度更高）的那一条。"""
+    """跨维度去重，保留严重级别更高（同级则置信度更高）的那一条。
+
+    返回的代表项会合并所有重复项的来源维度（source_aspects），供评测做
+    维度贡献度统计。
+    """
     best: dict[tuple[str, ...], IssueLike] = {}
     order: list[tuple[str, ...]] = []
 
@@ -139,7 +161,10 @@ def deduplicate_issues(issues: Iterable[IssueLike]) -> list:
             issue.confidence,
         )
         if new_rank > existing_rank:
+            _merge_source_aspects(issue, existing)
             best[key] = issue
+        else:
+            _merge_source_aspects(existing, issue)
 
     return [best[key] for key in order]
 
