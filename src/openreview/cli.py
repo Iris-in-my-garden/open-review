@@ -1,10 +1,12 @@
 # openreview/cli.py
 import logging
 from pathlib import Path
+from typing import Optional
 
 import typer
 
 from openreview.repo.manager import RepoCommandError
+from openreview.review.report_writer import ReportWriter
 from openreview.services.review_service import ReviewPipeline
 
 # 创建应用对象
@@ -28,6 +30,11 @@ def review(
         "--output",
         "-o",
         help="Directory to save the review markdown report",
+    ),
+    json_out: Optional[Path] = typer.Option(
+        None,
+        "--json-out",
+        help="Also export the structured result (JSON, incl. source_aspects/metrics)",
     ),
     github_token: str = typer.Option(
         None,
@@ -176,11 +183,22 @@ def review(
             post_comments=post_comment,
         )
 
+        json_path = None
+        if json_out is not None:
+            if pipeline.last_result is None:
+                raise RuntimeError("Review finished without a result to export.")
+            json_path = ReportWriter.write_json(pipeline.last_result, json_out)
+
         typer.secho(
             f"\n✨ Review completed successfully! Report saved to:\n{report_path.resolve()}",
             fg=typer.colors.GREEN,
             bold=True,
         )
+        if json_path is not None:
+            typer.secho(
+                f"Structured result saved to: {json_path.resolve()}",
+                fg=typer.colors.GREEN,
+            )
 
     except RepoCommandError as e:
         typer.secho(

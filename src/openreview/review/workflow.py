@@ -11,13 +11,16 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from openreview.github.client import ChangedFile, PullRequestInfo
 from openreview.github.pr_url import GitHubPRRef
 from openreview.repo.diff_parser import ParsedDiff
 from openreview.retriever.code_context import CodeContext
 from openreview.review.report_writer import ReviewResult
+
+if TYPE_CHECKING:
+    from openreview.repo.local import LocalReviewInput, LocalWorkspace
 
 
 class BudgetExceeded(RuntimeError):
@@ -97,6 +100,11 @@ class ReviewState:
     post_comments: bool = False
     budget: ReviewBudget = field(default_factory=ReviewBudget)
     progress_cb: Optional[Callable[[int, str], None]] = None
+
+    # local_mode=True 时跳过 GitHub API，改用 repo_path + base/head SHA。
+    local_mode: bool = False
+    local_input: Optional["LocalReviewInput"] = None
+    local_workspace: Optional["LocalWorkspace"] = None
 
     pr_ref: Optional[GitHubPRRef] = None
     pr_info: Optional[PullRequestInfo] = None

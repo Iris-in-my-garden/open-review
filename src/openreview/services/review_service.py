@@ -5,9 +5,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
-from openreview.github.client import GitHubClient
+from openreview.github.client import GitHubClient, PullRequestInfo
 from openreview.github.pr_url import parse_pr_url
 from openreview.repo.diff_parser import DiffParser
+from openreview.repo.local import (
+    LocalReviewInput,
+    collect_local_changes,
+    prepare_local_workspace,
+)
 from openreview.repo.manager import RepoCommandError, RepoManager
 from openreview.retriever.base import Retriever
 from openreview.retriever.code_context import CodeContext
@@ -137,6 +142,10 @@ class ReviewPipeline:
             review_cache_dir, enabled=review_cache_enabled
         )
 
+        # run()/run_local() 结束后保留最后一次结果，供 CLI 导出 JSON 或评测读取。
+        self.last_result: Optional[ReviewResult] = None
+        self.last_state: Optional[ReviewState] = None
+
     def close(self) -> None:
         self.gh_client.close()
 
@@ -152,8 +161,21 @@ class ReviewPipeline:
     def _build_workflow(self) -> BoundedWorkflow:
         return BoundedWorkflow(
             [
-                WorkflowNode("parse_url", self._node_parse_url),
-                WorkflowNode("fetch_pr", self._node_fetch_pr),
+                WorkflowNode(
+                    "parse_url",
+                    self._node_parse_url,
+                    enabled=lambda state: not state.local_mode,
+                ),
+                WorkflowNode(
+                    "fetch_pr",
+                    self._node_fetch_pr,
+                    enabled=lambda state: not state.local_mode,
+                ),
+                WorkflowNode(
+                    "load_local",
+                    self._node_load_local,
+                    enabled=lambda state: state.local_mode,
+                ),
                 WorkflowNode(
                     "cache_lookup",
                     self._node_cache_lookup,
@@ -162,7 +184,12 @@ class ReviewPipeline:
                 WorkflowNode(
                     "prepare_repo",
                     self._node_prepare_repo,
-                    enabled=lambda state: not state.cache_hit,
+                    enabled=lambda state: not state.cache_hit and not state.local_mode,
+                ),
+                WorkflowNode(
+                    "prepare_local",
+                    self._node_prepare_local,
+                    enabled=lambda state: state.local_mode and not state.cache_hit,
                 ),
                 WorkflowNode(
                     "parse_diff",
@@ -195,11 +222,48 @@ class ReviewPipeline:
                 WorkflowNode(
                     "post_comments",
                     self._node_post_comments,
-                    enabled=lambda state: state.post_comments and not state.cache_hit,
+                    enabled=lambda state: (
+                        state.post_comments
+                        and not state.cache_hit
+                        and not state.local_mode
+                    ),
                 ),
                 WorkflowNode("finalize", self._node_finalize),
             ]
         )
+
+    def _new_state(
+        self,
+        pr_url: str,
+        output_dir: Path,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+        post_comments: bool = False,
+        *,
+        local_mode: bool = False,
+        local_input: Optional[LocalReviewInput] = None,
+    ) -> ReviewState:
+        return ReviewState(
+            pr_url=pr_url,
+            output_dir=Path(output_dir),
+            post_comments=post_comments,
+            progress_cb=progress_cb,
+            budget=ReviewBudget(
+                max_llm_calls=self.budget_calls,
+                max_input_tokens=self.budget_tokens,
+                max_seconds=self.budget_seconds,
+            ),
+            local_mode=local_mode,
+            local_input=local_input,
+        )
+
+    def _execute(self, state: ReviewState) -> Path:
+        state = self._build_workflow().run(state)
+        self.last_state = state
+        self.last_result = state.review_result
+        if state.report_path is None:
+            raise RuntimeError("Review workflow finished without a report path.")
+        logger.info("Stage timings: %s", state.stages)
+        return state.report_path
 
     def run(
         self,
@@ -214,22 +278,71 @@ class ReviewPipeline:
         message)
         :param post_comments: 是否通过 GitHub Review API 发表行内评论
         """
-        state = ReviewState(
+        state = self._new_state(
             pr_url=pr_url,
-            output_dir=Path(output_dir),
-            post_comments=post_comments,
+            output_dir=output_dir,
             progress_cb=progress_cb,
-            budget=ReviewBudget(
-                max_llm_calls=self.budget_calls,
-                max_input_tokens=self.budget_tokens,
-                max_seconds=self.budget_seconds,
-            ),
+            post_comments=post_comments,
         )
-        state = self._build_workflow().run(state)
-        if state.report_path is None:
-            raise RuntimeError("Review workflow finished without a report path.")
-        logger.info("Stage timings: %s", state.stages)
-        return state.report_path
+        return self._execute(state)
+
+    def run_local(
+        self,
+        repo_path: str | Path,
+        base_sha: str,
+        head_sha: str,
+        output_dir: Optional[Path] = None,
+        *,
+        owner: str = "local",
+        repo: str = "repo",
+        pr_number: int = 0,
+        title: Optional[str] = None,
+        body: Optional[str] = None,
+        pr_url: Optional[str] = None,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+        keep_worktrees: bool = False,
+    ) -> Path:
+        """不依赖 GitHub API，在本地仓库上跑完整 review。
+
+        适用于代码评测（AACR-Bench 等）和离线回放：输入是仓库路径 +
+        base/head commit，pipeline 会创建临时 detached worktree，结束后清理。
+        需要 GitHub 写操作的 ``post_comments`` 在本地模式下不生效。
+        """
+        resolved_repo = Path(repo_path).expanduser().resolve()
+        base = base_sha.strip()
+        head = head_sha.strip()
+        if not base or not head:
+            raise ValueError("base_sha and head_sha are required")
+        if base == head:
+            raise ValueError("base_sha and head_sha are identical; nothing to review")
+
+        synthetic_url = pr_url or (
+            f"local://{resolved_repo}@{base[:7]}..{head[:7]}"
+        )
+        local_input = LocalReviewInput(
+            repo_path=resolved_repo,
+            base_sha=base,
+            head_sha=head,
+            owner=owner,
+            repo=repo,
+            pr_number=pr_number,
+            title=title,
+            body=body,
+            pr_url=pr_url,
+            keep_worktrees=keep_worktrees,
+        )
+        state = self._new_state(
+            pr_url=synthetic_url,
+            output_dir=output_dir or Path("reports"),
+            progress_cb=progress_cb,
+            local_mode=True,
+            local_input=local_input,
+        )
+        try:
+            return self._execute(state)
+        finally:
+            if state.local_workspace is not None:
+                state.local_workspace.cleanup()
 
     # ------------------------------------------------------------------
     # 节点实现
@@ -246,6 +359,47 @@ class ReviewPipeline:
         with self._timed(state, "fetch_pr"):
             state.pr_info = self.gh_client.get_pull_request(state.pr_ref)
             state.raw_files = self.gh_client.list_changed_files(state.pr_ref)
+
+    def _node_load_local(self, state: ReviewState) -> None:
+        if state.local_input is None:
+            raise RuntimeError("local_mode requires local_input.")
+        local = state.local_input
+        if local.pr_url:
+            state.pr_url = local.pr_url
+        state.pr_info = PullRequestInfo(
+            owner=local.owner,
+            repo=local.repo,
+            pr_number=local.pr_number,
+            title=local.title
+            or f"Local review {local.base_sha[:7]}..{local.head_sha[:7]}",
+            body=local.body,
+            base_branch=local.base_sha[:7],
+            head_branch=local.head_sha[:7],
+            base_sha=local.base_sha,
+            head_sha=local.head_sha,
+            html_url=local.pr_url or state.pr_url,
+        )
+
+    def _node_prepare_local(self, state: ReviewState) -> None:
+        if state.local_input is None:
+            raise RuntimeError("local_mode requires local_input.")
+        local = state.local_input
+        self._log(state, 3, "Preparing local base/head worktrees...")
+        with self._timed(state, "prepare_local"):
+            workspace = prepare_local_workspace(
+                local.repo_path,
+                local.base_sha,
+                local.head_sha,
+                keep=local.keep_worktrees,
+            )
+            # 先挂到 state 上：即使后面的 diff 生成失败，run_local 的 finally
+            # 也能清理 worktree。
+            state.local_workspace = workspace
+            state.local_repo_path = workspace.head_path
+            state.base_path = workspace.base_path
+            state.raw_files = collect_local_changes(
+                workspace.repo_path, local.base_sha, local.head_sha
+            )
 
     def _node_cache_lookup(self, state: ReviewState) -> None:
         if state.pr_info is None:
@@ -553,6 +707,7 @@ class ReviewPipeline:
             return ""
         return fingerprint(
             state.pr_url,
+            state.pr_info.base_sha,
             state.pr_info.head_sha,
             str(getattr(self.llm_client, "model", "unknown")),
             PROMPT_VERSION,

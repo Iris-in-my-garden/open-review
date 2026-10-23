@@ -32,6 +32,7 @@
 - **Prompt Injection 防护**：不可信内容统一包裹 + 标签转义 + 输出证据校验 + 命中规则提示
 - **GitHub API 重试/限流处理**，单维度失败不影响整体，失败信息写入报告
 - **仓库缓存并发安全**：仓库级 `FileLock` + blobless partial clone + 平台缓存目录 + 按 mtime 淘汰
+- **本地仓库模式**：输入 `repo_path + base_sha + head_sha` 即可离线 review，不依赖 GitHub API；用 detached worktree 隔离 head/base，结束后自动清理（评测/回放用）
 - **单一检索与审查路径**：tree-sitter AST 是唯一上下文来源，四维度并行是唯一审查模式，避免维护未评测的实现
 - **可观测性**：`logging` + 阶段耗时 / 批次 / LLM 调用次数 / 真实 token 用量 / 预算与缓存命中，统一写入报告 `Run Metrics`
 - **严重级别收口**：`critical|high|medium|low` 使用 `Literal` 校验，兼容 `HIGH`、`严重` 等别名后再归一化
@@ -162,9 +163,39 @@ openreview review https://github.com/owner/repo/pull/123 \
   --llm-cache-dir .cache/llm \
   --llm-cache-mode record
 
+# 同时导出机器可读结果（含 source_aspects / Run Metrics），供评测脚本消费
+openreview review https://github.com/owner/repo/pull/123 \
+  --json-out reports/result.json
+
 # 打开 debug 日志（阶段耗时、检索数量、重试等）
 openreview review https://github.com/owner/repo/pull/123 --verbose
 ```
+
+### 本地仓库模式（评测 / 离线回放）
+
+不经过 GitHub API，直接对任意本地 git 仓库的 `base..head` 做 review。适合
+AACR-Bench 这类给出 `repo + base_commit + head_commit` 的评测集：
+
+```python
+from pathlib import Path
+from openreview.services.review_service import ReviewPipeline
+
+with ReviewPipeline(mock_llm=True) as pipeline:
+    report = pipeline.run_local(
+        repo_path=Path("/path/to/repo"),
+        base_sha="<base_commit>",
+        head_sha="<head_commit>",
+        output_dir=Path("reports/local"),
+        owner="encode",
+        repo="httpx",
+        pr_number=1055,
+    )
+    result = pipeline.last_result  # ReviewResult，含 source_aspects / metrics
+```
+
+`run_local` 会在系统临时目录创建 detached head/base worktree，结束后自动清理
+（`keep_worktrees=True` 可保留用于排查）。本地模式不会执行 GitHub 写操作，
+`post_comments` 不生效。
 
 报告默认写入 `reports/<owner>_<repo>_pr_<number>_review.md`，可用 `--output` 指定目录。
 
@@ -178,6 +209,7 @@ src/openreview/
 ├── github/                    # GitHub REST API 与 PR URL 解析
 ├── repo/
 │   ├── manager.py             # 仓库 clone / fetch / head+base worktree
+│   ├── local.py               # 本地 repo + base/head worktree + git diff（评测/离线）
 │   └── diff_parser.py         # Hunk、变更行、可见行、符号提取
 ├── retriever/
 │   ├── base.py                # Retriever 协议
@@ -198,7 +230,7 @@ src/openreview/
 │   ├── assessment.py          # 风险等级 / 决策 / 跨维度去重 / 批次合并
 │   ├── test_gap.py            # 基于关联测试文件的测试缺口分析
 │   ├── comment_builder.py     # GitHub Review body / 行内评论构造
-│   ├── report_writer.py       # Markdown / Run Metrics 渲染
+│   ├── report_writer.py       # Markdown / JSON / Run Metrics 渲染
 │   └── llm_client.py          # 真实 / Mock LLM 客户端（含 token usage）
 └── services/review_service.py # 有界工作流装配与节点实现
 ```

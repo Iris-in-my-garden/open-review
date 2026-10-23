@@ -199,3 +199,11 @@ class ReportWriter:
         file_path.write_text(content, encoding="utf-8")
 
         return file_path
+
+    @classmethod
+    def write_json(cls, result: ReviewResult, path: Path) -> Path:
+        """导出机器可读结果（含 source_aspects / metrics），供评测消费。"""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+        return path

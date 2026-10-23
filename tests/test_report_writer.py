@@ -1,4 +1,5 @@
 # tests/test_report_writer.py
+import json
 from pathlib import Path
 
 from openreview.review.report_writer import (
@@ -158,3 +159,32 @@ def test_run_metrics_are_rendered(tmp_path: Path):
     assert "**Stages**: fetch_pr=0.25s, retrieve_and_review=1.50s" in content
     assert "**LLM Calls**: 4" in content
     assert "**Estimated Patch Tokens**: 120" in content
+
+
+def test_write_json_includes_source_aspects(tmp_path: Path):
+    issue = PotentialIssue(
+        file="src/auth.py",
+        severity="high",
+        category="bugs",
+        confidence=0.9,
+        reasoning="Missing guard.",
+        suggestion="Add a guard.",
+        source_aspects=["bugs", "security"],
+    )
+    result = ReviewResult(
+        owner="org",
+        repo="project",
+        pr_number=1,
+        summary="Summary.",
+        risk_level="HIGH",
+        risk_reason="Reason.",
+        potential_issues=[issue],
+        final_decision="REQUEST_CHANGES",
+        final_summary="Fix it.",
+    )
+
+    path = ReportWriter.write_json(result, tmp_path / "nested" / "result.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload["potential_issues"][0]["source_aspects"] == ["bugs", "security"]
+    assert payload["final_decision"] == "REQUEST_CHANGES"
