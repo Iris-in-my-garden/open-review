@@ -2,7 +2,7 @@
 import logging
 import re
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
 from openreview.retriever.code_context import CodeContext
@@ -45,6 +45,8 @@ class FindingValidator:
         self.missing_evidence_penalty = missing_evidence_penalty
         self.ungrounded_evidence_penalty = ungrounded_evidence_penalty
         self.grounded_evidence_bonus = grounded_evidence_bonus
+        # 最近一次 validate 的计数，供 pipeline 写入 metrics / 评测分析。
+        self.last_stats: Dict[str, int] = {}
 
     def validate(
         self,
@@ -55,12 +57,25 @@ class FindingValidator:
     ) -> ReviewResult:
         files_by_name = {file.filename: file for file in parsed_diff.files}
         contexts = contexts or []
+        stats = {
+            "candidates": len(result.potential_issues),
+            "kept": 0,
+            "dropped_unknown_file": 0,
+            "invalid_line": 0,
+            "missing_line": 0,
+            "missing_evidence": 0,
+            "ungrounded_evidence": 0,
+            "grounded_evidence": 0,
+            "low_confidence": 0,
+            "deduplicated": 0,
+        }
 
         filtered_issues: List[PotentialIssue] = []
         for issue in result.potential_issues:
             file_diff = files_by_name.get(issue.file)
             # 规则 1: 防止文件路径幻觉（确保 Issue 指向的文件在 Diff 中存在）
             if file_diff is None:
+                stats["dropped_unknown_file"] += 1
                 continue
 
             confidence = issue.confidence
@@ -71,6 +86,7 @@ class FindingValidator:
                     issue.line = None
                     issue.end_line = None
                     confidence -= self.invalid_line_penalty
+                    stats["invalid_line"] += 1
                 elif issue.end_line is not None:
                     if issue.end_line < issue.line:
                         issue.end_line = None
@@ -78,6 +94,7 @@ class FindingValidator:
                         issue.end_line = None
             elif file_diff.visible_lines:
                 confidence -= self.missing_line_penalty
+                stats["missing_line"] += 1
 
             # 规则 3: evidence 必须能在真实代码中找到
             grounding = self._check_evidence(
@@ -85,10 +102,13 @@ class FindingValidator:
             )
             if grounding is None:
                 confidence -= self.missing_evidence_penalty
+                stats["missing_evidence"] += 1
             elif grounding:
                 confidence += self.grounded_evidence_bonus
+                stats["grounded_evidence"] += 1
             else:
                 confidence -= self.ungrounded_evidence_penalty
+                stats["ungrounded_evidence"] += 1
                 logger.debug(
                     "Ungrounded evidence for %s:%s: %r",
                     issue.file,
@@ -99,6 +119,7 @@ class FindingValidator:
             issue.confidence = round(max(0.0, min(1.0, confidence)), 2)
             # 规则 4: 过滤低置信度
             if issue.confidence < self.min_confidence:
+                stats["low_confidence"] += 1
                 continue
 
             issue.severity = normalize_severity(issue.severity)
@@ -107,7 +128,11 @@ class FindingValidator:
         # 规则过滤会改变问题集合，风险等级 / 决策 / 证据必须同步重算，
         # 否则报告会出现 “HIGH + 8 issues” 但正文 “No issues found” 的矛盾。
         # 同时再做一次跨维度去重，覆盖不经过 OutputParser.aggregate_aspects 的单 Reviewer 路径。
+        before_dedupe = len(filtered_issues)
         filtered_issues = deduplicate_issues(filtered_issues)
+        stats["deduplicated"] = before_dedupe - len(filtered_issues)
+        stats["kept"] = len(filtered_issues)
+        self.last_stats = stats
         result.potential_issues = filtered_issues
         result.risk_level, result.risk_reason = assess_risk(filtered_issues)
         result.final_decision = decide(result.risk_level)

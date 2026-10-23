@@ -145,3 +145,15 @@ def test_base_revision_context_is_used_for_removed_symbols(tmp_path: Path):
     assert all(
         context.score <= SCORE_BASE_DEFINITION for context in base_contexts
     )
+
+
+def test_git_grep_timeout_is_bounded(monkeypatch, tmp_path: Path):
+    def _timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", _timeout)
+    contexts = TreeSitterLocalRetriever()._search_with_git_grep(
+        tmp_path, {"target"}, set(), {}
+    )
+
+    assert contexts == []

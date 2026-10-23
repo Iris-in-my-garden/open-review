@@ -18,10 +18,10 @@ jobs:
         run: uv sync --frozen
 
       - name: Lint
-        run: uv run ruff check src tests
+        run: uv run ruff check src tests evaluation
 
       - name: Type check
-        run: uv run mypy src
+        run: uv run mypy src evaluation
 
       - name: Test
         run: uv run pytest -q

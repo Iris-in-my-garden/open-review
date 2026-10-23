@@ -550,6 +550,15 @@ class ReviewPipeline:
                 state.budget.consume(calls=len(aspects), tokens=estimated_tokens)
                 batch_results.append(result)
 
+                # 多批次时累加 validator 计数；只保留最后一批会低估失败模式。
+                validator = getattr(self.reviewer, "validator", None)
+                stats = getattr(validator, "last_stats", None)
+                if stats:
+                    for key, value in stats.items():
+                        state.validation_stats[key] = (
+                            state.validation_stats.get(key, 0) + int(value)
+                        )
+
         if not batch_results:
             raise RuntimeError(
                 "No review results were produced. "
@@ -726,10 +735,34 @@ class ReviewPipeline:
         context_tokens = sum(
             estimate_tokens(context.snippet) for context in state.all_contexts
         )
+        diff_files = parsed_diff.files if parsed_diff else []
+        changed_files = {file.filename for file in diff_files}
+        context_files = {context.file_path for context in state.all_contexts}
+        covered_files = changed_files & context_files
         return {
             "stages_seconds": dict(state.stages),
             "total_seconds": round(sum(state.stages.values()), 3),
-            "files": len(parsed_diff.files) if parsed_diff else 0,
+            "files": len(diff_files),
+            "diff": {
+                "files": len(diff_files),
+                "additions": sum(file.additions for file in diff_files),
+                "deletions": sum(file.deletions for file in diff_files),
+                "languages": sorted(
+                    {file.language for file in diff_files if file.language}
+                ),
+            },
+            "retrieval": {
+                "contexts": len(state.all_contexts),
+                "context_files": len(context_files),
+                "changed_files": len(changed_files),
+                "covered_changed_files": len(covered_files),
+                "changed_file_coverage": (
+                    round(len(covered_files) / len(changed_files), 3)
+                    if changed_files
+                    else 0.0
+                ),
+                "context_tokens": context_tokens,
+            },
             "batches": len(state.batches),
             "aspects": len(state.selected_aspects),
             "llm_calls": state.budget.used_llm_calls,
@@ -749,6 +782,7 @@ class ReviewPipeline:
                 "enabled": self.static_analysis_enabled,
                 "findings": state.static_count,
             },
+            "validation": dict(state.validation_stats),
             "verifier": dict(state.verifier_stats),
             "cache": {
                 "review_hit": state.cache_hit,

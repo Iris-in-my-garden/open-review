@@ -13,7 +13,11 @@ logger = logging.getLogger(__name__)
 
 MAX_CONTEXT_COUNT = 20
 MAX_FILE_SIZE = 500 * 1024  # 500 KB 限制
-MAX_SEARCH_TARGETS = 200
+# 大 PR（尤其是包含生成代码的 PR）可能有几百个符号。git grep 的耗时随
+# `-e` 数量快速增长，200 个目标在真实仓库上能跑几分钟。50 个目标已经足够
+# 覆盖主要变更，同时把单次检索压到秒级。
+MAX_SEARCH_TARGETS = 50
+GIT_GREP_TIMEOUT_SECONDS = 15.0
 MAX_TEST_CONTEXT_COUNT = 8
 MAX_TEST_SNIPPET_LINES = 120
 
@@ -328,7 +332,12 @@ class TreeSitterLocalRetriever:
     ) -> List[CodeContext]:
         contexts: List[CodeContext] = []
 
-        valid_targets = sorted(target for target in targets if target and target.strip())
+        # 超长 PR 必须截断时，优先保留更长、更具体的符号；按字母序截断容易
+        # 留下 `init` / `x` / `Context` 这类高频噪声，挤掉真正有信息量的名字。
+        valid_targets = sorted(
+            (target for target in targets if target and target.strip()),
+            key=lambda target: (-len(target), target),
+        )
         if not valid_targets:
             return []
 
@@ -345,10 +354,25 @@ class TreeSitterLocalRetriever:
             cmd.extend(["-e", symbol])
 
         try:
-            process = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            process = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=GIT_GREP_TIMEOUT_SECONDS,
+            )
             if process.returncode not in (0, 1):
                 logger.warning("git grep failed with code %d", process.returncode)
                 return []
+        except subprocess.TimeoutExpired:
+            # 检索只是增强上下文，不能因为一个大仓库把整次 review 挂住。
+            logger.warning(
+                "git grep timed out after %.0fs for %d targets; "
+                "continuing without git-grep context",
+                GIT_GREP_TIMEOUT_SECONDS,
+                len(valid_targets),
+            )
+            return contexts
         except FileNotFoundError as exc:
             raise RuntimeError("Git is required but not found in system path.") from exc
 

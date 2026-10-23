@@ -211,3 +211,52 @@ def test_validate_evidence_can_be_grounded_in_local_source(tmp_path):
 
     assert len(result.potential_issues) == 1
     assert result.potential_issues[0].confidence == 0.75
+
+
+def test_validate_records_counters_for_eval():
+    validator = FindingValidator()
+    grounded = PotentialIssue(
+        file="src/auth.py",
+        severity="High",
+        category="Security",
+        confidence=0.7,
+        reasoning="Hardcoded password.",
+        suggestion="Use env vars.",
+        line=1,
+        evidence='password = "123"',
+    )
+    invalid_line = PotentialIssue(
+        file="src/auth.py",
+        severity="High",
+        category="Security",
+        confidence=0.9,
+        reasoning="Line outside the diff.",
+        suggestion="Check it.",
+        line=99,
+    )
+    unknown_file = PotentialIssue(
+        file="src/missing.py",
+        severity="Critical",
+        category="Security",
+        confidence=0.9,
+        reasoning="Hallucinated file.",
+        suggestion="N/A.",
+    )
+
+    result = validator.validate(
+        _result([grounded, invalid_line, unknown_file]), _diff_with_patch()
+    )
+
+    assert len(result.potential_issues) == 2
+    assert validator.last_stats == {
+        "candidates": 3,
+        "kept": 2,
+        "dropped_unknown_file": 1,
+        "invalid_line": 1,
+        "missing_line": 0,
+        "missing_evidence": 1,
+        "ungrounded_evidence": 0,
+        "grounded_evidence": 1,
+        "low_confidence": 0,
+        "deduplicated": 0,
+    }

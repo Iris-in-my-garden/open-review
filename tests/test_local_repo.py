@@ -111,6 +111,9 @@ def test_run_local_generates_report_and_json(tmp_path: Path):
         assert pipeline.last_result.pr_number == 7
         assert pipeline.last_state is not None
         assert pipeline.last_state.local_mode is True
+        assert pipeline.last_result.metrics["diff"]["files"] >= 1
+        assert pipeline.last_result.metrics["retrieval"]["changed_files"] >= 1
+        assert "candidates" in pipeline.last_result.metrics["validation"]
 
         json_path = ReportWriter.write_json(
             pipeline.last_result, output_dir / "result.json"
