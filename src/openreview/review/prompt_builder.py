@@ -24,6 +24,7 @@ OUTPUT_CONSTRAINTS = """### 【输出约束】（必须遵守）
 2. `evidence` 必须逐字引用 Patch 或 Context 中的代码片段；找不到证据就不要报告该问题。
 3. `suggested_patch` 使用 unified diff 格式，只修改与问题相关的行；无法给出时留空。
 4. 宁缺毋滥：只报告有明确证据、能说明触发场景的问题。
+5. 如果结论依赖 `Context`，把对应上下文的 `[ctx-xxxxxxxx]` 写入 `context_refs`；禁止编造不存在的 ID。
 """
 
 # Prompt Injection 检测规则：命中后仅作为“风险提示”，不会阻断审查

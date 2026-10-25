@@ -44,6 +44,11 @@ from evaluation.deterministic import (
 from evaluation.deterministic import (
     print_summary as print_deterministic_summary,
 )
+from evaluation.retrieval import (
+    compute_retrieval_metrics,
+    print_retrieval_summary,
+    write_retrieval_metrics,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EVAL_ROOT = PROJECT_ROOT / "evaluation"
@@ -154,6 +159,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         triage_enabled=not args.no_triage,
         impact_enabled=not args.no_impact,
         verifier_enabled=not args.no_verifier,
+        hybrid_retrieval_enabled=not args.no_hybrid_retrieval,
         budget_calls=args.budget_calls,
         review_cache_enabled=bool(review_cache_dir),
         review_cache_dir=str(review_cache_dir) if review_cache_dir else None,
@@ -202,7 +208,20 @@ def cmd_metrics(args: argparse.Namespace) -> int:
     )
     path = write_metrics(metrics, metrics_dir, run_id=run_id)
     print_deterministic_summary(metrics)
+
+    retrieval_metrics = compute_retrieval_metrics(
+        instances,
+        results_dir=results_dir,
+        run_id=run_id,
+        split=args.split,
+    )
+    retrieval_path = write_retrieval_metrics(
+        retrieval_metrics, metrics_dir, run_id=run_id
+    )
+    print_retrieval_summary(retrieval_metrics)
+
     print(f"metrics -> {path}")
+    print(f"retrieval metrics -> {retrieval_path}")
     return 0
 
 
@@ -275,6 +294,11 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--no-triage", action="store_true")
     review.add_argument("--no-impact", action="store_true")
     review.add_argument("--no-verifier", action="store_true")
+    review.add_argument(
+        "--no-hybrid-retrieval",
+        action="store_true",
+        help="关闭 FTS5 符号索引，仅用 tree-sitter AST 检索（消融用）",
+    )
     review.add_argument("--keep-worktrees", action="store_true")
     review.add_argument("--fail-fast", action="store_true")
     review.add_argument(

@@ -20,6 +20,7 @@ from openreview.review.report_writer import PotentialIssue, ReviewResult
 logger = logging.getLogger(__name__)
 
 MAX_GROUNDING_FILE_SIZE = 500 * 1024
+MAX_SUGGESTED_PATCH_SIZE = 100_000
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+")
 COMMON_EVIDENCE_TOKENS = {
     "self",
@@ -307,6 +308,8 @@ class FindingValidator:
         patch = (issue.suggested_patch or "").strip()
         if not patch or repo_path is None:
             return None, None
+        if len(patch) > MAX_SUGGESTED_PATCH_SIZE:
+            return False, "patch too large"
 
         repo_path = Path(repo_path).resolve()
         if not (repo_path / issue.file).is_file():

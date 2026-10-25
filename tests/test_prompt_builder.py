@@ -111,3 +111,53 @@ def test_patch_and_context_budgets_are_enforced():
 
     assert "内容因 token 预算被截断" in prompt
     assert "另有 1 段上下文因 token 预算被省略" in prompt
+
+
+def test_all_aspects_share_system_prefix_and_persona_is_at_end():
+    builder = PromptBuilder()
+    system_prompts = {
+        builder.build_system_prompt_for_aspect(aspect)
+        for aspect in ("clean_code", "bugs", "performance", "security")
+    }
+    assert len(system_prompts) == 1
+    assert "QA" not in next(iter(system_prompts))
+
+    bugs = builder.build_user_prompt_for_aspect("bugs", _pr(), _diff(), [])
+    security = builder.build_user_prompt_for_aspect("security", _pr(), _diff(), [])
+
+    marker = "### 【当前审查维度】"
+    assert bugs.split(marker)[0] == security.split(marker)[0]
+    assert "QA" in bugs.split(marker)[1]
+    assert bugs.index("QA") > bugs.index(UNTRUSTED_START)
+
+
+def test_context_ids_are_rendered_and_injected_next_to_matching_file():
+    same_file = CodeContext(
+        file_path="src/utils.py",
+        reason="enclosing function",
+        snippet="def new_func():\n    return 1",
+        score=0.9,
+        kind="enclosing",
+        symbol="new_func",
+        start_line=10,
+        end_line=11,
+    )
+    other_file = CodeContext(
+        file_path="src/other.py",
+        reason="imported dependency",
+        snippet="def helper():\n    return 2",
+        score=0.6,
+        kind="dependency",
+        symbol="helper",
+        start_line=1,
+        end_line=2,
+    )
+
+    prompt = PromptBuilder().build_user_prompt(_pr(), _diff(), [same_file, other_file])
+
+    assert "[ctx-" in prompt
+    assert same_file.context_id in prompt
+    assert "Related context（同文件" in prompt
+    assert "src/other.py" in prompt
+    # 同文件 context 必须出现在 patch 块和“其他文件”section 之间。
+    assert prompt.index("Related context（同文件") < prompt.index("5. Retrieved Context Snippets")

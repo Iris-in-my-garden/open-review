@@ -118,7 +118,6 @@ class QueryBuilder:
                 if (
                     cleaned
                     and len(cleaned) >= 3
-                    and cleaned.lower() not in _COMMON_NAMES
                     and cleaned not in symbols
                 ):
                     symbols.append(cleaned)

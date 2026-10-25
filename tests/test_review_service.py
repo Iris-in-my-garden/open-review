@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from openreview.github.client import ChangedFile, PullRequestInfo
+from openreview.retriever.code_context import CodeContext
 from openreview.review.report_writer import PotentialIssue, ReviewResult
 from openreview.services.review_service import ReviewPipeline
 
@@ -105,6 +106,52 @@ class FakeReviewer:
             final_summary="summary",
             review_notes=[],
         )
+
+
+class FakeContextRetriever:
+    """返回带 context_id / symbol 的结构化上下文，用于验证指标链路。"""
+
+    def __init__(self):
+        self.calls = 0
+        self.last_stats = {"index_symbol_hits": 1}
+
+    def retrieve(self, repo_path, parsed_diff, base_path=None):
+        self.calls += 1
+        filename = parsed_diff.files[0].filename
+        return [
+            CodeContext(
+                file_path=filename,
+                reason="definition",
+                snippet="def x(): ...",
+                score=0.9,
+                kind="definition",
+                symbol="x",
+                start_line=1,
+                end_line=1,
+            )
+        ]
+
+
+class FakeContextReviewer(FakeReviewer):
+    def review(self, pr_info, parsed_diff, contexts, repo_path=None, aspects=None):
+        result = super().review(
+            pr_info, parsed_diff, contexts, repo_path=repo_path, aspects=aspects
+        )
+        result.potential_issues[0].context_refs = [
+            context.ensure_context_id() for context in contexts
+        ]
+        return result
+
+
+class FakeCachedReviewer(FakeReviewer):
+    """模拟“reviewer 使用预算客户端但本次全部命中缓存”的情况。"""
+
+    class _CachedClient:
+        has_budget = True
+
+    def __init__(self):
+        super().__init__()
+        self.llm_client = self._CachedClient()
 
 
 def test_pipeline_batches_merges_and_posts_comments(tmp_path: Path):
@@ -213,3 +260,77 @@ def test_pipeline_review_cache_skips_second_run(tmp_path: Path):
     content = second.read_text(encoding="utf-8")
     assert "命中本地 review 缓存" in content
 
+
+def test_pipeline_surfaces_retrieval_metrics_and_context_refs(tmp_path: Path):
+    files = [
+        ChangedFile(
+            filename=f"src/file_{index}.py",
+            status="modified",
+            additions=1,
+            deletions=0,
+            changes=1,
+            patch="@@ -0,0 +1,1 @@\n+def x():\n",
+        )
+        for index in range(2)
+    ]
+    pipeline = ReviewPipeline(mock_llm=True, max_batch_tokens=1)
+    pipeline.gh_client = FakeGitHubClient(files=files)
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeContextRetriever()
+    pipeline.reviewer = FakeContextReviewer()
+
+    pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+
+    assert pipeline.last_state is not None
+    result = pipeline.last_state.review_result
+    assert result is not None
+    retrieval = result.metrics["retrieval"]
+    assert retrieval["contexts"] == 2
+    assert retrieval["unique_contexts"] == 2
+    assert retrieval["duplicate_contexts"] == 0
+    assert retrieval["context_file_list"] == ["src/file_0.py", "src/file_1.py"]
+    assert retrieval["index_context_file_list"] == [
+        "src/file_0.py",
+        "src/file_1.py",
+    ]
+    assert retrieval["context_kinds"] == {"definition": 2}
+    assert retrieval["stats"] == {"index_symbol_hits": 2}
+    assert retrieval["symbol_coverage"] == 1.0
+
+    # context_refs 从 prompt 上下文 -> finding -> validator -> result 全链路保留。
+    assert all(issue.context_refs for issue in result.potential_issues)
+
+    pipeline.close()
+
+
+def test_pipeline_does_not_charge_budget_for_client_side_cache_hits(tmp_path: Path):
+    pipeline = ReviewPipeline(
+        mock_llm=True,
+        max_batch_tokens=1,
+        budget_calls=10,
+        verifier_enabled=False,
+    )
+    pipeline.gh_client = FakeGitHubClient(
+        files=[
+            ChangedFile(
+                filename="src/file_0.py",
+                status="modified",
+                additions=1,
+                deletions=0,
+                changes=1,
+                patch="@@ -0,0 +1,1 @@\n+x = 1\n",
+            )
+        ]
+    )
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+    pipeline.reviewer = FakeCachedReviewer()
+
+    pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+
+    assert pipeline.last_state is not None
+    # reviewer 自带预算客户端且本次没有真实调用（缓存命中），
+    # _node_analyze 不应再按维度数补扣预算。
+    assert pipeline.last_state.budget.used_llm_calls == 0
+
+    pipeline.close()

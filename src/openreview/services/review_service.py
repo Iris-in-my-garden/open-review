@@ -570,9 +570,12 @@ class ReviewPipeline:
                         + ", ".join(aspects)
                     )
 
-                # 先按调用数做快速检查；token 预算由 BudgetedLLMClient 在
-                # 每次真实调用前精确扣减，避免这里估算偏差导致误杀。
-                if not state.budget.allow(calls=len(aspects)):
+                # 先按调用数 + 保守 token 下界做快速检查；真正的 token
+                # 扣减由 BudgetedLLMClient 在每次调用前精确执行。
+                preflight_tokens = estimated_tokens * max(1, len(aspects)) + 2000
+                if not state.budget.allow(
+                    calls=len(aspects), tokens=preflight_tokens
+                ):
                     state.add_note(
                         "[budget] LLM 调用或 token 预算不足，"
                         f"批次 {index}/{len(batches)} 起未执行审查。"
@@ -592,7 +595,16 @@ class ReviewPipeline:
                 )
                 # 真实客户端由 BudgetedLLMClient 扣账；FakeReviewer / 自定义
                 # reviewer 绕过客户端时，这里补一次，保证预算语义一致。
-                if state.budget.used_llm_calls == calls_before:
+                # 注意：LLM cache hit 也不会增加 used_llm_calls，但它本来就
+                # 不应该消耗预算；因此只有 reviewer 不依赖预算客户端时才补账。
+                reviewer_client = getattr(self.reviewer, "llm_client", None)
+                reviewer_has_budget = bool(
+                    getattr(reviewer_client, "has_budget", False)
+                )
+                if (
+                    state.budget.used_llm_calls == calls_before
+                    and not reviewer_has_budget
+                ):
                     state.budget.consume(
                         calls=len(aspects), tokens=estimated_tokens
                     )
@@ -846,6 +858,8 @@ class ReviewPipeline:
                     else 0.0
                 ),
                 "index_context_files": len(index_context_files),
+                "context_file_list": sorted(context_files)[:100],
+                "index_context_file_list": sorted(index_context_files)[:100],
                 "hybrid_enabled": self.hybrid_retrieval_enabled,
                 "stats": dict(state.retrieval_stats),
             },

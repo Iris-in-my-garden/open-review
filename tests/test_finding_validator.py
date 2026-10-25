@@ -1,3 +1,6 @@
+import subprocess
+from pathlib import Path
+
 from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
 from openreview.review.finding_validator import FindingValidator
 from openreview.review.report_writer import PotentialIssue, ReviewResult
@@ -257,6 +260,81 @@ def test_validate_records_counters_for_eval():
         "missing_evidence": 1,
         "ungrounded_evidence": 0,
         "grounded_evidence": 1,
+        "evidence_exact": 1,
+        "evidence_line_match": 0,
+        "evidence_token_match": 0,
+        "invalid_context_ref": 0,
         "low_confidence": 0,
         "deduplicated": 0,
+        "patch_checked": 0,
+        "patch_valid": 0,
+        "patch_invalid": 0,
     }
+
+
+def _git_repo_with_auth(tmp_path: Path) -> Path:
+    root = tmp_path / "repo"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "auth.py").write_text('password = "123"\n', encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=a@b.c", "-c", "user.name=t", "commit", "-qm", "init"],
+        cwd=root,
+        check=True,
+    )
+    return root
+
+
+def test_validate_checks_suggested_patch_with_git_apply(tmp_path: Path):
+    root = _git_repo_with_auth(tmp_path)
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="src/auth.py",
+                status="modified",
+                patch='@@ -1 +1 @@\n-password = "123"\n+password = "456"\n',
+                changed_lines=[1],
+                visible_lines=[1],
+            )
+        ]
+    )
+    valid = PotentialIssue(
+        file="src/auth.py",
+        severity="high",
+        category="security",
+        confidence=0.9,
+        reasoning="Hardcoded password.",
+        suggestion="Use env vars.",
+        line=1,
+        evidence='password = "123"',
+        suggested_patch=(
+            '@@ -1 +1 @@\n-password = "123"\n+password = "456"\n'
+        ),
+    )
+    invalid = PotentialIssue(
+        file="src/auth.py",
+        severity="high",
+        category="security",
+        confidence=0.9,
+        reasoning="Another issue on the same line.",
+        suggestion="Check patch.",
+        line=1,
+        evidence='password = "123"',
+        suggested_patch=(
+            '@@ -1 +1 @@\n-not_present = 1\n+not_present = 2\n'
+        ),
+    )
+
+    validator = FindingValidator()
+    result = validator.validate(
+        _result([valid, invalid]), diff, repo_path=root
+    )
+
+    by_reason = {issue.reasoning: issue for issue in result.potential_issues}
+    assert by_reason["Hardcoded password."].suggested_patch_valid is True
+    assert by_reason["Another issue on the same line."].suggested_patch_valid is False
+    assert by_reason["Another issue on the same line."].suggested_patch_error
+    assert validator.last_stats["patch_checked"] == 2
+    assert validator.last_stats["patch_valid"] == 1
+    assert validator.last_stats["patch_invalid"] == 1

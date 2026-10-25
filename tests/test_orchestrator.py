@@ -64,7 +64,9 @@ class AspectFailingLLM:
         user_prompt: str,
         response_schema: Type[T],
     ) -> T:
-        if "QA" in system_prompt:  # bugs 维度
+        # persona 在 Phase 1 后移到 user prompt 尾部（共享 system 前缀给缓存），
+        # 因此这里按 user_prompt 识别 bugs 维度。
+        if "QA" in user_prompt:  # bugs 维度
             raise RuntimeError("simulated provider error")
         return response_schema(aspect_summary="ok", issues=[_issue()])
 

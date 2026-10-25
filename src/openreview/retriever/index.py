@@ -22,7 +22,6 @@ import re
 import sqlite3
 import subprocess
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -254,6 +253,9 @@ class RepoIndex:
 
         with FileLock(str(lock_path), timeout=120):
             old_head = self._meta("head_sha")
+            schema_version = self._meta("schema_version")
+            if schema_version and schema_version != INDEX_SCHEMA_VERSION:
+                force = True
             if not force and old_head == head_sha:
                 self.last_stats = {
                     "index_head": head_sha,
@@ -319,12 +321,16 @@ class RepoIndex:
         except ValueError:
             return False
         if not candidate.is_file() or candidate.suffix not in SUPPORTED_SUFFIXES:
+            # 文件被删除 / 改成不支持的类型时，必须清掉旧符号。
+            self._delete_file(rel_path)
             return False
         try:
             if candidate.stat().st_size > MAX_INDEXED_FILE_SIZE:
+                self._delete_file(rel_path)
                 return False
             data = candidate.read_bytes()
         except OSError:
+            self._delete_file(rel_path)
             return False
 
         digest = git_blob_sha(data)
@@ -350,8 +356,8 @@ class RepoIndex:
         suffix = Path(rel_path).suffix
         parsed = ast_utils.parse_text(text, suffix)
         symbols: List[Tuple[str, str, str, int, int, str]] = []
-        imports: List[Tuple[str, str, str, int]] = []
-        calls: List[Tuple[str, str, str, int]] = []
+        imports: List[Tuple[str, str, int]] = []
+        calls: List[Tuple[str, str, int]] = []
 
         if parsed is not None:
             _, source, tree = parsed
@@ -811,12 +817,23 @@ def _iter_source_files(repo_path: Path) -> Iterable[str]:
         raw_paths = []
 
     if raw_paths:
-        for rel_path in raw_paths:
+        for count, rel_path in enumerate(raw_paths):
+            if count >= MAX_INDEXED_FILES:
+                logger.warning(
+                    "Repo has more than %d indexable files; truncating index.",
+                    MAX_INDEXED_FILES,
+                )
+                return
             if _is_indexable(rel_path):
                 yield rel_path
         return
 
-    for path in sorted(repo_path.rglob("*")):
+    for count, path in enumerate(sorted(repo_path.rglob("*"))):
+        if count >= MAX_INDEXED_FILES:
+            logger.warning(
+                "Repo has more than %d files; truncating index.", MAX_INDEXED_FILES
+            )
+            return
         if not path.is_file():
             continue
         rel_path = path.relative_to(repo_path).as_posix()

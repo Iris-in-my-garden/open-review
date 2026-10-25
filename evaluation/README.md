@@ -93,6 +93,19 @@ uv run python -m evaluation.cli metrics \
 - `evaluation/results/aacr-pygo-v1/dev-mock/<instance_id>.json`
 - `evaluation/results/aacr-pygo-v1/dev-mock/summary_openreview.json`
 - `evaluation/metrics/aacr-pygo-v1/dev-mock/deterministic_dev-mock.json`
+- `evaluation/metrics/aacr-pygo-v1/dev-mock/retrieval_dev-mock.json`
+
+`deterministic_*.json` 覆盖行号合法性、证据可定位性、维度归因与成本；
+`retrieval_*.json` 是 Phase 1 的检索质量指标，完全不调用 LLM：
+
+- `file_recall` / `index_file_recall`：reference comment 指向的文件是否被上下文覆盖
+- `symbol_coverage`：diff 里的 changed symbols 有多少被检索回来
+- `citation_rate`：finding 是否真的引用了注入的 `context_refs`
+- `duplicate_context_rate` / `avg_contexts`：上下文是否重复或膨胀
+- `patch_validation`：`suggested_patch` 有多少能通过 `git apply --check`
+
+做检索消融时加 `--no-hybrid-retrieval`，关闭 FTS5 符号索引，只保留 tree-sitter
+AST 检索；两次 run 使用不同 `--run-id`，再比较 `retrieval_*.json`。
 
 ### 3. 真实模型（按需，产生费用）
 

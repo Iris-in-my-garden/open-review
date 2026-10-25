@@ -50,7 +50,7 @@ class HybridRetriever:
         self.max_contexts = max(1, max_contexts)
         self.query_builder = QueryBuilder()
         self._index_cache: Dict[str, RepoIndex] = {}
-        self.last_stats: Dict[str, int] = {}
+        self.last_stats: Dict[str, float] = {}
 
     def close(self) -> None:
         for index in self._index_cache.values():
@@ -67,7 +67,7 @@ class HybridRetriever:
         contexts = list(
             self.ast_retriever.retrieve(repo_path, parsed_diff, base_path=base_path)
         )
-        stats: Dict[str, int] = {
+        stats: Dict[str, float] = {
             "ast_contexts": len(contexts),
             "index_symbol_hits": 0,
             "index_importer_hits": 0,
@@ -100,7 +100,7 @@ class HybridRetriever:
         return _rank_and_dedupe(contexts, self.max_contexts)
 
     def _get_index(
-        self, repo_path: Path, stats: Dict[str, int]
+        self, repo_path: Path, stats: Dict[str, float]
     ) -> Optional[RepoIndex]:
         key = str(repo_path)
         cached = self._index_cache.get(key)
@@ -134,8 +134,8 @@ class HybridRetriever:
                 "index_files_indexed": int(
                     index.last_stats.get("index_files_indexed", 0)
                 ),
-                "index_build_seconds": int(
-                    float(index.last_stats.get("index_build_seconds", 0.0)) * 1000
+                "index_build_seconds": round(
+                    float(index.last_stats.get("index_build_seconds", 0.0)), 3
                 ),
             }
         )
@@ -146,7 +146,7 @@ class HybridRetriever:
         repo_path: Path,
         index: RepoIndex,
         query: RetrievalQuery,
-        stats: Dict[str, int],
+        stats: Dict[str, float],
     ) -> List[CodeContext]:
         contexts: List[CodeContext] = []
         for symbol in index.search_symbols(query.terms, limit=MAX_SYMBOL_CONTEXTS):
@@ -186,7 +186,7 @@ class HybridRetriever:
         repo_path: Path,
         index: RepoIndex,
         query: RetrievalQuery,
-        stats: Dict[str, int],
+        stats: Dict[str, float],
     ) -> List[CodeContext]:
         contexts: List[CodeContext] = []
         seen: set[tuple[str, int]] = set()
@@ -226,7 +226,7 @@ class HybridRetriever:
         repo_path: Path,
         index: RepoIndex,
         query: RetrievalQuery,
-        stats: Dict[str, int],
+        stats: Dict[str, float],
     ) -> List[CodeContext]:
         contexts: List[CodeContext] = []
         for symbol in index.definitions_in_modules(

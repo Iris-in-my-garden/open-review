@@ -55,6 +55,9 @@ def issue_comment(issue: PotentialIssue) -> Dict[str, Any]:
         "source_aspects": list(issue.source_aspects),
         "evidence": issue.evidence,
         "suggested_patch": issue.suggested_patch,
+        "context_refs": list(issue.context_refs),
+        "suggested_patch_valid": issue.suggested_patch_valid,
+        "suggested_patch_error": issue.suggested_patch_error,
     }
 
 
