@@ -48,6 +48,10 @@ class FileLLMCacheClient:
     def usage(self) -> dict:
         return getattr(self.inner, "usage", {})
 
+    def __getattr__(self, name: str):
+        # cache wrapper 需要把 bind_budget / has_budget 透传给内层客户端。
+        return getattr(object.__getattribute__(self, "inner"), name)
+
     def generate_structured(
         self,
         system_prompt: str,
@@ -82,6 +86,9 @@ class FileLLMCacheClient:
         digest = hashlib.sha256()
         for part in (
             str(model),
+            # 采样参数必须进 key，否则改 temperature/seed 后会误命中旧响应。
+            str(getattr(self.inner, "temperature", "")),
+            str(getattr(self.inner, "seed", "")),
             response_schema.__module__,
             response_schema.__name__,
             system_prompt,

@@ -16,6 +16,8 @@ from openreview.repo.local import (
 from openreview.repo.manager import RepoCommandError, RepoManager
 from openreview.retriever.base import Retriever
 from openreview.retriever.code_context import CodeContext
+from openreview.retriever.hybrid import HybridRetriever
+from openreview.retriever.index import RETRIEVER_VERSION
 from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
 from openreview.review.aspect_reviewer import ReviewOrchestrator
 from openreview.review.assessment import merge_review_results
@@ -27,7 +29,12 @@ from openreview.review.comment_builder import (
 from openreview.review.finding_validator import FindingValidator
 from openreview.review.impact import ImpactAnalyzer
 from openreview.review.llm_cache import FileLLMCacheClient
-from openreview.review.llm_client import AbstractLLMClient, LLMClient, MockLLMClient
+from openreview.review.llm_client import (
+    AbstractLLMClient,
+    BudgetedLLMClient,
+    LLMClient,
+    MockLLMClient,
+)
 from openreview.review.output_parser import OutputParser
 from openreview.review.prompt_builder import PromptBuilder
 from openreview.review.report_writer import ReportWriter, ReviewResult
@@ -70,6 +77,12 @@ class ReviewPipeline:
         max_context_tokens: int = 16000,
         max_workers: int = 4,
         aspect_timeout: float = 90.0,
+        llm_timeout: float = 60.0,
+        llm_max_retries: int = 0,
+        temperature: float = 0.0,
+        seed: Optional[int] = None,
+        hybrid_retrieval_enabled: bool = True,
+        index_cache_dir: Optional[str] = None,
         triage_enabled: bool = True,
         impact_enabled: bool = True,
         static_analysis_enabled: bool = False,
@@ -87,8 +100,15 @@ class ReviewPipeline:
         self.gh_client = GitHubClient(token=github_token)
         self.repo_mgr = RepoManager()
         self.diff_parser = DiffParser()
-        # 只支持 Python / Go：没有独立 grep 检索器，tree-sitter 是唯一上下文来源。
-        self.retriever: Retriever = TreeSitterLocalRetriever()
+        # HybridRetriever 以 tree-sitter AST 为主路径，FTS5 符号索引只做增强；
+        # 关闭时行为与旧版 TreeSitterLocalRetriever 完全一致，方便做消融。
+        self.hybrid_retrieval_enabled = hybrid_retrieval_enabled
+        if hybrid_retrieval_enabled:
+            self.retriever: Retriever = HybridRetriever(
+                index_cache_dir=index_cache_dir
+            )
+        else:
+            self.retriever = TreeSitterLocalRetriever()
         self.max_batch_tokens = max_batch_tokens
 
         self.triage_enabled = triage_enabled
@@ -103,6 +123,9 @@ class ReviewPipeline:
 
         # 根据标志直接切换实例，不需要用 MagicMock 动态拼装。
         # 注意：GitHub Token 与 LLM API Key 是两套完全独立的凭证。
+        effective_llm_timeout = (
+            min(llm_timeout, aspect_timeout) if aspect_timeout > 0 else llm_timeout
+        )
         base_client: AbstractLLMClient = (
             MockLLMClient()
             if mock_llm
@@ -110,14 +133,21 @@ class ReviewPipeline:
                 api_key=llm_api_key,
                 model=llm_model,
                 base_url=llm_base_url,
+                timeout=effective_llm_timeout,
+                max_retries=llm_max_retries,
+                temperature=temperature,
+                seed=seed,
             )
         )
-        # record/replay 包在真实客户端外面，verifier 的调用也会被一并缓存。
+        # 预算包在真实客户端外面：aspect / verifier / retry 的每次调用都扣账。
+        self._budgeted_client = BudgetedLLMClient(base_client)
+        client: AbstractLLMClient = self._budgeted_client
+        # record/replay 放在预算外层：cache hit 不消耗真实调用预算。
         if llm_cache_dir:
-            base_client = FileLLMCacheClient(
-                base_client, llm_cache_dir, llm_cache_mode  # type: ignore[arg-type]
+            client = FileLLMCacheClient(
+                self._budgeted_client, llm_cache_dir, llm_cache_mode  # type: ignore[arg-type]
             )
-        self.llm_client = base_client
+        self.llm_client = client
 
         self.reviewer = ReviewOrchestrator(
             prompt_builder=PromptBuilder(
@@ -148,6 +178,9 @@ class ReviewPipeline:
 
     def close(self) -> None:
         self.gh_client.close()
+        close_retriever = getattr(self.retriever, "close", None)
+        if callable(close_retriever):
+            close_retriever()
 
     def __enter__(self) -> "ReviewPipeline":
         return self
@@ -242,7 +275,7 @@ class ReviewPipeline:
         local_mode: bool = False,
         local_input: Optional[LocalReviewInput] = None,
     ) -> ReviewState:
-        return ReviewState(
+        state = ReviewState(
             pr_url=pr_url,
             output_dir=Path(output_dir),
             post_comments=post_comments,
@@ -255,6 +288,9 @@ class ReviewPipeline:
             local_mode=local_mode,
             local_input=local_input,
         )
+        # 每次 run 使用独立预算；客户端在本次 run 内共享同一本账。
+        self._budgeted_client.bind_budget(state.budget)
+        return state
 
     def _execute(self, state: ReviewState) -> Path:
         state = self._build_workflow().run(state)
@@ -494,6 +530,14 @@ class ReviewPipeline:
                 contexts = self.retriever.retrieve(
                     state.local_repo_path, batch, base_path=state.base_path
                 )
+                # HybridRetriever 的索引命中/构建耗时按批次累加，供评测分析。
+                retrieval_stats = getattr(self.retriever, "last_stats", None)
+                if retrieval_stats:
+                    for key, value in retrieval_stats.items():
+                        if isinstance(value, (int, float)):
+                            state.retrieval_stats[key] = (
+                                state.retrieval_stats.get(key, 0) + value
+                            )
                 contexts.extend(
                     self._extra_contexts(batch, impact_contexts, static_contexts)
                 )
@@ -526,11 +570,9 @@ class ReviewPipeline:
                         + ", ".join(aspects)
                     )
 
-                # 预算不足时降级：已经产出的批次照常保留，而不是让整个
-                # review 因为后半段超支而失败。
-                if not state.budget.allow(
-                    calls=len(aspects), tokens=estimated_tokens
-                ):
+                # 先按调用数做快速检查；token 预算由 BudgetedLLMClient 在
+                # 每次真实调用前精确扣减，避免这里估算偏差导致误杀。
+                if not state.budget.allow(calls=len(aspects)):
                     state.add_note(
                         "[budget] LLM 调用或 token 预算不足，"
                         f"批次 {index}/{len(batches)} 起未执行审查。"
@@ -540,6 +582,7 @@ class ReviewPipeline:
                     )
                     break
 
+                calls_before = state.budget.used_llm_calls
                 result = self.reviewer.review(
                     pr_info=state.pr_info,
                     parsed_diff=batch,
@@ -547,7 +590,12 @@ class ReviewPipeline:
                     repo_path=state.local_repo_path,
                     aspects=aspects,
                 )
-                state.budget.consume(calls=len(aspects), tokens=estimated_tokens)
+                # 真实客户端由 BudgetedLLMClient 扣账；FakeReviewer / 自定义
+                # reviewer 绕过客户端时，这里补一次，保证预算语义一致。
+                if state.budget.used_llm_calls == calls_before:
+                    state.budget.consume(
+                        calls=len(aspects), tokens=estimated_tokens
+                    )
                 batch_results.append(result)
 
                 # 多批次时累加 validator 计数；只保留最后一批会低估失败模式。
@@ -719,11 +767,15 @@ class ReviewPipeline:
             state.pr_info.base_sha,
             state.pr_info.head_sha,
             str(getattr(self.llm_client, "model", "unknown")),
+            str(getattr(self.llm_client, "temperature", "")),
+            str(getattr(self.llm_client, "seed", "")),
             PROMPT_VERSION,
+            RETRIEVER_VERSION,
             f"triage={int(self.triage_enabled)}",
             f"impact={int(self.impact_enabled)}",
             f"static={int(self.static_analysis_enabled)}",
             f"verifier={int(self.verifier_enabled)}",
+            f"hybrid={int(self.hybrid_retrieval_enabled)}",
         )
 
     def _build_metrics(self, state: ReviewState) -> Dict[str, object]:
@@ -739,6 +791,27 @@ class ReviewPipeline:
         changed_files = {file.filename for file in diff_files}
         context_files = {context.file_path for context in state.all_contexts}
         covered_files = changed_files & context_files
+        context_ids = {context.ensure_context_id() for context in state.all_contexts}
+        context_kinds: Dict[str, int] = {}
+        for context in state.all_contexts:
+            context_kinds[context.kind] = context_kinds.get(context.kind, 0) + 1
+        changed_symbols = {
+            symbol
+            for file in diff_files
+            for symbol in (file.changed_symbols or [])
+            if symbol
+        }
+        retrieved_symbols = {
+            context.symbol for context in state.all_contexts if context.symbol
+        }
+        # 只有“符号/定义/import/依赖/引用”这类结构化上下文才算索引召回；
+        # test/impact/static 不是 FTS 索引的直接产物。
+        index_kinds = {"symbol", "definition", "import", "dependency", "reference"}
+        index_context_files = {
+            context.file_path
+            for context in state.all_contexts
+            if context.kind in index_kinds
+        }
         return {
             "stages_seconds": dict(state.stages),
             "total_seconds": round(sum(state.stages.values()), 3),
@@ -762,6 +835,19 @@ class ReviewPipeline:
                     else 0.0
                 ),
                 "context_tokens": context_tokens,
+                "unique_contexts": len(context_ids),
+                "duplicate_contexts": len(state.all_contexts) - len(context_ids),
+                "context_kinds": context_kinds,
+                "changed_symbols": len(changed_symbols),
+                "retrieved_symbols": len(retrieved_symbols),
+                "symbol_coverage": (
+                    round(len(changed_symbols & retrieved_symbols) / len(changed_symbols), 3)
+                    if changed_symbols
+                    else 0.0
+                ),
+                "index_context_files": len(index_context_files),
+                "hybrid_enabled": self.hybrid_retrieval_enabled,
+                "stats": dict(state.retrieval_stats),
             },
             "batches": len(state.batches),
             "aspects": len(state.selected_aspects),

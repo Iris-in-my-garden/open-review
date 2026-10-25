@@ -7,6 +7,8 @@ from openai import OpenAI
 from pydantic import BaseModel
 
 from openreview.review.output_parser import PotentialIssueSchema
+from openreview.review.token_budget import estimate_tokens
+from openreview.review.workflow import ReviewBudget
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -20,6 +22,70 @@ class AbstractLLMClient(Protocol):
         response_schema: Type[T],
     ) -> T:
         ...
+
+
+class BudgetedLLMClient:
+    """在每次 LLM 调用前统一检查/扣减预算。
+
+    之前预算只在 ``ReviewPipeline._node_analyze`` 里按“维度数”记账，
+    重试、超时和 verifier 的额外调用都不会被扣减，``--budget-calls``
+    并不是真正的硬上限。把预算放到客户端层后，aspect / verifier / retry
+    共享同一本账。
+    """
+
+    has_budget = True
+
+    def __init__(
+        self,
+        inner: AbstractLLMClient,
+        budget: Optional[ReviewBudget] = None,
+    ):
+        self.inner = inner
+        self._budget = budget
+
+    def bind_budget(self, budget: Optional[ReviewBudget]) -> None:
+        self._budget = budget
+
+    @property
+    def budget(self) -> Optional[ReviewBudget]:
+        return self._budget
+
+    @property
+    def model(self) -> str:
+        return str(getattr(self.inner, "model", type(self.inner).__name__))
+
+    @property
+    def usage(self) -> Dict[str, int]:
+        return getattr(self.inner, "usage", {})
+
+    @property
+    def temperature(self) -> Optional[float]:
+        return getattr(self.inner, "temperature", None)
+
+    @property
+    def seed(self) -> Optional[int]:
+        return getattr(self.inner, "seed", None)
+
+    def generate_structured(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        response_schema: Type[T],
+    ) -> T:
+        if self._budget is not None:
+            estimated = estimate_tokens(system_prompt) + estimate_tokens(user_prompt)
+            # 先 check 再 consume：并发调用不会同时越过上限。
+            self._budget.require(calls=1, tokens=estimated)
+            self._budget.consume(calls=1, tokens=estimated)
+        return self.inner.generate_structured(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_schema=response_schema,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        # 透传 cache wrapper 的 hits/misses 等统计字段。
+        return getattr(self.inner, name)
 
 
 class LLMClient:
@@ -37,6 +103,8 @@ class LLMClient:
         base_url: Optional[str] = None,
         timeout: float = 60.0,
         max_retries: int = 2,
+        temperature: float = 0.0,
+        seed: Optional[int] = None,
     ):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
@@ -47,6 +115,10 @@ class LLMClient:
 
         self.model: str = model or os.getenv("OPENAI_MODEL") or "gpt-4o"
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
+        self.timeout = timeout
+        # 固定采样参数，保证同一 prompt 的结果可复现；评测/回放需要这一点。
+        self.temperature = temperature
+        self.seed = seed
 
         client_kwargs: dict[str, Any] = {
             "api_key": self.api_key,
@@ -84,14 +156,21 @@ class LLMClient:
         user_prompt: str,
         response_schema: Type[T],
     ) -> T:
-        response = self._client.beta.chat.completions.parse(
-            model=self.model,
-            messages=[
+        request: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            response_format=response_schema,
-        )
+            "response_format": response_schema,
+            # 把 HTTP 超时压到 aspect_timeout 以下，避免线程超时后请求还挂很久。
+            "timeout": self.timeout,
+        }
+        if self.temperature is not None:
+            request["temperature"] = self.temperature
+        if self.seed is not None:
+            request["seed"] = self.seed
+        response = self._client.beta.chat.completions.parse(**request)
 
         message = response.choices[0].message
         self._record_usage(getattr(response, "usage", None))
@@ -113,6 +192,8 @@ class MockLLMClient:
     def __init__(self, custom_schema: Optional[BaseModel] = None):
         self.custom_schema = custom_schema
         self.model = "mock"
+        self.temperature = 0.0
+        self.seed: Optional[int] = None
         # 与真实客户端保持同一接口，方便报告统一读取。
         self.usage: Dict[str, int] = {
             "calls": 0,

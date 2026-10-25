@@ -19,7 +19,7 @@ from typing import Iterable, List, Optional
 from pydantic import BaseModel, Field
 
 from openreview.repo.diff_parser import ParsedDiff
-from openreview.retriever.code_context import CodeContext
+from openreview.retriever.code_context import CodeContext, make_context_id
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +92,17 @@ class ImpactReport(BaseModel):
                     reason=f"impact:reference to '{item.symbol}' from changed file",
                     snippet=snippet,
                     score=item.confidence,
+                    kind="impact",
+                    symbol=item.symbol,
+                    start_line=max(1, item.line - 6),
+                    end_line=item.line + 6,
+                    context_id=make_context_id(
+                        item.file,
+                        max(1, item.line - 6),
+                        item.line + 6,
+                        "impact",
+                        fallback=item.symbol,
+                    ),
                 )
             )
         return contexts

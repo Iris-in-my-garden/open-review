@@ -18,6 +18,11 @@ class PotentialIssue(BaseModel):
     end_line: Optional[int] = None
     evidence: Optional[str] = None
     suggested_patch: Optional[str] = None
+    # 引用了哪些检索上下文；评测用于 citation rate / context precision。
+    context_refs: List[str] = Field(default_factory=list)
+    # 由 FindingValidator 写入：git apply --check 的结果（None 表示未检查）。
+    suggested_patch_valid: Optional[bool] = None
+    suggested_patch_error: Optional[str] = None
     # 内部归因：哪些审查维度报告过这个问题（跨维度去重时合并）。
     # 不参与渲染，供评测统计“维度贡献度”使用。
     source_aspects: List[str] = Field(default_factory=list)
@@ -98,6 +103,11 @@ class ReportWriter:
                 ]
                 if issue.evidence:
                     issue_lines.append(f"- **evidence**: `{issue.evidence}`")
+                if issue.context_refs:
+                    issue_lines.append(
+                        "- **context_refs**: "
+                        + ", ".join(f"`{ref}`" for ref in issue.context_refs)
+                    )
                 if issue.suggested_patch:
                     issue_lines.extend(
                         [
@@ -107,6 +117,19 @@ class ReportWriter:
                             "```",
                         ]
                     )
+                    if issue.suggested_patch_valid is False:
+                        issue_lines.append(
+                            "- **suggested_patch_check**: INVALID"
+                            + (
+                                f" (`{issue.suggested_patch_error}`)"
+                                if issue.suggested_patch_error
+                                else ""
+                            )
+                        )
+                    elif issue.suggested_patch_valid is True:
+                        issue_lines.append(
+                            "- **suggested_patch_check**: valid"
+                        )
                 issue_lines.append("")
                 md_lines.extend(issue_lines)
         md_lines.append("")

@@ -135,6 +135,19 @@ def _merge_source_aspects(target: IssueLike, *others: IssueLike) -> None:
         pass
 
 
+def _merge_context_refs(target: IssueLike, *others: IssueLike) -> None:
+    """重复问题合并时保留所有被引用的 context id。"""
+    merged = list(getattr(target, "context_refs", []) or [])
+    for other in others:
+        for ref in getattr(other, "context_refs", []) or []:
+            if ref and ref not in merged:
+                merged.append(ref)
+    try:
+        target.context_refs = merged  # type: ignore[attr-defined]
+    except (AttributeError, TypeError, ValueError):
+        pass
+
+
 def deduplicate_issues(issues: Iterable[IssueLike]) -> list:
     """跨维度去重，保留严重级别更高（同级则置信度更高）的那一条。
 
@@ -162,9 +175,11 @@ def deduplicate_issues(issues: Iterable[IssueLike]) -> list:
         )
         if new_rank > existing_rank:
             _merge_source_aspects(issue, existing)
+            _merge_context_refs(issue, existing)
             best[key] = issue
         else:
             _merge_source_aspects(existing, issue)
+            _merge_context_refs(existing, issue)
 
     return [best[key] for key in order]
 

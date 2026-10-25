@@ -26,7 +26,7 @@ from openreview.review.assessment import (
 from openreview.review.llm_client import AbstractLLMClient
 from openreview.review.report_writer import PotentialIssue, ReviewResult
 from openreview.review.token_budget import estimate_tokens
-from openreview.review.workflow import ReviewBudget
+from openreview.review.workflow import BudgetExceeded, ReviewBudget
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +99,9 @@ class FindingVerifier:
 
         decisions: Dict[str, VerifierResult] = {}
         pending = candidates
+        # 流水线里 client 是 BudgetedLLMClient，预算已经在调用层扣过；
+        # 这里只给直接使用 verifier 的场景保留手动预算兜底。
+        budgeted_client = bool(getattr(self.llm_client, "has_budget", False))
         for attempt in range(self.max_attempts):
             next_pending: List[Tuple[str, PotentialIssue]] = []
             for start in range(0, len(pending), self.batch_size):
@@ -107,10 +110,10 @@ class FindingVerifier:
                     chunk, parsed_diff, contexts, repo_path, expanded=attempt > 0
                 )
                 estimated = estimate_tokens(prompt) + 200
-                if budget is not None and not budget.allow(calls=1, tokens=estimated):
-                    stats.skipped_by_budget += len(chunk)
-                    continue
-                if budget is not None:
+                if budget is not None and not budgeted_client:
+                    if not budget.allow(calls=1, tokens=estimated):
+                        stats.skipped_by_budget += len(chunk)
+                        continue
                     budget.consume(calls=1, tokens=estimated)
 
                 try:
@@ -122,6 +125,12 @@ class FindingVerifier:
                     stats.llm_calls += 1
                     for item in response.results:
                         decisions[item.issue_id] = item
+                except BudgetExceeded:
+                    stats.skipped_by_budget += len(chunk)
+                    result.review_notes.append(
+                        "Verifier: 预算不足，剩余 finding 保留原判断。"
+                    )
+                    break
                 except Exception as exc:  # noqa: BLE001 - verifier 失败不应丢结果
                     logger.warning("Verifier call failed: %s", exc)
                     result.review_notes.append(

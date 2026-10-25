@@ -21,7 +21,7 @@ from typing import Iterable, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 from openreview.repo.diff_parser import ParsedDiff
-from openreview.retriever.code_context import CodeContext
+from openreview.retriever.code_context import CodeContext, make_context_id
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,16 @@ class StaticAnalysisReport(BaseModel):
                     reason=f"static:{item.tool}:{item.code}",
                     snippet=snippet,
                     score=0.6,
+                    kind="static",
+                    start_line=max(1, item.line - 4),
+                    end_line=item.line + 4,
+                    context_id=make_context_id(
+                        item.file,
+                        max(1, item.line - 4),
+                        item.line + 4,
+                        "static",
+                        fallback=item.code,
+                    ),
                 )
             )
         return contexts

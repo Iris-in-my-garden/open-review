@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from tree_sitter import Language, Node, Parser, Tree
 
 from openreview.repo.diff_parser import DiffParser, ParsedDiff
-from openreview.retriever.code_context import CodeContext
+from openreview.retriever.code_context import CodeContext, make_context_id
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +186,16 @@ class TreeSitterLocalRetriever:
                         ),
                         snippet=snippet,
                         score=SCORE_ENCLOSING,
+                        kind="enclosing",
+                        symbol=display_name if name else "",
+                        start_line=start_row + 1,
+                        end_line=end_row + 1,
+                        context_id=make_context_id(
+                            file_diff.filename,
+                            start_row + 1,
+                            end_row + 1,
+                            "enclosing",
+                        ),
                     )
                 )
 
@@ -257,6 +267,7 @@ class TreeSitterLocalRetriever:
 
             _, lines, _, _ = loaded
             seen_node_ranges.add(unique_key)
+            end_line = min(len(lines), MAX_TEST_SNIPPET_LINES)
             contexts.append(
                 CodeContext(
                     file_path=rel_path,
@@ -264,6 +275,12 @@ class TreeSitterLocalRetriever:
                     snippet="\n".join(lines[:MAX_TEST_SNIPPET_LINES]),
                     score=SCORE_TEST_FILE,
                     revision="head",
+                    kind="test",
+                    start_line=1,
+                    end_line=end_line,
+                    context_id=make_context_id(
+                        rel_path, 1, end_line, "test", revision="head"
+                    ),
                 )
             )
 
@@ -393,7 +410,13 @@ class TreeSitterLocalRetriever:
                     continue
 
                 # 核心：通过 Tree-sitter 提取 AST 边界并判断定义/引用
-                snippet, reason, is_def, node_range = self._extract_snippet_with_ast(
+                (
+                    snippet,
+                    reason,
+                    is_def,
+                    node_range,
+                    matched_symbol,
+                ) = self._extract_snippet_with_ast(
                     abs_file_path, line_number, valid_targets, file_cache
                 )
 
@@ -414,6 +437,7 @@ class TreeSitterLocalRetriever:
                 else:
                     score = SCORE_DEFINITION if is_def else SCORE_REFERENCE
 
+                kind = "definition" if is_def else "reference"
                 contexts.append(
                     CodeContext(
                         file_path=rel_path_str,
@@ -421,6 +445,17 @@ class TreeSitterLocalRetriever:
                         snippet=snippet,
                         score=score,
                         revision=revision,
+                        kind=kind,
+                        symbol=matched_symbol,
+                        start_line=node_range[0] + 1,
+                        end_line=node_range[1] + 1,
+                        context_id=make_context_id(
+                            rel_path_str,
+                            node_range[0] + 1,
+                            node_range[1] + 1,
+                            kind,
+                            revision=revision,
+                        ),
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - 单行解析失败不应中断整体检索
@@ -435,16 +470,16 @@ class TreeSitterLocalRetriever:
         line_number: int,
         targets: List[str],
         file_cache: Dict[Path, Optional[LoadedFile]],
-    ) -> Tuple[str, str, bool, Optional[Tuple[int, int]]]:
+    ) -> Tuple[str, str, bool, Optional[Tuple[int, int]], str]:
         """利用 Tree-sitter 纯语法结构分析，截取边界并判定 Definition / Reference"""
         loaded = self._load_file(file_path, file_cache)
         if loaded is None:
-            return "", "", False, None
+            return "", "", False, None, ""
 
         _, lines, source, tree = loaded
         target_idx = line_number - 1
         if target_idx < 0 or target_idx >= len(lines):
-            return "", "", False, None
+            return "", "", False, None, ""
 
         target_line = lines[target_idx]
         target_node = self._find_enclosing_definition(tree.root_node, target_idx)
@@ -460,6 +495,7 @@ class TreeSitterLocalRetriever:
                 f"Fallback snippet around line {line_number} for '{matched}'",
                 False,
                 (start_row, end_row),
+                matched,
             )
 
         start_row, end_row = target_node.start_point[0], target_node.end_point[0]
@@ -486,7 +522,7 @@ class TreeSitterLocalRetriever:
             else f"AST-enclosed reference to '{matched_target}' "
             f"(lines {start_row + 1}-{end_row + 1})"
         )
-        return snippet, reason, is_def, (start_row, end_row)
+        return snippet, reason, is_def, (start_row, end_row), matched_target
 
     @staticmethod
     def _definition_name(node: Node, source: bytes) -> Optional[str]:

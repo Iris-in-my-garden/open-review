@@ -12,6 +12,7 @@ from openreview.review.output_parser import AspectReviewTaskResult, OutputParser
 from openreview.review.prompt_builder import PromptBuilder
 from openreview.review.report_writer import ReviewResult
 from openreview.review.test_gap import analyze_test_gaps
+from openreview.review.workflow import BudgetExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +112,9 @@ class ReviewOrchestrator:
 
         # 2. 使用 ThreadPoolExecutor 進行多維度「並行」審查
         max_workers = max(1, min(len(workers), self.max_workers))
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="openreview-aspect"
+        )
         future_to_aspect = {
             executor.submit(
                 self._review_aspect_with_retry, worker, pr_info, parsed_diff, contexts
@@ -119,31 +122,56 @@ class ReviewOrchestrator:
             for worker in workers
         }
 
+        pending = set(future_to_aspect)
         try:
-            done, not_done = concurrent.futures.wait(
+            # 用 as_completed + 总 deadline，而不是 wait() 后一次性取 done：
+            # 这样在 deadline 附近完成的 future 也会被收集，不会因为竞态丢结果。
+            for future in concurrent.futures.as_completed(
                 future_to_aspect, timeout=self.aspect_timeout
-            )
-            for future in done:
+            ):
                 aspect = future_to_aspect[future]
+                pending.discard(future)
                 try:
                     all_aspect_results.append(future.result())
+                except BudgetExceeded as exc:
+                    # 预算已耗尽：立即止损，保留已经完成的维度。
+                    failures.append(f"维度 `{aspect}` 因预算不足跳过：{exc}")
+                    break
                 except Exception as exc:  # noqa: BLE001 - 单维度失败不应拖垮整体
                     logger.exception("Aspect review failed for [%s]", aspect)
                     failures.append(
                         f"维度 `{aspect}` 审查失败：{type(exc).__name__}: {exc}"
                     )
-
-            for future in not_done:
-                aspect = future_to_aspect[future]
-                future.cancel()
-                message = (
-                    f"维度 `{aspect}` 超时（>{self.aspect_timeout:.0f}s），已跳过。"
-                )
-                logger.warning(message)
-                failures.append(message)
+        except concurrent.futures.TimeoutError:
+            pass
         finally:
-            # 不等待卡住的线程，避免一个异常请求无限阻塞整个流水线
+            for future in pending:
+                future.cancel()
+            # Python 线程无法被强杀；LLMClient 已把单次 HTTP timeout 压到
+            # aspect_timeout 以下，因此这里不等待，也不会长期悬挂。
             executor.shutdown(wait=False, cancel_futures=True)
+
+        # deadline / budget break 之后，可能还有已经完成但尚未被 as_completed
+        # yield 的 future；先收结果，再把真正未完成的标记为超时。
+        for future in list(pending):
+            if future.done() and not future.cancelled():
+                pending.discard(future)
+                aspect = future_to_aspect[future]
+                try:
+                    all_aspect_results.append(future.result())
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Aspect review failed for [%s]", aspect)
+                    failures.append(
+                        f"维度 `{aspect}` 审查失败：{type(exc).__name__}: {exc}"
+                    )
+
+        for future in pending:
+            aspect = future_to_aspect[future]
+            message = (
+                f"维度 `{aspect}` 超时（>{self.aspect_timeout:.0f}s），已跳过。"
+            )
+            logger.warning(message)
+            failures.append(message)
 
         if not all_aspect_results and workers:
             raise RuntimeError(
@@ -198,6 +226,9 @@ class ReviewOrchestrator:
         for attempt in range(self.max_attempts):
             try:
                 return worker.review_aspect(pr_info, parsed_diff, contexts)
+            except BudgetExceeded:
+                # 预算问题不是瞬时错误，重试只会放大超支。
+                raise
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 if attempt + 1 >= self.max_attempts:

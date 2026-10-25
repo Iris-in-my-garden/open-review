@@ -126,6 +126,7 @@ class ReviewState:
     impact_count: int = 0
     static_count: int = 0
     validation_stats: Dict[str, int] = field(default_factory=dict)
+    retrieval_stats: Dict[str, float] = field(default_factory=dict)
     verifier_stats: Dict[str, int] = field(default_factory=dict)
     cache_hits: int = 0
     cache_misses: int = 0
@@ -172,6 +173,7 @@ class ReviewState:
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
             "validation_stats": dict(self.validation_stats),
+            "retrieval_stats": dict(self.retrieval_stats),
             "verifier_stats": dict(self.verifier_stats),
         }
 

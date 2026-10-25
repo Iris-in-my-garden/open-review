@@ -40,6 +40,13 @@ class PotentialIssueSchema(BaseModel):
         default=None,
         description="可直接应用的 unified diff 修复片段（可选）",
     )
+    context_refs: List[str] = Field(
+        default_factory=list,
+        description=(
+            "引用的上下文 ID 列表，例如 [\"ctx-a1b2c3d4\"]；"
+            "只能引用 Patch/Context 中实际出现的 [ctx-...]"
+        ),
+    )
     # 内部字段：由聚合层写入，不暴露给模型（SkipJsonSchema），也不参与序列化。
     source_aspects: SkipJsonSchema[List[str]] = Field(
         default_factory=list,
@@ -156,6 +163,7 @@ class OutputParser:
                     end_line=issue.end_line,
                     evidence=issue.evidence,
                     suggested_patch=issue.suggested_patch,
+                    context_refs=list(issue.context_refs),
                     source_aspects=list(issue.source_aspects),
                 )
                 for issue in review_data.potential_issues

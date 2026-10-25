@@ -1,6 +1,6 @@
 # openreview/prompt_builder.py
 import re
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from openreview.github.client import PullRequestInfo
 from openreview.repo.diff_parser import HUNK_RANGE_PATTERN, ParsedDiff
@@ -91,9 +91,13 @@ class PromptBuilder:
         return self.system_prompt + SECURITY_SYSTEM_SUFFIX
 
     def build_system_prompt_for_aspect(self, aspect: str) -> str:
-        """根据维度获取专属的 System Prompt。"""
-        persona = ASPECT_SYSTEM_PROMPTS.get(aspect, self.system_prompt)
-        return persona + SECURITY_SYSTEM_SUFFIX
+        """所有维度共享同一个 System Prompt。
+
+        维度 persona 被移到 user prompt 的末尾。这样 4 个 aspect 请求共享
+        system + PR 输入这段长前缀，能命中 provider 的 prefix cache；以前每个
+        aspect 的 system prompt 都不同，缓存命中率为 0。
+        """
+        return self.build_system_prompt()
 
     @staticmethod
     def sanitize_untrusted(text: Optional[str]) -> str:
@@ -166,8 +170,9 @@ class PromptBuilder:
 
     def _build_patch_section(
         self, parsed_diff: ParsedDiff
-    ) -> Tuple[str, List[str], List[str]]:
-        blocks: List[str] = []
+    ) -> Tuple[List[Tuple[str, str]], List[str], List[str]]:
+        """返回 (filename, block) 列表；后面才能按文件就近挂 context。"""
+        blocks: List[Tuple[str, str]] = []
         truncated: List[str] = []
         skipped: List[str] = []
         remaining = self.max_patch_tokens
@@ -185,58 +190,94 @@ class PromptBuilder:
                     )
                     if was_truncated:
                         truncated.append(file_diff.filename)
-                    blocks.append(f"### {file_diff.filename}\n```diff\n{annotated}\n```")
+                    blocks.append(
+                        (
+                            file_diff.filename,
+                            f"### {file_diff.filename}\n```diff\n{annotated}\n```",
+                        )
+                    )
                 else:
                     skipped.append(file_diff.filename)
                 remaining = 0
                 continue
 
-            blocks.append(f"### {file_diff.filename}\n```diff\n{annotated}\n```")
+            blocks.append(
+                (
+                    file_diff.filename,
+                    f"### {file_diff.filename}\n```diff\n{annotated}\n```",
+                )
+            )
             remaining -= cost
 
-        note_lines = []
-        if truncated:
-            note_lines.append(
-                "> 因 token 预算限制，以下文件的 Patch 被截断："
-                + ", ".join(truncated)
-            )
-        if skipped:
-            note_lines.append(
-                "> 因 token 预算限制，以下文件未展示 Patch："
-                + ", ".join(skipped)
-            )
+        return blocks, truncated, skipped
 
-        patch_str = "\n\n".join(blocks) if blocks else "No patches available."
-        if note_lines:
-            patch_str = "\n".join(note_lines) + "\n\n" + patch_str
-        return patch_str, truncated, skipped
+    @staticmethod
+    def _render_context(ctx: CodeContext) -> str:
+        context_id = ctx.ensure_context_id()
+        meta = [f"Kind: {ctx.kind}"]
+        if ctx.symbol:
+            meta.append(f"Symbol: {ctx.symbol}")
+        if ctx.start_line is not None and ctx.end_line is not None:
+            meta.append(f"Lines: {ctx.start_line}-{ctx.end_line}")
+        if ctx.revision:
+            meta.append(f"Revision: {ctx.revision}")
+        meta.append(f"Score: {ctx.score}")
+        return (
+            f"### [{context_id}] File: {ctx.file_path} "
+            f"({' , '.join(meta)}, Reason: {ctx.reason})\n"
+            f"```\n{ctx.snippet}\n```"
+        )
 
-    def _build_context_section(self, contexts: List[CodeContext]) -> str:
-        blocks: List[str] = []
+    def _build_context_sections(
+        self,
+        patch_blocks: List[Tuple[str, str]],
+        contexts: List[CodeContext],
+    ) -> Tuple[str, str]:
+        """把上下文按文件注入对应 Patch 块；其他文件放到独立 section。
+
+        这样模型在读到某个文件的 diff 时，立刻能看到该文件的 enclosing/symbol
+        上下文，而不是在 prompt 尾部跨文件查找。
+        """
+        block_files = {filename for filename, _ in patch_blocks}
+        by_file: Dict[str, List[str]] = {}
+        other_blocks: List[str] = []
         remaining = self.max_context_tokens
         omitted = 0
 
         for ctx in sorted(contexts, key=lambda item: item.score, reverse=True):
-            revision = f", Revision: {ctx.revision}" if ctx.revision else ""
-            block = (
-                f"### File: {ctx.file_path} "
-                f"(Reason: {ctx.reason}{revision}, Score: {ctx.score})\n"
-                f"```\n{ctx.snippet}\n```"
-            )
-            cost = estimate_tokens(block) + 20
+            rendered = self._render_context(ctx)
+            cost = estimate_tokens(rendered) + 20
             if cost > remaining:
                 omitted += 1
                 continue
-            blocks.append(block)
             remaining -= cost
+            if ctx.file_path in block_files:
+                by_file.setdefault(ctx.file_path, []).append(rendered)
+            else:
+                other_blocks.append(rendered)
 
-        if not blocks:
-            return "No relevant contexts retrieved."
+        rendered_blocks: List[str] = []
+        for filename, block in patch_blocks:
+            related = by_file.get(filename)
+            if related:
+                block = (
+                    block
+                    + "\n\n**Related context（同文件，可直接用 context_refs 引用）：**\n\n"
+                    + "\n\n".join(related)
+                )
+            rendered_blocks.append(block)
 
-        result = "\n\n".join(blocks)
+        patch_str = (
+            "\n\n".join(rendered_blocks) if rendered_blocks else "No patches available."
+        )
+        context_str = (
+            "\n\n".join(other_blocks)
+            if other_blocks
+            else "No additional contexts retrieved."
+        )
         if omitted:
-            result += f"\n\n> 另有 {omitted} 段上下文因 token 预算被省略。"
-        return result
+            context_str += f"\n\n> 另有 {omitted} 段上下文因 token 预算被省略。"
+        return patch_str, context_str
 
     def build_user_prompt(
         self,
@@ -265,8 +306,22 @@ class PromptBuilder:
             else "No files changed."
         )
 
-        patch_str, _, _ = self._build_patch_section(parsed_diff)
-        context_str = self._build_context_section(contexts)
+        patch_blocks, truncated, skipped = self._build_patch_section(parsed_diff)
+        patch_str, context_str = self._build_context_sections(patch_blocks, contexts)
+
+        note_lines = []
+        if truncated:
+            note_lines.append(
+                "> 因 token 预算限制，以下文件的 Patch 被截断："
+                + ", ".join(truncated)
+            )
+        if skipped:
+            note_lines.append(
+                "> 因 token 预算限制，以下文件未展示 Patch："
+                + ", ".join(skipped)
+            )
+        if note_lines:
+            patch_str = "\n".join(note_lines) + "\n\n" + patch_str
 
         # 所有来自 PR 的内容都放进不可信数据区，并转义可能提前闭合标签的文本
         untrusted_payload = self.sanitize_untrusted(
@@ -308,5 +363,11 @@ class PromptBuilder:
         }
 
         instruction = aspect_instructions.get(aspect, "请进行全面审查。")
+        persona = ASPECT_SYSTEM_PROMPTS.get(aspect, "")
 
-        return f"{base_prompt}\n\n### 【当前任务指令】\n{instruction}"
+        # persona 放在最后，保持前面的 system + PR 输入是四个 aspect 的公共前缀。
+        return (
+            f"{base_prompt}\n\n"
+            f"### 【当前审查维度】\n{persona}\n\n"
+            f"### 【当前任务指令】\n{instruction}"
+        )
