@@ -1,7 +1,7 @@
 [project]
 name = "openreview"
 version = "0.1.0"
-description = "AI-powered GitHub PR code review with AST-aware context retrieval and structured findings"
+description = "AI-powered GitHub PR code review with hybrid context retrieval and structured findings"
 readme = "README.md"
 authors = [
     { name = "Ran", email = "55568777+Iris-in-my-garden@users.noreply.github.com" }

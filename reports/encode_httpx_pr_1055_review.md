@@ -1,5 +1,7 @@
 # PR Review Report
 
+> **Mock 演示输出：**此报告由 `--mock_llm` 生成，仅用于展示报告格式与流水线流程。以下 findings 是 mock 生成的示例内容，不是对该 PR 的真实审查结果，也不能作为漏洞或代码质量结论。
+
 ## 1. PR Summary
 [CLEAN_CODE] [MOCK] 该维度的代码检查完成，发现了一些需要注意的潜在问题。
 [BUGS] [MOCK] 该维度的代码检查完成，发现了一些需要注意的潜在问题。

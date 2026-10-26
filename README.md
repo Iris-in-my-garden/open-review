@@ -1,8 +1,8 @@
 # OpenReview
 
-一个面向 GitHub Pull Request 的 AI Code Review 工具：拉取 PR → 解析 Diff → AST 上下文检索 → 多维度并行审查 → 结果校验 → 生成 Markdown 报告。
+一个面向 GitHub Pull Request 的 AI Code Review 工具：拉取 PR → 解析 Diff → 混合上下文检索 → 多维度并行审查 → 结果校验 → 生成 Markdown 报告。
 
-> 目标不是“让 LLM 随便说几句”，而是把每条结论约束在**真实 Diff 与真实代码上下文**上，减少幻觉与重复。
+> 项目定位是**有界、可验证、可观测的代码审查流水线**，而不是自主 Agent：尽量把结论约束在真实 Diff 与代码证据上，并控制调用成本。
 
 ## 功能
 
@@ -10,10 +10,10 @@
 - 有界工作流：URL 解析 → PR 元数据 → review 缓存 → 仓库准备 → Diff 解析 → 规则 triage → 影响分析/静态分析/上下文检索 → 多维度审查 → 语义 verifier → 报告 → 可选行内评论。所有条件边由代码显式声明，不引入“自主 Agent”循环
 - 多维度并行审查：`clean_code` / `bugs` / `performance` / `security`
 - **规则 triage（0 LLM 调用）**：文档/配置-only PR 直接跳过模型；纯测试变更只跑 `clean_code` + `bugs`
-- **AST 级上下文检索**（tree-sitter）：
+- **混合上下文检索**（默认启用）：tree-sitter AST 提供结构化主路径，SQLite FTS5 符号索引与 import 关系补充跨文件候选：
   - 只要改动了函数体，就能自动定位并抽取所属函数/类
-  - 区分“符号定义”和“符号引用”，分别赋分
-  - 关联测试文件检索，用于真实的测试缺口分析
+  - 符号索引支持精确匹配与 BM25 召回，import 关系补充模块使用方及依赖
+  - 关联测试文件检索，用于测试缺口分析
   - base worktree 检索被删除符号的历史实现
   - 仅支持 Python / Go（刻意收窄范围）；其他语言只使用 diff，不注入结构上下文
 - **跨文件影响分析**：变更/删除的符号在其他文件中的引用会被抽成上下文；删除符号仍有残留调用时，reviewer 能看到调用点
@@ -33,7 +33,7 @@
 - **GitHub API 重试/限流处理**，单维度失败不影响整体，失败信息写入报告
 - **仓库缓存并发安全**：仓库级 `FileLock` + blobless partial clone + 平台缓存目录 + 按 mtime 淘汰
 - **本地仓库模式**：输入 `repo_path + base_sha + head_sha` 即可离线 review，不依赖 GitHub API；用 detached worktree 隔离 head/base，结束后自动清理（评测/回放用）
-- **单一检索与审查路径**：tree-sitter AST 是唯一上下文来源，四维度并行是唯一审查模式，避免维护未评测的实现
+- **生产审查路径明确**：默认使用混合检索与四维度并行审查；AST-only 是检索消融开关，single-shot 是评测对照基线，不作为另一条生产路径
 - **可观测性**：`logging` + 阶段耗时 / 批次 / LLM 调用次数 / 真实 token 用量 / 预算与缓存命中，统一写入报告 `Run Metrics`
 - **严重级别收口**：`critical|high|medium|low` 使用 `Literal` 校验，兼容 `HIGH`、`严重` 等别名后再归一化
 - **工程化**：ruff + mypy + pre-commit + GitHub Actions
@@ -73,7 +73,7 @@ GitHub PR URL
 │ Evidence Collectors          │
 │ 1. ImpactAnalyzer：跨文件引用 │
 │ 2. StaticAnalysis：ruff/mypy │
-│ 3. Retriever：tree-sitter AST │
+│ 3. Retriever：AST + FTS5 + imports │
 └────────┬─────────────────────┘
          ▼
 ┌──────────────────────────────┐
@@ -213,7 +213,10 @@ src/openreview/
 │   └── diff_parser.py         # Hunk、变更行、可见行、符号提取
 ├── retriever/
 │   ├── base.py                # Retriever 协议
-│   └── tree_sitter_retriever.py  # AST 边界 + 定义/引用 + 测试文件 + base 检索
+│   ├── tree_sitter_retriever.py  # AST 边界 + 定义/引用 + 测试文件 + base 检索
+│   ├── hybrid.py                # AST + 符号索引 + import 关系融合与去重
+│   ├── index.py                 # SQLite FTS5 符号索引与 import 关系
+│   └── query.py                 # 从 Diff 构造检索查询
 ├── review/
 │   ├── prompt_builder.py      # 带行号 Patch、不可信数据包裹、token 预算
 │   ├── token_budget.py        # token 估算 / 截断 / 大 PR 分批
@@ -237,8 +240,8 @@ src/openreview/
 
 ## 设计取舍
 
-**为什么只支持 Python / Go？**
-grep 只能告诉你“某一行命中了符号”，无法给出函数/类边界，也无法区分定义和引用；tree-sitter 能抽取完整函数/类，并按“变更行所属定义 > 定义 > 引用”排序。与其用 grep 假装支持 10 种语言，不如把两种语言做深：没有 parser 的语言只保留 diff 上下文，并在报告中明确说明。这是一次刻意的范围收窄——多语言的代价是每种语言一套 parser、检索策略和测试，收益不足以支撑当前阶段。
+**为什么检索采用 AST + 符号索引？**
+tree-sitter AST 是结构化主路径，能定位变更行所属的函数/类；SQLite FTS5 符号索引提供精确匹配与 BM25 召回，import 关系补充跨文件候选。上下文按相关性排序并去重，检索增强失败时仍可退回 AST 结果。当前索引和 AST 解析都聚焦 Python / Go；其他语言只使用 diff，不注入结构上下文。实现内部仍会在部分符号分析中调用 `git grep`，但它不是独立的检索器或多语言 fallback。
 
 **为什么 triage 只用规则、不用模型？**
 triage 的目标是省钱，不是做判断。用一次 LLM 调用决定“要不要调用 LLM”在成本上不成立；docs-only / test-only 这类信号用文件后缀和 diff 元数据就能确定性判断，也更容易测试。
@@ -304,7 +307,8 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 - [x] Prompt Injection 防护与红队测试
 - [x] RepoManager：FileLock、blobless clone、平台缓存目录、LRU 式缓存淘汰
 - [x] GitHub API 429/5xx/限流重试，CLI `finally` 关闭 HTTP 连接
-- [x] 单一检索与审查路径：tree-sitter AST 检索 + 四维度并行 Review，移除未评测的 grep / single 分支
+- [x] 默认混合检索：tree-sitter AST 主路径 + SQLite FTS5 符号索引 + import 关系；支持 AST-only 检索消融
+- [x] 生产路径采用四维度并行 Review；single-shot 保留为评测对照基线
 - [x] 有界工作流（`workflow.py`）：条件节点、`ReviewBudget`、trace
 - [x] 规则 triage：docs-only 跳过、test-only 收窄维度
 - [x] 跨文件影响分析（`impact.py`）
@@ -328,4 +332,4 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 - 行内评论只能落在 diff 可见行；不在 diff 内的问题会退化为文件级描述
 - 单文件极大时会在 Prompt 层截断，可能漏掉文件后半部分的问题
 - 静态分析默认关闭，且只覆盖 Python；开启时会在本地执行 ruff/mypy
-
+- `--mock_llm` 仅验证流程与报告格式，不代表审查质量；仓库中的示例报告也是 mock 演示输出，不应作为真实漏洞发现或评测结果
