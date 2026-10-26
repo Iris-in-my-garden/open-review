@@ -37,6 +37,7 @@ from evaluation.aacr import (
     sha256_file,
     write_manifest,
 )
+from evaluation.cost import CostError, estimate_usd, resolve_prices
 from evaluation.deterministic import (
     compute_deterministic_metrics,
     write_metrics,
@@ -118,6 +119,43 @@ def _restrict_to_actual_run(
     return selected
 
 
+def _estimate_aacr_review(
+    instances: list[dict],
+    *,
+    input_price: float,
+    output_price: float,
+    verifier: bool = True,
+) -> dict:
+    """AACR review 的保守 preflight。
+
+    不 clone 仓库，只看 manifest 里的 change_line_count / reference_comments。
+    真实 prompt 还受上下文检索和 token 预算影响，因此这里明确标注为估算。
+    """
+    prompt_tokens = 0
+    completion_tokens = 0
+    calls = 0
+    for instance in instances:
+        lines = max(1, int(instance.get("change_line_count") or 0))
+        per_aspect_prompt = 5000 + lines * 12
+        prompt_tokens += per_aspect_prompt * 4
+        completion_tokens += 450 * 4
+        calls += 4
+        if verifier:
+            prompt_tokens += 1500 + int(instance.get("reference_comments") or 1) * 250
+            completion_tokens += 300
+            calls += 1
+    return {
+        "instances": len(instances),
+        "llm_calls": calls,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "estimated_usd": estimate_usd(
+            prompt_tokens, completion_tokens, input_price, output_price
+        ),
+        "assumption": "4 aspects + verifier; ~12 tokens/change line + base context",
+    }
+
+
 def cmd_prepare(args: argparse.Namespace) -> int:
     source = ensure_source(
         args.source,
@@ -148,6 +186,38 @@ def cmd_review(args: argparse.Namespace) -> int:
         DEFAULT_RESULTS_ROOT, manifest["version"], run_id
     )
 
+    estimate = None
+    if args.estimate_only or args.budget_usd is not None:
+        input_price, output_price = resolve_prices(
+            args.model,
+            input_price=args.input_price,
+            output_price=args.output_price,
+            mock_llm=args.mock_llm,
+        )
+        estimate = _estimate_aacr_review(
+            instances,
+            input_price=input_price,
+            output_price=output_price,
+            verifier=not args.no_verifier,
+        )
+        print(
+            "[estimate] instances={instances} calls={llm_calls} "
+            "prompt_tokens={prompt_tokens} completion_tokens={completion_tokens} "
+            "estimated_usd={estimated_usd}".format(**estimate)
+        )
+        print(f"[estimate] assumption: {estimate['assumption']}")
+        if args.estimate_only:
+            return 0
+        if estimate["estimated_usd"] > args.budget_usd:
+            print(
+                "error: estimated cost ${:.4f} exceeds --budget-usd ${:.4f}; "
+                "abort before any LLM call.".format(
+                    estimate["estimated_usd"], args.budget_usd
+                ),
+                file=sys.stderr,
+            )
+            return 2
+
     review_cache_dir = args.review_cache_dir
     if args.review_cache and not review_cache_dir:
         review_cache_dir = EVAL_ROOT / ".cache" / "review"
@@ -175,12 +245,14 @@ def cmd_review(args: argparse.Namespace) -> int:
             keep_worktrees=args.keep_worktrees,
             fail_fast=args.fail_fast,
             limit=None,
+            resume=args.resume,
         )
     finally:
         pipeline.close()
 
     ok = sum(1 for row in rows if row["status"] == "ok")
-    print(f"\nreview done: {ok}/{len(rows)} ok")
+    resumed = sum(1 for row in rows if row.get("resumed"))
+    print(f"\nreview done: {ok}/{len(rows)} ok; resumed={resumed}")
     print(f"results -> {results_dir}")
     print(f"next: python -m evaluation.cli metrics --run-id {run_id} --split {args.split}")
     return 0 if ok == len(rows) else 1
@@ -250,6 +322,98 @@ def cmd_semantic(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_synthetic(args: argparse.Namespace) -> int:
+    from evaluation.synthetic import (
+        DEFAULT_CASES,
+        estimate_synthetic_run,
+        run_synthetic_benchmark,
+    )
+
+    cases = list(DEFAULT_CASES)
+    if args.limit is not None:
+        cases = cases[: args.limit]
+    modes = ["full", "baseline"] if args.mode == "both" else [args.mode]
+
+    input_price, output_price = resolve_prices(
+        args.model,
+        input_price=args.input_price,
+        output_price=args.output_price,
+        mock_llm=args.mock_llm,
+    )
+    estimates = [
+        estimate_synthetic_run(
+            cases,
+            mode=mode,
+            input_price=input_price,
+            output_price=output_price,
+        )
+        for mode in modes
+    ]
+    if args.estimate_only or args.budget_usd is not None:
+        for estimate in estimates:
+            print(
+                "[estimate] mode={mode} cases={cases} calls={llm_calls} "
+                "prompt_tokens={prompt_tokens} "
+                "completion_tokens={completion_tokens} "
+                "estimated_usd={estimated_usd}".format(**estimate)
+            )
+            print(f"[estimate] assumption: {estimate['assumption']}")
+        if args.estimate_only:
+            return 0
+        total_estimate = sum(item["estimated_usd"] for item in estimates)
+        if total_estimate > args.budget_usd:
+            print(
+                "error: estimated cost ${:.4f} exceeds --budget-usd ${:.4f}; "
+                "abort before creating repositories or calling LLMs.".format(
+                    total_estimate, args.budget_usd
+                ),
+                file=sys.stderr,
+            )
+            return 2
+
+    run_id = args.run_id or _default_run_id()
+    run_root = args.results_dir or (EVAL_ROOT / "results" / "synthetic" / run_id)
+    work_root = args.work_dir or (EVAL_ROOT / ".cache" / "synthetic" / run_id)
+
+    summaries = []
+    for mode in modes:
+        summary = run_synthetic_benchmark(
+            cases,
+            mode=mode,
+            results_dir=run_root / mode,
+            work_dir=work_root,
+            mock_llm=args.mock_llm,
+            input_price=input_price,
+            output_price=output_price,
+            resume=args.resume,
+            keep_worktrees=args.keep_worktrees,
+            budget_usd=args.budget_usd,
+            hybrid_retrieval_enabled=args.hybrid_retrieval,
+            verifier_enabled=not args.no_verifier,
+            fail_fast=args.fail_fast,
+        )
+        summaries.append(summary)
+
+    if len(summaries) > 1:
+        print("\nSynthetic comparison")
+        for summary in summaries:
+            cost = summary["cost"]
+            print(
+                f"- {summary['mode']}: bug_recall={summary['bug_recall']} "
+                f"precision={summary['finding_precision']} "
+                f"clean_fp={summary['clean_case_false_positive_rate']} "
+                f"llm_calls={cost['llm_calls']} "
+                f"estimated_usd={cost['estimated_usd']}"
+            )
+
+    failed = any(
+        summary["cases_error"] > 0 or summary["stopped_by_budget"]
+        for summary in summaries
+    )
+    print(f"\nsynthetic results -> {run_root}")
+    return 1 if failed else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m evaluation.cli",
@@ -302,6 +466,34 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--keep-worktrees", action="store_true")
     review.add_argument("--fail-fast", action="store_true")
     review.add_argument(
+        "--resume",
+        action="store_true",
+        help="跳过已有 status=ok 的结果；失败样本会重跑",
+    )
+    review.add_argument(
+        "--estimate-only",
+        action="store_true",
+        help="只打印成本估算，不 clone、不调用 LLM",
+    )
+    review.add_argument(
+        "--budget-usd",
+        type=float,
+        default=None,
+        help="preflight 估算超过该金额则直接退出（USD）",
+    )
+    review.add_argument(
+        "--input-price",
+        type=float,
+        default=None,
+        help="覆盖 input 价格（USD / 1M tokens）",
+    )
+    review.add_argument(
+        "--output-price",
+        type=float,
+        default=None,
+        help="覆盖 output 价格（USD / 1M tokens）",
+    )
+    review.add_argument(
         "--review-cache",
         action="store_true",
         help="复用相同 PR head / 模型 / 开关的完整 review 结果",
@@ -326,6 +518,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review.set_defaults(func=cmd_review)
 
+    synthetic = sub.add_parser(
+        "synthetic", help="合成 bug / clean-control benchmark（零成本可先 mock）"
+    )
+    synthetic.add_argument(
+        "--mode",
+        choices=["full", "baseline", "both"],
+        default="both",
+        help="full=多维度+verifier；baseline=single-shot；both=同批对照",
+    )
+    synthetic.add_argument("--limit", type=int, default=None)
+    synthetic.add_argument("--run-id", default=None)
+    synthetic.add_argument("--results-dir", type=Path, default=None)
+    synthetic.add_argument("--work-dir", type=Path, default=None)
+    synthetic.add_argument("--mock-llm", action="store_true")
+    synthetic.add_argument("--resume", action="store_true")
+    synthetic.add_argument("--keep-worktrees", action="store_true")
+    synthetic.add_argument("--fail-fast", action="store_true")
+    synthetic.add_argument(
+        "--hybrid-retrieval",
+        action="store_true",
+        help="启用 FTS5 符号索引；默认关闭以保持合成 benchmark 轻量",
+    )
+    synthetic.add_argument(
+        "--no-verifier",
+        action="store_true",
+        help="full 模式下关闭 verifier（消融用）",
+    )
+    synthetic.add_argument("--model", default=None)
+    synthetic.add_argument("--input-price", type=float, default=None)
+    synthetic.add_argument("--output-price", type=float, default=None)
+    synthetic.add_argument(
+        "--estimate-only",
+        action="store_true",
+        help="只打印 preflight 成本估算，不创建仓库、不调用 LLM",
+    )
+    synthetic.add_argument(
+        "--budget-usd",
+        type=float,
+        default=None,
+        help="preflight 估算超过该金额则退出（USD）",
+    )
+    synthetic.set_defaults(func=cmd_synthetic)
+
     metrics = sub.add_parser("metrics", parents=[common], help="零成本确定性指标")
     metrics.add_argument("--results-dir", type=Path, default=None)
     metrics.add_argument("--metrics-dir", type=Path, default=None)
@@ -349,7 +584,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
-    except ManifestError as error:
+    except (CostError, ManifestError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 

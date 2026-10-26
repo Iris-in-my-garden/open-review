@@ -140,6 +140,7 @@ def run_reviews(
     keep_worktrees: bool = False,
     fail_fast: bool = False,
     limit: Optional[int] = None,
+    resume: bool = False,
 ) -> List[Dict[str, Any]]:
     """逐条调用 ``pipeline.run_local`` 并把结果落盘。
 
@@ -157,6 +158,29 @@ def run_reviews(
         started_at = datetime.now(timezone.utc).isoformat()
         started = time.monotonic()
         print(f"[{index}/{len(selected)}] {instance_id} ({instance['split']})")
+
+        existing_path = result_path(results_dir, instance_id)
+        if resume and existing_path.exists():
+            try:
+                existing = json.loads(existing_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = None
+            if isinstance(existing, dict) and existing.get("status") == "ok":
+                review = existing.get("review") or {}
+                print("  [resume] skip existing ok result")
+                rows.append(
+                    {
+                        "instance_id": instance_id,
+                        "split": instance["split"],
+                        "status": "ok",
+                        "duration_seconds": existing.get("duration_seconds", 0),
+                        "issues": len(review.get("comments") or []),
+                        "result_path": str(existing_path),
+                        "error": None,
+                        "resumed": True,
+                    }
+                )
+                continue
 
         try:
             repo_path = ensure_repo(
@@ -213,6 +237,7 @@ def run_reviews(
                 "issues": len(payload["review"].get("comments") or []),
                 "result_path": str(out_path),
                 "error": payload.get("error"),
+                "resumed": False,
             }
         )
 

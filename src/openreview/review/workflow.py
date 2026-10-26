@@ -106,6 +106,12 @@ class ReviewState:
     local_input: Optional["LocalReviewInput"] = None
     local_workspace: Optional["LocalWorkspace"] = None
 
+    # 每次 run 开始时的客户端累计计数。pipeline 会被评测复用，
+    # 直接用客户端上的累计值会把上一次 run 的成本算进本次报告。
+    usage_start: Dict[str, int] = field(default_factory=dict)
+    cache_hits_start: int = 0
+    cache_misses_start: int = 0
+
     pr_ref: Optional[GitHubPRRef] = None
     pr_info: Optional[PullRequestInfo] = None
     raw_files: List[ChangedFile] = field(default_factory=list)

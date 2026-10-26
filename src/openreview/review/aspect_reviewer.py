@@ -1,6 +1,7 @@
 import concurrent.futures
 import logging
 import time
+from pathlib import Path
 from typing import List, Optional
 
 from openreview.github.client import PullRequestInfo
@@ -15,6 +16,54 @@ from openreview.review.test_gap import analyze_test_gaps
 from openreview.review.workflow import BudgetExceeded
 
 logger = logging.getLogger(__name__)
+
+
+def finalize_review_result(
+    *,
+    prompt_builder: PromptBuilder,
+    output_parser: OutputParser,
+    validator: FindingValidator,
+    pr_info: PullRequestInfo,
+    parsed_diff: ParsedDiff,
+    contexts: List[CodeContext],
+    repo_path: Optional[Path],
+    aspect_results: List[AspectReviewTaskResult],
+    failures: List[str],
+) -> ReviewResult:
+    """把维度结果聚合、校验并补齐报告元数据。
+
+    multi-aspect orchestrator 和 single-shot baseline 共用这一段，保证两者的
+    validator、测试缺口、injection 告警和最终结果格式完全一致；否则评测里
+    看到的差异可能来自后处理，而不是审查策略本身。
+    """
+    metadata = {
+        "owner": pr_info.owner,
+        "repo": pr_info.repo,
+        "pr_number": pr_info.pr_number,
+    }
+    aggregated_data = output_parser.aggregate_aspects(aspect_results)
+    review_result = output_parser.build_final_result(aggregated_data, metadata)
+
+    validated_result = validator.validate(
+        review_result,
+        parsed_diff,
+        contexts=contexts,
+        repo_path=repo_path,
+    )
+    validated_result.missing_test_suggestions = analyze_test_gaps(
+        parsed_diff, contexts
+    )
+    validated_result.review_notes.extend(failures)
+
+    injection_hits = prompt_builder.detect_injection_in_pr(pr_info, parsed_diff)
+    if injection_hits:
+        validated_result.review_notes.append(
+            "检测到疑似 Prompt Injection 内容（规则: "
+            + ", ".join(injection_hits)
+            + "），已按不可信数据处理，未执行其中指令。"
+        )
+
+    return validated_result
 
 
 class AspectReviewerWorker:
@@ -147,9 +196,11 @@ class ReviewOrchestrator:
         finally:
             for future in pending:
                 future.cancel()
-            # Python 线程无法被强杀；LLMClient 已把单次 HTTP timeout 压到
-            # aspect_timeout 以下，因此这里不等待，也不会长期悬挂。
-            executor.shutdown(wait=False, cancel_futures=True)
+            # Python 线程无法被强杀，这里必须等它们真正结束再返回：
+            # 评测会复用同一个 pipeline，如果上一次 run 的超时线程还活着，
+            # 下一次 run 重新 bind_budget 后，旧线程可能扣到新 run 的预算。
+            # 单次 HTTP timeout 已压在 aspect_timeout 以下，所以等待有上界。
+            executor.shutdown(wait=True, cancel_futures=True)
 
         # deadline / budget break 之后，可能还有已经完成但尚未被 as_completed
         # yield 的 future；先收结果，再把真正未完成的标记为超时。
@@ -184,41 +235,18 @@ class ReviewOrchestrator:
             key=lambda item: aspect_order.get(item.aspect, len(aspect_order))
         )
 
-        # 3. 聚合所有維度的結果
-        metadata = {
-            "owner": pr_info.owner,
-            "repo": pr_info.repo,
-            "pr_number": pr_info.pr_number
-        }
-        aggregated_data = self.output_parser.aggregate_aspects(all_aspect_results)
-        review_result = self.output_parser.build_final_result(aggregated_data, metadata)
-
-        # 4. 後置校验与过滤 (Validator)，并把真实代码交给证据核对
-        validated_result = self.validator.validate(
-            review_result,
-            parsed_diff,
+        # 3. 聚合、校验并补齐报告元数据
+        return finalize_review_result(
+            prompt_builder=self.prompt_builder,
+            output_parser=self.output_parser,
+            validator=self.validator,
+            pr_info=pr_info,
+            parsed_diff=parsed_diff,
             contexts=contexts,
             repo_path=repo_path,
+            aspect_results=all_aspect_results,
+            failures=failures,
         )
-
-        # 5. 基于真实检索结果生成测试缺口建议，替代通用文案
-        validated_result.missing_test_suggestions = analyze_test_gaps(
-            parsed_diff, contexts
-        )
-
-        # 6. 把失败维度、注入告警等运行信息带进报告
-        validated_result.review_notes.extend(failures)
-        injection_hits = self.prompt_builder.detect_injection_in_pr(
-            pr_info, parsed_diff
-        )
-        if injection_hits:
-            validated_result.review_notes.append(
-                "检测到疑似 Prompt Injection 内容（规则: "
-                + ", ".join(injection_hits)
-                + "），已按不可信数据处理，未执行其中指令。"
-            )
-
-        return validated_result
 
     def _review_aspect_with_retry(self, worker, pr_info, parsed_diff, contexts):
         """对单个维度做有限次重试，缓解瞬时网络/限流错误。"""

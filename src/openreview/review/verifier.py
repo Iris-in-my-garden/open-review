@@ -12,9 +12,9 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from openreview.repo.diff_parser import ParsedDiff
 from openreview.retriever.code_context import CodeContext
@@ -41,12 +41,41 @@ VERIFIER_SYSTEM_PROMPT = """你是一个严格的 Code Review Verifier。你的�
 """
 
 
+Verdict = Literal["verified", "rejected", "needs_more_context"]
+
+# 模型可能返回同义词或拼写变体。未知值一律收敛到“需要更多上下文”，
+# 绝不能默认成 verified，否则一个拼写错误就会放行未经验证的高优问题。
+_VERDICT_ALIASES: Dict[str, Verdict] = {
+    "verified": "verified",
+    "verify": "verified",
+    "valid": "verified",
+    "true": "verified",
+    "accept": "verified",
+    "accepted": "verified",
+    "rejected": "rejected",
+    "reject": "rejected",
+    "invalid": "rejected",
+    "false": "rejected",
+    "needs_more_context": "needs_more_context",
+    "needs-more-context": "needs_more_context",
+    "insufficient_context": "needs_more_context",
+    "unknown": "needs_more_context",
+    "uncertain": "needs_more_context",
+}
+
+
 class VerifierResult(BaseModel):
     issue_id: str
-    verdict: str
-    confidence: float = 0.5
+    verdict: Verdict
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     reason: str = ""
     evidence: str = ""
+
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def _normalize_verdict(cls, value: object) -> Verdict:
+        text = str(value or "").strip().lower()
+        return _VERDICT_ALIASES.get(text, "needs_more_context")
 
 
 class VerifierBatchOutput(BaseModel):
@@ -58,6 +87,7 @@ class VerifierStats(BaseModel):
     verified: int = 0
     rejected: int = 0
     needs_more_context: int = 0
+    downgraded_low_confidence: int = 0
     llm_calls: int = 0
     skipped_by_budget: int = 0
 
@@ -72,11 +102,15 @@ class FindingVerifier:
         batch_size: int = 4,
         max_attempts: int = 2,
         verify_severities: Sequence[str] = ("critical", "high"),
+        min_verify_confidence: float = 0.6,
     ):
         self.llm_client = llm_client
         self.batch_size = max(1, batch_size)
         self.max_attempts = max(1, max_attempts)
         self.verify_severities = set(verify_severities)
+        self.min_verify_confidence = max(
+            0.0, min(1.0, float(min_verify_confidence))
+        )
 
     def verify(
         self,
@@ -157,6 +191,24 @@ class FindingVerifier:
                 kept.append(issue)
                 continue
 
+            # “verified” 但置信度不足时，不能直接放行；降级为 needs_more_context，
+            # 交给下游降权/丢弃，避免模型用低置信度强行确认高优问题。
+            if (
+                decision.verdict == "verified"
+                and decision.confidence < self.min_verify_confidence
+            ):
+                stats.downgraded_low_confidence += 1
+                decision = decision.model_copy(
+                    update={
+                        "verdict": "needs_more_context",
+                        "reason": (
+                            f"verifier confidence {decision.confidence:.2f} "
+                            f"< {self.min_verify_confidence:.2f}; "
+                            + (decision.reason or "证据不足")
+                        ),
+                    }
+                )
+
             if decision.verdict == "rejected":
                 stats.rejected += 1
                 result.review_notes.append(
@@ -186,11 +238,13 @@ class FindingVerifier:
         )
         result.review_notes.append(
             "Verifier: 校验 {candidates} 个高优问题，verified={verified}, "
-            "rejected={rejected}, needs_more_context={needs}, llm_calls={calls}。".format(
+            "rejected={rejected}, needs_more_context={needs}, "
+            "downgraded_low_confidence={downgraded}, llm_calls={calls}。".format(
                 candidates=stats.candidates,
                 verified=stats.verified,
                 rejected=stats.rejected,
                 needs=stats.needs_more_context,
+                downgraded=stats.downgraded_low_confidence,
                 calls=stats.llm_calls,
             )
         )

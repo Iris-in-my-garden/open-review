@@ -289,7 +289,13 @@ class ReviewPipeline:
             local_input=local_input,
         )
         # 每次 run 使用独立预算；客户端在本次 run 内共享同一本账。
+        # ReviewOrchestrator 返回前会等待所有 worker 结束，因此复用客户端
+        # 不会出现“上一次 run 的超时线程扣本次预算”的竞态。
         self._budgeted_client.bind_budget(state.budget)
+        # 记录 run 开始时的累计值，后续用 delta 计算本次真实成本。
+        state.usage_start = self._usage_snapshot()
+        state.cache_hits_start = int(getattr(self.llm_client, "hits", 0) or 0)
+        state.cache_misses_start = int(getattr(self.llm_client, "misses", 0) or 0)
         return state
 
     def _execute(self, state: ReviewState) -> Path:
@@ -790,6 +796,26 @@ class ReviewPipeline:
             f"hybrid={int(self.hybrid_retrieval_enabled)}",
         )
 
+    def _usage_snapshot(self) -> Dict[str, int]:
+        """读取客户端当前的累计 usage，作为一次 run 的起点。"""
+        usage = getattr(self.llm_client, "usage", {}) or {}
+        return {
+            str(key): int(value)
+            for key, value in usage.items()
+            if isinstance(value, (int, float))
+        }
+
+    @staticmethod
+    def _usage_delta(
+        before: Dict[str, int], after: Dict[str, int]
+    ) -> Dict[str, int]:
+        """计算本次 run 的 usage 增量，避免评测复用 pipeline 时累计污染。"""
+        keys = sorted(set(before) | set(after))
+        return {
+            key: int(after.get(key, 0)) - int(before.get(key, 0))
+            for key in keys
+        }
+
     def _build_metrics(self, state: ReviewState) -> Dict[str, object]:
         parsed_diff = state.parsed_diff
         patch_tokens = sum(
@@ -887,8 +913,16 @@ class ReviewPipeline:
             "cache": {
                 "review_hit": state.cache_hit,
                 "key": state.cache_key[:16] if state.cache_key else "",
-                "llm_hits": getattr(self.llm_client, "hits", 0),
-                "llm_misses": getattr(self.llm_client, "misses", 0),
+                "llm_hits": max(
+                    0,
+                    int(getattr(self.llm_client, "hits", 0) or 0)
+                    - state.cache_hits_start,
+                ),
+                "llm_misses": max(
+                    0,
+                    int(getattr(self.llm_client, "misses", 0) or 0)
+                    - state.cache_misses_start,
+                ),
             },
             "budget": {
                 "max_llm_calls": state.budget.max_llm_calls,
@@ -898,7 +932,9 @@ class ReviewPipeline:
                 "max_seconds": state.budget.max_seconds,
                 "elapsed_seconds": round(state.budget.elapsed(), 3),
             },
-            "llm_usage": dict(getattr(self.llm_client, "usage", {})),
+            "llm_usage": self._usage_delta(
+                state.usage_start, self._usage_snapshot()
+            ),
         }
 
     @staticmethod

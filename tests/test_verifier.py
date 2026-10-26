@@ -26,6 +26,7 @@ class ScriptedVerifierLLM:
                 VerifierResult(
                     issue_id=issue_id,
                     verdict=verdict,
+                    confidence=0.9 if verdict == "verified" else 0.5,
                     reason=f"{verdict} reason",
                 )
                 for issue_id, verdict in self.verdicts.items()
@@ -96,5 +97,44 @@ def test_verifier_lowers_confidence_when_context_is_insufficient():
 
     result, stats = verifier.verify(_result([_issue(1)]), _diff(), contexts=[])
 
+    assert stats.needs_more_context == 1
+    assert result.potential_issues[0].confidence == 0.7
+
+
+class LowConfidenceVerifiedLLM:
+    def generate_structured(self, system_prompt, user_prompt, response_schema):
+        return response_schema(
+            results=[
+                VerifierResult(
+                    issue_id="issue-1",
+                    verdict="verified",
+                    confidence=0.2,
+                    reason="looks plausible",
+                )
+            ]
+        )
+
+
+def test_verifier_does_not_accept_low_confidence_verified():
+    verifier = FindingVerifier(
+        llm_client=LowConfidenceVerifiedLLM(), batch_size=10, max_attempts=1
+    )
+
+    result, stats = verifier.verify(_result([_issue(1)]), _diff(), contexts=[])
+
+    assert stats.verified == 0
+    assert stats.needs_more_context == 1
+    assert stats.downgraded_low_confidence == 1
+    assert result.potential_issues[0].confidence == 0.7
+
+
+def test_verifier_treats_unknown_verdict_as_needs_more_context():
+    llm = ScriptedVerifierLLM({"issue-1": "definitely-not-a-verdict"})
+    verifier = FindingVerifier(llm_client=llm, batch_size=10, max_attempts=1)
+
+    result, stats = verifier.verify(_result([_issue(1)]), _diff(), contexts=[])
+
+    # 未知 verdict 绝不能默认成 verified；应降级为需要更多上下文。
+    assert stats.verified == 0
     assert stats.needs_more_context == 1
     assert result.potential_issues[0].confidence == 0.7

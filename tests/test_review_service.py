@@ -303,6 +303,39 @@ def test_pipeline_surfaces_retrieval_metrics_and_context_refs(tmp_path: Path):
     pipeline.close()
 
 
+def test_pipeline_llm_usage_is_per_run_not_cumulative(tmp_path: Path):
+    pipeline = ReviewPipeline(
+        mock_llm=True,
+        max_batch_tokens=10_000,
+        verifier_enabled=False,
+    )
+    pipeline.gh_client = FakeGitHubClient(
+        files=[
+            ChangedFile(
+                filename="src/file_0.py",
+                status="modified",
+                additions=1,
+                deletions=0,
+                changes=1,
+                patch="@@ -0,0 +1,1 @@\n+x = 1\n",
+            )
+        ]
+    )
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+
+    pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+    first = dict(pipeline.last_result.metrics["llm_usage"])
+    pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+    second = dict(pipeline.last_result.metrics["llm_usage"])
+
+    # pipeline 在评测中会被复用；第二次 run 的报告不能包含第一次的调用。
+    assert first["calls"] > 0
+    assert second["calls"] == first["calls"]
+
+    pipeline.close()
+
+
 def test_pipeline_does_not_charge_budget_for_client_side_cache_hits(tmp_path: Path):
     pipeline = ReviewPipeline(
         mock_llm=True,
