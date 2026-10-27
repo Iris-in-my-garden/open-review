@@ -74,9 +74,8 @@ class BudgetedLLMClient:
     ) -> T:
         if self._budget is not None:
             estimated = estimate_tokens(system_prompt) + estimate_tokens(user_prompt)
-            # 先 check 再 consume：并发调用不会同时越过上限。
-            self._budget.require(calls=1, tokens=estimated)
-            self._budget.consume(calls=1, tokens=estimated)
+            # 检查与扣减在同一临界区完成：4 个 aspect 并发时不会同时越过上限。
+            self._budget.reserve(calls=1, tokens=estimated)
         return self.inner.generate_structured(
             system_prompt=system_prompt,
             user_prompt=user_prompt,

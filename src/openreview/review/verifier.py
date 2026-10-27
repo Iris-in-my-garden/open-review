@@ -88,6 +88,7 @@ class VerifierStats(BaseModel):
     rejected: int = 0
     needs_more_context: int = 0
     downgraded_low_confidence: int = 0
+    dropped_low_confidence: int = 0
     llm_calls: int = 0
     skipped_by_budget: int = 0
 
@@ -103,6 +104,7 @@ class FindingVerifier:
         max_attempts: int = 2,
         verify_severities: Sequence[str] = ("critical", "high"),
         min_verify_confidence: float = 0.6,
+        min_finding_confidence: float = 0.6,
     ):
         self.llm_client = llm_client
         self.batch_size = max(1, batch_size)
@@ -110,6 +112,11 @@ class FindingVerifier:
         self.verify_severities = set(verify_severities)
         self.min_verify_confidence = max(
             0.0, min(1.0, float(min_verify_confidence))
+        )
+        # validator 在 verifier 之前已经用过 0.6 阈值；verifier 再次降权后
+        # 必须重新收口，否则会留下“低于阈值但仍然进入报告”的 finding。
+        self.min_finding_confidence = max(
+            0.0, min(1.0, float(min_finding_confidence))
         )
 
     def verify(
@@ -145,10 +152,10 @@ class FindingVerifier:
                 )
                 estimated = estimate_tokens(prompt) + 200
                 if budget is not None and not budgeted_client:
-                    if not budget.allow(calls=1, tokens=estimated):
+                    # 与 BudgetedLLMClient 一样，检查与扣减必须原子完成。
+                    if not budget.try_reserve(calls=1, tokens=estimated):
                         stats.skipped_by_budget += len(chunk)
                         continue
-                    budget.consume(calls=1, tokens=estimated)
 
                 try:
                     response = self.llm_client.generate_structured(
@@ -219,6 +226,16 @@ class FindingVerifier:
             if decision.verdict == "needs_more_context":
                 stats.needs_more_context += 1
                 issue.confidence = round(max(0.0, issue.confidence - 0.1), 2)
+                if issue.confidence < self.min_finding_confidence:
+                    # validator 的 min_confidence 已经跑过一轮；verifier 再降权后
+                    # 必须重新收口，否则报告会留下低于阈值的 finding。
+                    stats.dropped_low_confidence += 1
+                    result.review_notes.append(
+                        f"Verifier 未能确认 `{issue.file}:{issue.line or '-'}`，"
+                        f"置信度降至 {issue.confidence:.2f} < "
+                        f"{self.min_finding_confidence:.2f}，已丢弃。"
+                    )
+                    continue
                 result.review_notes.append(
                     f"Verifier 未能确认 `{issue.file}:{issue.line or '-'}`，"
                     "已降低置信度。"
@@ -239,12 +256,14 @@ class FindingVerifier:
         result.review_notes.append(
             "Verifier: 校验 {candidates} 个高优问题，verified={verified}, "
             "rejected={rejected}, needs_more_context={needs}, "
-            "downgraded_low_confidence={downgraded}, llm_calls={calls}。".format(
+            "downgraded_low_confidence={downgraded}, "
+            "dropped_low_confidence={dropped}, llm_calls={calls}。".format(
                 candidates=stats.candidates,
                 verified=stats.verified,
                 rejected=stats.rejected,
                 needs=stats.needs_more_context,
                 downgraded=stats.downgraded_low_confidence,
+                dropped=stats.dropped_low_confidence,
                 calls=stats.llm_calls,
             )
         )

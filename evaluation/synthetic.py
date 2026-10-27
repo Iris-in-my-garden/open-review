@@ -655,7 +655,7 @@ def run_synthetic_benchmark(
     results_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    pipeline_kwargs = {
+    pipeline_kwargs: Dict[str, Any] = {
         "mock_llm": mock_llm,
         "hybrid_retrieval_enabled": hybrid_retrieval_enabled,
         "review_cache_enabled": False,

@@ -34,12 +34,12 @@ class ScriptedVerifierLLM:
         )
 
 
-def _issue(line: int, severity: str = "high") -> PotentialIssue:
+def _issue(line: int, severity: str = "high", confidence: float = 0.8) -> PotentialIssue:
     return PotentialIssue(
         file="src/a.py",
         severity=severity,
         category="bugs",
-        confidence=0.8,
+        confidence=confidence,
         reasoning=f"issue at {line}",
         suggestion="fix it",
         line=line,
@@ -98,7 +98,24 @@ def test_verifier_lowers_confidence_when_context_is_insufficient():
     result, stats = verifier.verify(_result([_issue(1)]), _diff(), contexts=[])
 
     assert stats.needs_more_context == 1
+    assert stats.dropped_low_confidence == 0
     assert result.potential_issues[0].confidence == 0.7
+
+
+def test_verifier_drops_findings_below_threshold_after_downgrade():
+    llm = ScriptedVerifierLLM({"issue-1": "needs_more_context"})
+    verifier = FindingVerifier(llm_client=llm, batch_size=10, max_attempts=1)
+
+    result, stats = verifier.verify(
+        _result([_issue(1, confidence=0.65)]), _diff(), contexts=[]
+    )
+
+    # 0.65 - 0.1 = 0.55 < 0.6，不能在报告里留下低于阈值的 finding。
+    assert stats.needs_more_context == 1
+    assert stats.dropped_low_confidence == 1
+    assert result.potential_issues == []
+    assert result.risk_level == "LOW"
+    assert any("已丢弃" in note for note in result.review_notes)
 
 
 class LowConfidenceVerifiedLLM:

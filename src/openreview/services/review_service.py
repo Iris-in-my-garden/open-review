@@ -697,7 +697,28 @@ class ReviewPipeline:
             raise RuntimeError("Review result is missing; cannot finalize.")
         result = state.review_result
 
-        result.metrics = self._build_metrics(state)
+        if state.cache_hit and result.metrics:
+            # 缓存命中时 analyze/verify 节点都被跳过，state 里没有文件、批次、
+            # 检索和 token 信息。直接重算会把上一次 run 的指标覆盖成 0，
+            # 所以保留缓存里的原始 metrics，只补充本次 cache 命中信息。
+            metrics = dict(result.metrics)
+            cache = dict(metrics.get("cache") or {})
+            cache.update(
+                {
+                    "review_hit": True,
+                    "key": state.cache_key[:16] if state.cache_key else "",
+                    "served_from_cache": True,
+                    "cache_lookup_seconds": round(
+                        float(state.stages.get("cache_lookup", 0.0)), 3
+                    ),
+                    "current_run_seconds": round(sum(state.stages.values()), 3),
+                }
+            )
+            metrics["cache"] = cache
+            metrics["metrics_source"] = "review_cache"
+            result.metrics = metrics
+        else:
+            result.metrics = self._build_metrics(state)
         logger.info("Review metrics: %s", result.metrics)
 
         # 报告首次写入时 metrics 还没补齐；这里补齐后重新落盘，

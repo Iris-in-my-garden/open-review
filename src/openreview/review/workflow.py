@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,21 +42,29 @@ class ReviewBudget:
     used_llm_calls: int = 0
     used_input_tokens: int = 0
     started_at: float = field(default_factory=time.monotonic)
+    # 四个 aspect 由线程池并发执行，预算检查 + 扣减必须是同一临界区，
+    # 否则多个线程可能同时通过检查，把“硬预算”变成软预算。
+    # 用 RLock 是为了 allow()/consume() 可以在 reserve() 内部安全复用。
+    _lock: Any = field(
+        default_factory=threading.RLock, repr=False, compare=False
+    )
 
     def elapsed(self) -> float:
         return time.monotonic() - self.started_at
 
     def remaining_calls(self) -> Optional[int]:
-        if self.max_llm_calls <= 0:
-            return None
-        return max(0, self.max_llm_calls - self.used_llm_calls)
+        with self._lock:
+            if self.max_llm_calls <= 0:
+                return None
+            return max(0, self.max_llm_calls - self.used_llm_calls)
 
     def remaining_tokens(self) -> Optional[int]:
-        if self.max_input_tokens <= 0:
-            return None
-        return max(0, self.max_input_tokens - self.used_input_tokens)
+        with self._lock:
+            if self.max_input_tokens <= 0:
+                return None
+            return max(0, self.max_input_tokens - self.used_input_tokens)
 
-    def allow(self, calls: int = 1, tokens: int = 0) -> bool:
+    def _allow_unlocked(self, calls: int, tokens: int) -> bool:
         if self.max_seconds > 0 and self.elapsed() >= self.max_seconds:
             return False
         if (
@@ -70,11 +79,54 @@ class ReviewBudget:
             return False
         return True
 
-    def consume(self, calls: int = 0, tokens: int = 0) -> None:
+    def allow(self, calls: int = 1, tokens: int = 0) -> bool:
+        """只检查、不扣减；用于调用前的快速预检。
+
+        并发场景下应使用 :meth:`reserve`，否则“检查”和“扣减”之间
+        仍可能被其他线程插入。
+        """
+        with self._lock:
+            return self._allow_unlocked(calls, tokens)
+
+    def _consume_unlocked(self, calls: int, tokens: int) -> None:
         self.used_llm_calls += max(0, calls)
         self.used_input_tokens += max(0, tokens)
 
+    def consume(self, calls: int = 0, tokens: int = 0) -> None:
+        with self._lock:
+            self._consume_unlocked(calls, tokens)
+
+    def reserve(self, calls: int = 1, tokens: int = 0) -> None:
+        """原子地检查并扣减预算；不足时抛 ``BudgetExceeded``。
+
+        这是真正给并发调用使用的入口：检查和扣减在同一个锁内完成，
+        不会出现四个线程同时通过 ``max_llm_calls`` 检查的情况。
+        """
+        with self._lock:
+            if not self._allow_unlocked(calls, tokens):
+                raise BudgetExceeded(
+                    f"Review budget exceeded: calls={self.used_llm_calls}/"
+                    f"{self.max_llm_calls or 'unlimited'}, "
+                    f"tokens={self.used_input_tokens}/"
+                    f"{self.max_input_tokens or 'unlimited'}, "
+                    f"elapsed={self.elapsed():.1f}s"
+                )
+            self._consume_unlocked(calls, tokens)
+
+    def try_reserve(self, calls: int = 1, tokens: int = 0) -> bool:
+        """``reserve`` 的非异常版本，方便调用方把预算不足当作普通分支处理。"""
+        with self._lock:
+            if not self._allow_unlocked(calls, tokens):
+                return False
+            self._consume_unlocked(calls, tokens)
+            return True
+
     def require(self, calls: int = 1, tokens: int = 0) -> None:
+        """仅检查预算是否足够；不扣减。
+
+        保留此方法是为了兼容调用方的预检语义。真正需要“占坑”时请用
+        :meth:`reserve`，避免检查与扣减之间的竞态。
+        """
         if not self.allow(calls, tokens):
             raise BudgetExceeded(
                 f"Review budget exceeded: calls={self.used_llm_calls}/"

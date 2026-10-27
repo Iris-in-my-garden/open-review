@@ -244,21 +244,36 @@ def test_pipeline_review_cache_skips_second_run(tmp_path: Path):
     )
     pipeline.gh_client = FakeGitHubClient()
     pipeline.repo_mgr = FakeRepoManager(tmp_path)
-    pipeline.retriever = FakeRetriever()
+    pipeline.retriever = FakeContextRetriever()
     pipeline.reviewer = FakeReviewer()
 
     first = pipeline.run(
         "https://github.com/org/repo/pull/1", tmp_path / "reports"
     )
+    first_metrics = dict(pipeline.last_result.metrics)
     second = pipeline.run(
         "https://github.com/org/repo/pull/1", tmp_path / "reports"
     )
+    second_metrics = dict(pipeline.last_result.metrics)
 
     assert first == second
     assert len(pipeline.reviewer.calls) == 1
     assert pipeline.repo_mgr.base_calls == 1
     content = second.read_text(encoding="utf-8")
     assert "命中本地 review 缓存" in content
+    assert "**Files**: 2" in content
+
+    # cache hit 时 analyze/verify 被跳过，但报告不能把上一次 run 的
+    # files / batches / aspects / retrieval 指标覆盖成 0。
+    assert first_metrics["files"] == 2
+    assert second_metrics["files"] == first_metrics["files"]
+    assert second_metrics["batches"] == first_metrics["batches"]
+    assert second_metrics["aspects"] == first_metrics["aspects"]
+    assert second_metrics["retrieval"]["contexts"] == 1
+    assert second_metrics["retrieval"] == first_metrics["retrieval"]
+    assert second_metrics["metrics_source"] == "review_cache"
+    assert second_metrics["cache"]["served_from_cache"] is True
+    assert second_metrics["cache"]["review_hit"] is True
 
 
 def test_pipeline_surfaces_retrieval_metrics_and_context_refs(tmp_path: Path):
