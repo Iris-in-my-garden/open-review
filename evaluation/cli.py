@@ -125,25 +125,28 @@ def _estimate_aacr_review(
     input_price: float,
     output_price: float,
     verifier: bool = True,
+    reviewer_mode: str = "single",
 ) -> dict:
     """AACR review 的保守 preflight。
 
     不 clone 仓库，只看 manifest 里的 change_line_count / reference_comments。
     真实 prompt 还受上下文检索和 token 预算影响，因此这里明确标注为估算。
     """
+    calls_per_review = 4 if reviewer_mode == "multi_aspect" else 1
     prompt_tokens = 0
     completion_tokens = 0
     calls = 0
     for instance in instances:
         lines = max(1, int(instance.get("change_line_count") or 0))
-        per_aspect_prompt = 5000 + lines * 12
-        prompt_tokens += per_aspect_prompt * 4
-        completion_tokens += 450 * 4
-        calls += 4
+        per_review_prompt = 5000 + lines * 12
+        prompt_tokens += per_review_prompt * calls_per_review
+        completion_tokens += 450 * calls_per_review
+        calls += calls_per_review
         if verifier:
             prompt_tokens += 1500 + int(instance.get("reference_comments") or 1) * 250
             completion_tokens += 300
             calls += 1
+    mode_label = "4 aspects" if reviewer_mode == "multi_aspect" else "single-pass"
     return {
         "instances": len(instances),
         "llm_calls": calls,
@@ -152,7 +155,9 @@ def _estimate_aacr_review(
         "estimated_usd": estimate_usd(
             prompt_tokens, completion_tokens, input_price, output_price
         ),
-        "assumption": "4 aspects + verifier; ~12 tokens/change line + base context",
+        "assumption": (
+            f"{mode_label} + verifier; ~12 tokens/change line + base context"
+        ),
     }
 
 
@@ -199,6 +204,7 @@ def cmd_review(args: argparse.Namespace) -> int:
             input_price=input_price,
             output_price=output_price,
             verifier=not args.no_verifier,
+            reviewer_mode=args.reviewer_mode,
         )
         print(
             "[estimate] instances={instances} calls={llm_calls} "
@@ -225,6 +231,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         mock_llm=args.mock_llm,
         llm_model=args.model,
         llm_base_url=args.base_url,
+        reviewer_mode=args.reviewer_mode,
         max_workers=args.max_workers,
         triage_enabled=not args.no_triage,
         impact_enabled=not args.no_impact,
@@ -453,6 +460,12 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--mock-llm", action="store_true", help="零成本 mock，仅验证链路")
     review.add_argument("--model", default=None)
     review.add_argument("--base-url", default=None)
+    review.add_argument(
+        "--reviewer-mode",
+        choices=["single", "multi_aspect"],
+        default="single",
+        help="single=每个 batch 一次调用；multi_aspect=四维度并行（高召回/消融）",
+    )
     review.add_argument("--max-workers", type=int, default=4)
     review.add_argument("--budget-calls", type=int, default=0)
     review.add_argument("--no-triage", action="store_true")
@@ -525,7 +538,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         choices=["full", "baseline", "both"],
         default="both",
-        help="full=多维度+verifier；baseline=single-shot；both=同批对照",
+        help="full=single-pass+检索+verifier；baseline=无 triage/impact/verifier；both=同批对照",
     )
     synthetic.add_argument("--limit", type=int, default=None)
     synthetic.add_argument("--run-id", default=None)

@@ -181,7 +181,8 @@ class ReportWriter:
                 for key, label in (
                     ("files", "Files"),
                     ("batches", "Batches"),
-                    ("aspects", "Aspects"),
+                    ("reviewer_mode", "Reviewer Mode"),
+                    ("aspects", "Focus Aspects"),
                     ("llm_calls", "LLM Calls"),
                     ("estimated_patch_tokens", "Estimated Patch Tokens"),
                     ("estimated_context_tokens", "Estimated Context Tokens"),

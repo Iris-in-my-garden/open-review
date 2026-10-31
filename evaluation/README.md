@@ -220,9 +220,10 @@ overlap ≥ 0.8。它不是语义判断，只回答“引用的代码是否真�
 
 - `coverage`：带 `source_aspects` 的 findings / 总 findings
 - `multi_aspect_rate`：被多个维度同时命中的 findings / 总 findings
-- `aspect_counts`：每个维度贡献了多少 findings
+- `aspect_counts`：每个来源贡献了多少 findings
 
-这组指标用于观察“跨维度去重后归因是否完整”，也为后续按维度分析提供数据。
+单遍模式下没有独立维度，`source_aspects` 使用 finding 自己的 `category`
+归因；多维度模式下则是实际运行维度。跨模式下对比时请先看清 `reviewer_mode`。
 
 ### retrieval
 
@@ -256,6 +257,10 @@ deduplicated`
 `review` 子命令直接暴露了当前需要验证的开关：
 
 ```bash
+# reviewer 策略：默认单遍；multi_aspect 仅用于高召回/消融
+--reviewer-mode single
+--reviewer-mode multi_aspect
+
 # verifier on/off
 --no-verifier
 
@@ -269,8 +274,8 @@ deduplicated`
 --model gpt-4o-mini
 ```
 
-建议保持三个主消融：**verifier、impact/tool-loop、model tier**。triage 和上下文
-级别可以作为补充，不要一次性展开太多维度，否则 43 个 PR 的样本量撑不住结论。
+建议保持三个主消融：**reviewer 策略、verifier、impact/tool-loop**，模型档位和
+triage 作为补充。不要一次性展开太多维度，否则 43 个 PR 的样本量撑不住结论。
 
 ### 录制 / 回放，避免重复付费
 

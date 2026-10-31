@@ -32,7 +32,7 @@ def finalize_review_result(
 ) -> ReviewResult:
     """把维度结果聚合、校验并补齐报告元数据。
 
-    multi-aspect orchestrator 和 single-shot baseline 共用这一段，保证两者的
+    single-pass 默认路径和 multi-aspect 可选路径共用这一段，保证两者的
     validator、测试缺口、injection 告警和最终结果格式完全一致；否则评测里
     看到的差异可能来自后处理，而不是审查策略本身。
     """

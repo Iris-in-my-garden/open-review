@@ -69,15 +69,20 @@ def review(
         "--max-batch-tokens",
         help="Max estimated patch tokens per review batch (0 disables batching)",
     ),
+    reviewer_mode: str = typer.Option(
+        "single",
+        "--reviewer-mode",
+        help="Reviewer strategy: single (default, 1 call/batch) | multi_aspect (high recall)",
+    ),
     max_workers: int = typer.Option(
         4,
         "--max-workers",
-        help="Max parallel aspect reviewers",
+        help="Max parallel aspect reviewers (multi_aspect mode only)",
     ),
     triage_enabled: bool = typer.Option(
         True,
         "--triage/--no-triage",
-        help="Enable rule-based triage (skip docs-only PRs, narrow aspects)",
+        help="Enable rule-based triage (skip docs-only PRs, narrow review focus)",
     ),
     impact_enabled: bool = typer.Option(
         True,
@@ -160,6 +165,7 @@ def review(
             llm_base_url=llm_base_url,
             mock_llm=mock_llm,
             max_batch_tokens=max_batch_tokens,
+            reviewer_mode=reviewer_mode,
             max_workers=max_workers,
             triage_enabled=triage_enabled,
             impact_enabled=impact_enabled,

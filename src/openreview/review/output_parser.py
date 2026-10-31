@@ -61,14 +61,14 @@ class PotentialIssueSchema(BaseModel):
 
 
 class AspectReviewOutputSchema(BaseModel):
-    """单个 Worker（维度）的标准输出结构"""
-    aspect_summary: str = Field(description="该维度的整体审查摘要")
-    issues: List[PotentialIssueSchema] = Field(default_factory=list, description="该维度发现的潜在问题列表")
+    """单次审查（single-pass 或单个 aspect）的标准输出结构"""
+    aspect_summary: str = Field(description="本次审查的整体摘要")
+    issues: List[PotentialIssueSchema] = Field(default_factory=list, description="本次发现的潜在问题列表")
 
 class AspectReviewTaskResult(BaseModel):
-    """ 单个 Worker 任务执行结果的结构化封装"""
-    aspect: str = Field(description="审查维度名称（如 clean_code, bugs, performance, security）")
-    data: AspectReviewOutputSchema = Field(description="该维度对应的结构化审查输出")
+    """单次审查任务执行结果的结构化封装"""
+    aspect: str = Field(description="审查来源（single_shot 或 clean_code/bugs/performance/security）")
+    data: AspectReviewOutputSchema = Field(description="该来源对应的结构化审查输出")
 
 class ReviewResultSchema(BaseModel):
     summary: str
@@ -84,7 +84,7 @@ class ReviewResultSchema(BaseModel):
 
 class OutputParser:
     def schema_for_aspect(self, aspect: str) -> Type[AspectReviewOutputSchema]:
-        """所有 Worker 维度统一使用该 Schema，确保 LLM 结构化输出稳定性"""
+        """single-pass 和 multi-aspect 共用该 Schema，确保结构化输出稳定。"""
         return AspectReviewOutputSchema
 
     def aggregate_aspects(self, all_aspect_results: List[AspectReviewTaskResult]) -> ReviewResultSchema:
@@ -105,9 +105,16 @@ class OutputParser:
             if data.issues:
                 # 在去重前记录来源维度：去重会保留 severity 最高的一条，
                 # 如果不记来源，clean_code 等低严重级别维度的贡献会被系统性吞掉。
+                # single_shot 没有独立维度，用 finding 自己的 category 归因，
+                # 这样评测里的 aspect_counts 仍然可读。
                 for issue in data.issues:
+                    source = (
+                        issue.category
+                        if aspect == "single_shot" and issue.category
+                        else aspect
+                    )
                     issue.source_aspects = list(
-                        dict.fromkeys([*issue.source_aspects, aspect])
+                        dict.fromkeys([*issue.source_aspects, source])
                     )
                 all_issues.extend(data.issues)
 
@@ -133,12 +140,12 @@ class OutputParser:
             summary=combined_summary,
             risk_level=risk_level,
             risk_reason=risk_reason,
-            key_changes=["多维度并行代码评审已完成"],
+            key_changes=["代码评审已完成"],
             potential_issues=all_issues,
             missing_test_suggestions=["建议针对本次审查发现的边界条件与潜在逻辑漏洞补充自动化单元测试。"],
             evidence=unique_files(all_issues),
             final_decision=final_decision,
-            final_summary=f"多维度评审结束。最终决策: {final_decision} (风险等级: {risk_level})"
+            final_summary=f"评审结束。最终决策: {final_decision} (风险等级: {risk_level})"
         )
 
 

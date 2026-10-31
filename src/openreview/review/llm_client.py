@@ -248,7 +248,7 @@ class MockLLMClient:
                 ]
             )
 
-        # 2. 针对单维度审查的 Schema (AspectReviewOutputSchema)
+        # 2. 审查输出 Schema（single-pass 和 multi-aspect 共用）
         if "AspectReviewOutputSchema" in schema_name:
             # 从 User Prompt 的 Patch 区块中取出真实文件名，
             # 避免 Mock 问题因“文件不在 Diff 中”被校验器全部过滤掉。
@@ -291,7 +291,7 @@ class MockLLMClient:
             ]
 
             return response_schema(
-                aspect_summary="[MOCK] 该维度的代码检查完成，发现了一些需要注意的潜在问题。",
+                aspect_summary="[MOCK] 本次审查完成，发现了一些需要注意的潜在问题。",
                 issues=mock_issues
             )
 
@@ -305,5 +305,5 @@ class MockLLMClient:
             missing_test_suggestions=["[MOCK] 建议针对修改后的认证流程补充单元测试。"],
             evidence=["src/auth/service.py"],
             final_decision="REQUEST_CHANGES",
-            final_summary="[MOCK] 多维度审查结束。最终决策: REQUEST_CHANGES (风险等级: MEDIUM)"
+            final_summary="[MOCK] 审查结束。最终决策: REQUEST_CHANGES (风险等级: MEDIUM)"
         )

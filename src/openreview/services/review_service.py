@@ -38,6 +38,7 @@ from openreview.review.llm_client import (
 from openreview.review.output_parser import OutputParser
 from openreview.review.prompt_builder import PromptBuilder
 from openreview.review.report_writer import ReportWriter, ReviewResult
+from openreview.review.single_shot import SingleShotReviewer
 from openreview.review.static_analysis import StaticAnalysisRunner
 from openreview.review.token_budget import estimate_tokens, split_parsed_diff
 from openreview.review.triage import (
@@ -60,9 +61,11 @@ logger = logging.getLogger(__name__)
 class ReviewPipeline:
     """有界工作流编排：每个节点只做一件事，条件边由代码显式声明。
 
-    这里刻意不引入“自主 Agent”：PR Review 的步骤是稳定的，真正需要动态
-    决策的只有 triage、证据增强、verifier 回炉和失败兜底。用 BoundedWorkflow
-    把这些决策显式化，既能控制成本，也方便做消融和回放。
+    默认使用 single-pass reviewer（每个 batch 一次 LLM 调用），
+    ``reviewer_mode="multi_aspect"`` 可切回四维度并行，作为高召回模式和评测
+    消融。这里刻意不引入“自主 Agent”：PR Review 的步骤是稳定的，真正需要
+    动态决策的只有 triage、证据增强、verifier 回炉和失败兜底。用
+    BoundedWorkflow 把这些决策显式化，既能控制成本，也方便做消融和回放。
     """
 
     def __init__(
@@ -75,6 +78,7 @@ class ReviewPipeline:
         max_batch_tokens: int = 60000,
         max_patch_tokens: int = 48000,
         max_context_tokens: int = 16000,
+        reviewer_mode: str = "single",
         max_workers: int = 4,
         aspect_timeout: float = 90.0,
         llm_timeout: float = 60.0,
@@ -110,6 +114,14 @@ class ReviewPipeline:
         else:
             self.retriever = TreeSitterLocalRetriever()
         self.max_batch_tokens = max_batch_tokens
+
+        normalized_mode = reviewer_mode.strip().lower().replace("-", "_")
+        if normalized_mode not in {"single", "multi_aspect"}:
+            raise ValueError(
+                "reviewer_mode must be 'single' or 'multi_aspect', "
+                f"got {reviewer_mode!r}"
+            )
+        self.reviewer_mode = normalized_mode
 
         self.triage_enabled = triage_enabled
         self.impact_enabled = impact_enabled
@@ -149,17 +161,31 @@ class ReviewPipeline:
             )
         self.llm_client = client
 
-        self.reviewer = ReviewOrchestrator(
-            prompt_builder=PromptBuilder(
-                max_patch_tokens=max_patch_tokens,
-                max_context_tokens=max_context_tokens,
-            ),
-            llm_client=self.llm_client,
-            output_parser=OutputParser(),
-            validator=FindingValidator(),
-            max_workers=max_workers,
-            aspect_timeout=aspect_timeout,
+        prompt_builder = PromptBuilder(
+            max_patch_tokens=max_patch_tokens,
+            max_context_tokens=max_context_tokens,
         )
+        output_parser = OutputParser()
+        validator = FindingValidator()
+        self.reviewer: ReviewOrchestrator
+        if self.reviewer_mode == "single":
+            self.reviewer = SingleShotReviewer(
+                prompt_builder=prompt_builder,
+                llm_client=self.llm_client,
+                output_parser=output_parser,
+                validator=validator,
+                max_workers=max_workers,
+                aspect_timeout=aspect_timeout,
+            )
+        else:
+            self.reviewer = ReviewOrchestrator(
+                prompt_builder=prompt_builder,
+                llm_client=self.llm_client,
+                output_parser=output_parser,
+                validator=validator,
+                max_workers=max_workers,
+                aspect_timeout=aspect_timeout,
+            )
         self.verifier = (
             FindingVerifier(
                 self.llm_client,
@@ -490,7 +516,7 @@ class ReviewPipeline:
         else:
             default_aspects = list(getattr(self.reviewer, "aspects", ALL_ASPECTS))
             decision = TriageDecision(
-                default_aspects, False, "triage 已关闭，运行完整维度"
+                default_aspects, False, "triage 已关闭，覆盖完整审查范围"
             )
 
         state.selected_aspects = list(decision.aspects)
@@ -554,10 +580,14 @@ class ReviewPipeline:
                     estimate_tokens(context.snippet) for context in contexts
                 ) + sum(estimate_tokens(file.patch or "") for file in batch.files)
                 aspects = state.selected_aspects or list(ALL_ASPECTS)
+                calls_per_batch = self._reviewer_call_count(aspects)
                 # 先用“剩余调用数”收窄维度，再检查 token / 时间预算。
-                # 这样小预算至少能产出部分维度，而不是整单失败。
+                # 多维度模式可以只跑部分维度；单遍模式无法拆分，只能整批跳过。
                 remaining_calls = state.budget.remaining_calls()
-                if remaining_calls is not None and remaining_calls < len(aspects):
+                if (
+                    remaining_calls is not None
+                    and remaining_calls < calls_per_batch
+                ):
                     if remaining_calls <= 0:
                         state.add_note(
                             "[budget] LLM 调用预算已用尽，"
@@ -569,8 +599,20 @@ class ReviewPipeline:
                             len(batches),
                         )
                         break
+                    if not self._can_narrow_aspects():
+                        state.add_note(
+                            "[budget] 剩余调用数不足，单遍审查无法拆分维度，"
+                            f"批次 {index}/{len(batches)} 起未执行审查。"
+                        )
+                        logger.warning(
+                            "LLM call budget too small for single-pass batch %d/%d",
+                            index,
+                            len(batches),
+                        )
+                        break
                     aspects = aspects[:remaining_calls]
                     state.selected_aspects = list(aspects)
+                    calls_per_batch = self._reviewer_call_count(aspects)
                     state.add_note(
                         f"[budget] 剩余调用数不足，仅运行 {len(aspects)} 个维度："
                         + ", ".join(aspects)
@@ -578,9 +620,9 @@ class ReviewPipeline:
 
                 # 先按调用数 + 保守 token 下界做快速检查；真正的 token
                 # 扣减由 BudgetedLLMClient 在每次调用前精确执行。
-                preflight_tokens = estimated_tokens * max(1, len(aspects)) + 2000
+                preflight_tokens = estimated_tokens * max(1, calls_per_batch) + 2000
                 if not state.budget.allow(
-                    calls=len(aspects), tokens=preflight_tokens
+                    calls=calls_per_batch, tokens=preflight_tokens
                 ):
                     state.add_note(
                         "[budget] LLM 调用或 token 预算不足，"
@@ -612,7 +654,7 @@ class ReviewPipeline:
                     and not reviewer_has_budget
                 ):
                     state.budget.consume(
-                        calls=len(aspects), tokens=estimated_tokens
+                        calls=calls_per_batch, tokens=estimated_tokens
                     )
                 batch_results.append(result)
 
@@ -798,6 +840,23 @@ class ReviewPipeline:
     # ------------------------------------------------------------------
     # 工具方法
     # ------------------------------------------------------------------
+    def _reviewer_call_count(self, aspects: Sequence[str]) -> int:
+        """每个 batch 预计消耗的 LLM 调用数。
+
+        single-pass reviewer 显式声明 ``calls_per_review=1``；多维度模式和
+        测试里的自定义 reviewer 没有这个属性，按 aspect 数量计算。
+        """
+        explicit = getattr(self.reviewer, "calls_per_review", None)
+        if explicit is not None:
+            return max(1, int(explicit))
+        return max(1, len(aspects))
+
+    def _can_narrow_aspects(self) -> bool:
+        """预算不足时是否可以只跑部分 aspect。"""
+        return bool(
+            getattr(self.reviewer, "supports_aspect_narrowing", True)
+        )
+
     def _cache_key(self, state: ReviewState) -> str:
         if state.pr_info is None:
             return ""
@@ -810,6 +869,7 @@ class ReviewPipeline:
             str(getattr(self.llm_client, "seed", "")),
             PROMPT_VERSION,
             RETRIEVER_VERSION,
+            f"reviewer={self.reviewer_mode}",
             f"triage={int(self.triage_enabled)}",
             f"impact={int(self.impact_enabled)}",
             f"static={int(self.static_analysis_enabled)}",
@@ -911,6 +971,7 @@ class ReviewPipeline:
                 "stats": dict(state.retrieval_stats),
             },
             "batches": len(state.batches),
+            "reviewer_mode": self.reviewer_mode,
             "aspects": len(state.selected_aspects),
             "llm_calls": state.budget.used_llm_calls,
             "estimated_patch_tokens": patch_tokens,

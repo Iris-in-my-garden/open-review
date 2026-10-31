@@ -5,7 +5,7 @@
 
 1. 注入的 bug 有没有被检出（bug recall）；
 2. clean / no-op 控制组会不会被强行找茬（clean false positive）；
-3. 检出同样数量的 bug 时，full pipeline 是否比 single-shot baseline 更贵。
+3. 检出同样数量的 bug 时，full pipeline 是否比简化 baseline 更贵。
 
 它不替代真实数据，只作为 CI 里的低成本回归和面试时可复现的 demo。
 """
@@ -598,13 +598,13 @@ def estimate_synthetic_run(
         calls = count
         prompt_tokens = sum(per_case_prompt)
         completion_tokens = count * 600
-        assumption = "1 次全量 review / case"
+        assumption = "1 次 single-pass review / case（无 triage/impact/verifier）"
     else:
-        calls = count * 5
-        # 4 个 aspect 各发送一次 patch/context；verifier 只发送候选问题。
-        prompt_tokens = sum(per_case_prompt) * 4 + count * 800
-        completion_tokens = count * 1600
-        assumption = "4 个 aspect + 1 次 verifier（上界）/ case"
+        calls = count * 2
+        # 单遍 review 发送一次 patch/context；verifier 只发送候选问题。
+        prompt_tokens = sum(per_case_prompt) + count * 800
+        completion_tokens = count * 1200
+        assumption = "1 次 single-pass review + 1 次 verifier（上界）/ case"
 
     return {
         "mode": mode,

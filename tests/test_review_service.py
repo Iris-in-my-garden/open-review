@@ -2,7 +2,9 @@ from pathlib import Path
 
 from openreview.github.client import ChangedFile, PullRequestInfo
 from openreview.retriever.code_context import CodeContext
+from openreview.review.aspect_reviewer import ReviewOrchestrator
 from openreview.review.report_writer import PotentialIssue, ReviewResult
+from openreview.review.single_shot import SingleShotReviewer
 from openreview.services.review_service import ReviewPipeline
 
 
@@ -382,3 +384,76 @@ def test_pipeline_does_not_charge_budget_for_client_side_cache_hits(tmp_path: Pa
     assert pipeline.last_state.budget.used_llm_calls == 0
 
     pipeline.close()
+
+
+def test_pipeline_defaults_to_single_shot_one_call_per_batch(tmp_path: Path):
+    pipeline = ReviewPipeline(
+        mock_llm=True,
+        max_batch_tokens=1,
+        verifier_enabled=False,
+    )
+    pipeline.gh_client = FakeGitHubClient()
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+
+    try:
+        pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+
+        assert isinstance(pipeline.reviewer, SingleShotReviewer)
+        assert pipeline.last_result is not None
+        metrics = pipeline.last_result.metrics
+        assert metrics["reviewer_mode"] == "single"
+        # 两个文件各成一批，single-pass 每批 1 次调用。
+        assert metrics["batches"] == 2
+        assert metrics["llm_calls"] == 2
+    finally:
+        pipeline.close()
+
+
+def test_pipeline_multi_aspect_mode_keeps_four_calls_per_batch(tmp_path: Path):
+    pipeline = ReviewPipeline(
+        mock_llm=True,
+        max_batch_tokens=1,
+        reviewer_mode="multi_aspect",
+        verifier_enabled=False,
+    )
+    pipeline.gh_client = FakeGitHubClient()
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+
+    try:
+        pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+
+        assert isinstance(pipeline.reviewer, ReviewOrchestrator)
+        assert not isinstance(pipeline.reviewer, SingleShotReviewer)
+        assert pipeline.last_result is not None
+        metrics = pipeline.last_result.metrics
+        assert metrics["reviewer_mode"] == "multi_aspect"
+        assert metrics["batches"] == 2
+        assert metrics["llm_calls"] == 8
+    finally:
+        pipeline.close()
+
+
+def test_single_shot_budget_does_not_partially_run_aspects(tmp_path: Path):
+    pipeline = ReviewPipeline(
+        mock_llm=True,
+        max_batch_tokens=1,
+        budget_calls=1,
+        verifier_enabled=False,
+    )
+    pipeline.gh_client = FakeGitHubClient()
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+
+    try:
+        pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+
+        assert pipeline.last_result is not None
+        assert pipeline.last_state is not None
+        assert pipeline.last_result.metrics["llm_calls"] == 1
+        assert any(
+            "LLM 调用预算已用尽" in note for note in pipeline.last_state.notes
+        )
+    finally:
+        pipeline.close()

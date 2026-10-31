@@ -1,15 +1,16 @@
 # OpenReview
 
-一个面向 GitHub Pull Request 的 AI Code Review 工具：拉取 PR → 解析 Diff → 混合上下文检索 → 多维度并行审查 → 结果校验 → 生成 Markdown 报告。
+一个面向 GitHub Pull Request 的 AI Code Review 工具：拉取 PR → 解析 Diff → 混合上下文检索 → 单遍结构化审查 → 结果校验 → 生成 Markdown 报告。
 
 > 项目定位是**有界、可验证、可观测的代码审查流水线**，而不是自主 Agent：尽量把结论约束在真实 Diff 与代码证据上，并控制调用成本。
 
 ## 功能
 
 - 输入一个 PR URL，生成结构化 Review 报告；可选把问题作为 GitHub 行内评论发回 PR
-- 有界工作流：URL 解析 → PR 元数据 → review 缓存 → 仓库准备 → Diff 解析 → 规则 triage → 影响分析/静态分析/上下文检索 → 多维度审查 → 语义 verifier → 报告 → 可选行内评论。所有条件边由代码显式声明，不引入“自主 Agent”循环
-- 多维度并行审查：`clean_code` / `bugs` / `performance` / `security`
-- **规则 triage（0 LLM 调用）**：文档/配置-only PR 直接跳过模型；纯测试变更只跑 `clean_code` + `bugs`
+- 有界工作流：URL 解析 → PR 元数据 → review 缓存 → 仓库准备 → Diff 解析 → 规则 triage → 影响分析/静态分析/上下文检索 → 单遍审查 → 语义 verifier → 报告 → 可选行内评论。所有条件边由代码显式声明，不引入“自主 Agent”循环
+- **默认单遍审查（single-pass per batch）**：每个 batch 一次结构化 LLM 调用，覆盖 `clean_code` / `bugs` / `performance` / `security` 四类风险；大 PR 仍按 token 预算分批
+- **可选多维度并行审查**：`--reviewer-mode multi_aspect` 可切回四维度并行，作为高召回模式和消融配置，不作为默认成本
+- **规则 triage（0 LLM 调用）**：文档/配置-only PR 直接跳过模型；纯测试变更收窄审查重点
 - **混合上下文检索**（默认启用）：tree-sitter AST 提供结构化主路径，SQLite FTS5 符号索引与 import 关系补充跨文件候选：
   - 只要改动了函数体，就能自动定位并抽取所属函数/类
   - 符号索引支持精确匹配与 BM25 召回，import 关系补充模块使用方及依赖
@@ -28,12 +29,12 @@
   - 校验阶段核对行号是否在 diff 内、evidence 是否能在真实代码中找到
 - **Token 预算与分批**：按 patch token 估算自动拆分大 PR，单文件超预算时在 Prompt 层截断
 - **Pydantic 结构化输出**，避免解析自由文本
-- **跨维度去重 + 后置校验**：过滤低置信度、过滤 Diff 中不存在的文件，并基于过滤后的结果重新计算风险等级与合并建议
+- **跨来源去重 + 后置校验**：过滤低置信度、过滤 Diff 中不存在的文件，并基于过滤后的结果重新计算风险等级与合并建议
 - **Prompt Injection 防护**：不可信内容统一包裹 + 标签转义 + 输出证据校验 + 命中规则提示
 - **GitHub API 重试/限流处理**，单维度失败不影响整体，失败信息写入报告
 - **仓库缓存并发安全**：仓库级 `FileLock` + blobless partial clone + 平台缓存目录 + 按 mtime 淘汰
 - **本地仓库模式**：输入 `repo_path + base_sha + head_sha` 即可离线 review，不依赖 GitHub API；用 detached worktree 隔离 head/base，结束后自动清理（评测/回放用）
-- **生产审查路径明确**：默认使用混合检索与四维度并行审查；AST-only 是检索消融开关，single-shot 是评测对照基线，不作为另一条生产路径
+- **生产审查路径明确**：默认使用混合检索与单遍审查；AST-only 是检索消融开关，`multi_aspect` 是高召回/消融配置，不作为默认路径
 - **可观测性**：`logging` + 阶段耗时 / 批次 / LLM 调用次数 / 真实 token 用量 / 预算与缓存命中，统一写入报告 `Run Metrics`
 - **严重级别收口**：`critical|high|medium|low` 使用 `Literal` 校验，兼容 `HIGH`、`严重` 等别名后再归一化
 - **工程化**：ruff + mypy + pre-commit + GitHub Actions
@@ -66,7 +67,7 @@ GitHub PR URL
 └────────┬────────┘
          ▼
 ┌─────────────────┐
-│     Triage      │  规则过滤：docs-only 跳过；test-only 收窄维度
+│     Triage      │  规则过滤：docs-only 跳过；test-only 收窄审查重点
 └────────┬────────┘
          ▼
 ┌──────────────────────────────┐
@@ -77,10 +78,11 @@ GitHub PR URL
 └────────┬─────────────────────┘
          ▼
 ┌──────────────────────────────┐
-│ ReviewOrchestrator           │
-│  ThreadPool: 4 个维度并行     │
+│ SingleShotReviewer (默认)     │
+│  每个 batch 1 次结构化调用    │
 │  timeout / retry / 失败可见   │
 │  Structured Output (Pydantic)│
+│  可选 multi_aspect 高召回模式 │
 └────────┬─────────────────────┘
          ▼
 ┌─────────────────┐
@@ -140,9 +142,13 @@ openreview review https://github.com/owner/repo/pull/123 \
 # 把问题作为 GitHub 行内评论发回 PR（默认 event=COMMENT，不会自动 approve）
 openreview review https://github.com/owner/repo/pull/123 --post-comment
 
-# 大 PR：调小单批 token 预算 / 限制并发维度
+# 大 PR：调小单批 token 预算
 openreview review https://github.com/owner/repo/pull/123 \
-  --max-batch-tokens 40000 \
+  --max-batch-tokens 40000
+
+# 高召回模式：切回四维度并行（默认 single，成本更高）
+openreview review https://github.com/owner/repo/pull/123 \
+  --reviewer-mode multi_aspect \
   --max-workers 2
 
 # 成本控制：禁用 triage / 关闭 verifier / 设置硬预算
@@ -224,7 +230,8 @@ src/openreview/
 │   ├── triage.py              # 规则 triage（docs-only / test-only）
 │   ├── impact.py              # 跨文件符号引用分析
 │   ├── static_analysis.py     # ruff/mypy 证据源（默认关闭）
-│   ├── aspect_reviewer.py     # 多维度并行编排、超时/重试/失败上报
+│   ├── single_shot.py         # 默认单遍审查（每个 batch 1 次调用）
+│   ├── aspect_reviewer.py     # 可选多维度并行编排、超时/重试/失败上报
 │   ├── output_parser.py       # 结构化 Schema、严重级别校验与聚合
 │   ├── finding_validator.py   # 行号 / evidence 校验与结论重算
 │   ├── verifier.py            # critical/high 语义复核
@@ -245,6 +252,9 @@ tree-sitter AST 是结构化主路径，能定位变更行所属的函数/类；
 
 **为什么 triage 只用规则、不用模型？**
 triage 的目标是省钱，不是做判断。用一次 LLM 调用决定“要不要调用 LLM”在成本上不成立；docs-only / test-only 这类信号用文件后缀和 diff 元数据就能确定性判断，也更容易测试。
+
+**为什么默认单遍审查，而不是四维度并行？**
+四个维度共享同一份检索上下文、同一个模型和同一套输出结构，差异主要来自 persona prompt；在没有证据表明它能带来成比例收益之前，默认四倍调用不划算。单遍审查把四类风险放进同一份 checklist，大 PR 仍按 batch 拆分；`multi_aspect` 保留为高召回模式和消融配置，等评测证明收益后再决定是否默认启用。
 
 **validator 已经校验了行号和 evidence，为什么还要 verifier？**
 validator 做的是确定性校验：文件是否存在、行号是否在 diff 内、evidence 能否定位。它拦不住“证据真实但结论过度解读”的问题。verifier 只处理 `critical` / `high`，最多回炉一次，并且所有调用都受 `ReviewBudget` 约束，避免二次校验变成成本黑洞。
@@ -308,9 +318,9 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 - [x] RepoManager：FileLock、blobless clone、平台缓存目录、LRU 式缓存淘汰
 - [x] GitHub API 429/5xx/限流重试，CLI `finally` 关闭 HTTP 连接
 - [x] 默认混合检索：tree-sitter AST 主路径 + SQLite FTS5 符号索引 + import 关系；支持 AST-only 检索消融
-- [x] 生产路径采用四维度并行 Review；single-shot 保留为评测对照基线
+- [x] 默认采用单遍 Review（每个 batch 1 次调用）；multi-aspect 保留为高召回/消融配置
 - [x] 有界工作流（`workflow.py`）：条件节点、`ReviewBudget`、trace
-- [x] 规则 triage：docs-only 跳过、test-only 收窄维度
+- [x] 规则 triage：docs-only 跳过、test-only 收窄审查重点
 - [x] 跨文件影响分析（`impact.py`）
 - [x] 可选静态分析证据源（`static_analysis.py`，默认关闭）
 - [x] 语义 verifier：critical/high 二次复核（`verifier.py`）
@@ -331,5 +341,6 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 - patch/context 的 token 数仍是保守估算（1 token ≈ 3 字符），用于预算与截断；真实用量单独记录
 - 行内评论只能落在 diff 可见行；不在 diff 内的问题会退化为文件级描述
 - 单文件极大时会在 Prompt 层截断，可能漏掉文件后半部分的问题
+- 单遍审查的 findings 受单次输出 token 限制；大 PR 会按 batch 拆分，但单个 batch 仍可能截断
 - 静态分析默认关闭，且只覆盖 Python；开启时会在本地执行 ruff/mypy
 - `--mock_llm` 仅验证流程与报告格式，不代表审查质量；仓库中的示例报告也是 mock 演示输出，不应作为真实漏洞发现或评测结果

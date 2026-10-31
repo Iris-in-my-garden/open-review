@@ -1,7 +1,9 @@
 """规则驱动的 review triage。
 
-图工作流的第一个条件边：不是所有 PR 都值得跑完整的多维度 LLM 审查。
+图工作流的第一个条件边：不是所有 PR 都值得跑完整的 LLM 审查。
 这里只用确定性规则，不调用模型，因此 triage 本身没有成本。
+
+单遍模式下 ``aspects`` 表示“审查重点”，多维度模式下表示实际运行的维度。
 """
 
 from __future__ import annotations
@@ -41,11 +43,11 @@ def triage(parsed_diff: ParsedDiff) -> TriageDecision:
         return TriageDecision(
             list(TEST_ONLY_ASPECTS),
             False,
-            "仅包含测试变更，关闭 performance/security 维度",
+            "仅包含测试变更，收窄审查重点到 clean_code/bugs",
         )
 
     # 常规代码变更：security 始终保留，漏掉安全问题的代价高于一次调用。
-    return TriageDecision(ALL_ASPECTS, False, "常规代码变更，运行多维度审查")
+    return TriageDecision(ALL_ASPECTS, False, "常规代码变更，运行完整审查")
 
 
 def build_skipped_result(
