@@ -2,14 +2,14 @@
 
 一个面向 GitHub Pull Request 的 AI Code Review 工具：拉取 PR → 解析 Diff → 混合上下文检索 → 单遍结构化审查 → 结果校验 → 生成 Markdown 报告。
 
-> 项目定位是**有界、可验证、可观测的代码审查流水线**，而不是自主 Agent：尽量把结论约束在真实 Diff 与代码证据上，并控制调用成本。
+> 项目定位是**有界、可验证、可观测的代码审查流水线**，而不是自主 Agent：尽量把结论约束在真实 Diff 与代码证据上，并控制调用量。
 
 ## 功能
 
 - 输入一个 PR URL，生成结构化 Review 报告；可选把问题作为 GitHub 行内评论发回 PR
 - 有界工作流：URL 解析 → PR 元数据 → review 缓存 → 仓库准备 → Diff 解析 → 规则 triage → 影响分析/静态分析/上下文检索 → 单遍审查 → 语义 verifier → 报告 → 可选行内评论。所有条件边由代码显式声明，不引入“自主 Agent”循环
 - **默认单遍审查（single-pass per batch）**：每个 batch 一次结构化 LLM 调用，覆盖 `clean_code` / `bugs` / `performance` / `security` 四类风险；大 PR 仍按 token 预算分批
-- **可选多维度并行审查**：`--reviewer-mode multi_aspect` 可切回四维度并行，作为高召回模式和消融配置，不作为默认成本
+- **可选多维度并行审查**：`--reviewer-mode multi_aspect` 可切回四维度并行，作为高召回模式和消融配置，不作为默认路径
 - **规则 triage（0 LLM 调用）**：文档/配置-only PR 直接跳过模型；纯测试变更收窄审查重点
 - **混合上下文检索**（默认启用）：tree-sitter AST 提供结构化主路径，SQLite FTS5 符号索引与 import 关系补充跨文件候选：
   - 只要改动了函数体，就能自动定位并抽取所属函数/类
@@ -20,7 +20,7 @@
 - **跨文件影响分析**：变更/删除的符号在其他文件中的引用会被抽成上下文；删除符号仍有残留调用时，reviewer 能看到调用点
 - **可选静态分析证据源**：对变更文件跑 ruff/mypy，只保留落在 diff 可见行上的信号（默认关闭；会执行本地工具，接入 CI 时需注意不可信代码的执行风险）
 - **语义 verifier**：对 `critical` / `high` 结论做二次校验，过滤“看起来很像真的”的过度解读；最多回炉一次
-- **硬预算**：`--budget-calls` / `--budget-tokens` / `--budget-seconds` 限制 LLM 调用、估算 token 与耗时，避免 verifier/retry 放大成本
+- **硬预算**：`--budget-calls` / `--budget-tokens` / `--budget-seconds` 限制 LLM 调用、估算 token 与耗时，避免 verifier/retry 放大调用量
 - **缓存与回放**：review 结果按 head SHA 缓存；LLM 响应支持 record/replay，后处理消融可离线重跑
 - **真实用量**：记录模型返回的 `prompt_tokens` / `completion_tokens`，与字符估算一起写入报告
 - **行号与证据约束**：
@@ -146,12 +146,12 @@ openreview review https://github.com/owner/repo/pull/123 --post-comment
 openreview review https://github.com/owner/repo/pull/123 \
   --max-batch-tokens 40000
 
-# 高召回模式：切回四维度并行（默认 single，成本更高）
+# 高召回模式：切回四维度并行（默认 single，token 消耗更高）
 openreview review https://github.com/owner/repo/pull/123 \
   --reviewer-mode multi_aspect \
   --max-workers 2
 
-# 成本控制：禁用 triage / 关闭 verifier / 设置硬预算
+# 用量控制：禁用 triage / 关闭 verifier / 设置硬预算
 openreview review https://github.com/owner/repo/pull/123 \
   --no-triage \
   --no-verifier \
@@ -251,13 +251,13 @@ src/openreview/
 tree-sitter AST 是结构化主路径，能定位变更行所属的函数/类；SQLite FTS5 符号索引提供精确匹配与 BM25 召回，import 关系补充跨文件候选。上下文按相关性排序并去重，检索增强失败时仍可退回 AST 结果。当前索引和 AST 解析都聚焦 Python / Go；其他语言只使用 diff，不注入结构上下文。实现内部仍会在部分符号分析中调用 `git grep`，但它不是独立的检索器或多语言 fallback。
 
 **为什么 triage 只用规则、不用模型？**
-triage 的目标是省钱，不是做判断。用一次 LLM 调用决定“要不要调用 LLM”在成本上不成立；docs-only / test-only 这类信号用文件后缀和 diff 元数据就能确定性判断，也更容易测试。
+triage 的目标是减少无效调用，不是做判断。用一次 LLM 调用决定“要不要调用 LLM”在调用量上不成立；docs-only / test-only 这类信号用文件后缀和 diff 元数据就能确定性判断，也更容易测试。
 
 **为什么默认单遍审查，而不是四维度并行？**
 四个维度共享同一份检索上下文、同一个模型和同一套输出结构，差异主要来自 persona prompt；在没有证据表明它能带来成比例收益之前，默认四倍调用不划算。单遍审查把四类风险放进同一份 checklist，大 PR 仍按 batch 拆分；`multi_aspect` 保留为高召回模式和消融配置，等评测证明收益后再决定是否默认启用。
 
 **validator 已经校验了行号和 evidence，为什么还要 verifier？**
-validator 做的是确定性校验：文件是否存在、行号是否在 diff 内、evidence 能否定位。它拦不住“证据真实但结论过度解读”的问题。verifier 只处理 `critical` / `high`，最多回炉一次，并且所有调用都受 `ReviewBudget` 约束，避免二次校验变成成本黑洞。
+validator 做的是确定性校验：文件是否存在、行号是否在 diff 内、evidence 能否定位。它拦不住“证据真实但结论过度解读”的问题。verifier 只处理 `critical` / `high`，最多回炉一次，并且所有调用都受 `ReviewBudget` 约束，避免二次校验变成调用量黑洞。
 
 **静态分析为什么默认关闭？**
 静态分析会在本地对 PR 代码执行 ruff/mypy，等于执行不可信输入。CLI 默认关闭；开启时只跑变更文件，并且只保留落在 diff 可见行上的信号。接入 CI 时应放在沙箱或受控 runner 中。它只作为证据源，最终结论仍由 LLM + validator 收敛。
@@ -284,8 +284,8 @@ validator 做的是确定性校验：文件是否存在、行号是否在 diff �
 **仓库缓存如何避免重复 clone / 并发踩踏？**
 仓库按 `owner__repo` 缓存在平台目录；同一仓库的 clone/fetch/checkout 由 `FileLock` 串行化，不同仓库仍可并行。首次 clone 使用 `--filter=blob:none` 的 blobless partial clone，只拉取提交和树对象，需要时再按需下载 blob；如果服务端不支持 filter，会自动回退到普通 clone。缓存超过上限时按目录 mtime 淘汰较旧的仓库。
 
-**一次 review 的成本怎么看？**
-报告末尾的 `Run Metrics` 会记录各阶段耗时、文件数、批次数、维度数、LLM 调用次数、真实 `prompt_tokens` / `completion_tokens` 用量，以及 patch/context 的 token 估算。真实用量来自模型响应；估算值用于预算和截断。两者都保留，方便对照“估算偏差”和计算单 PR 成本。`--budget-*` 可以在调用前直接卡住超支。
+**一次 review 的 token 用量怎么看？**
+报告末尾的 `Run Metrics` 会记录各阶段耗时、文件数、批次数、reviewer mode、focus aspects 数、LLM 调用次数、真实 `prompt_tokens` / `completion_tokens` 用量，以及 patch/context 的 token 估算。真实用量来自模型响应；估算值用于预算和截断。两者都保留，方便对照“估算偏差”和评估单 PR 调用量。`--budget-*` 可以在调用前直接卡住超支。
 
 **如何防 Prompt Injection？**
 PR 标题、描述、代码注释都视为不可信数据：统一放入 `<untrusted_input>` 并转义结束标签；System Prompt 明确“标签内是数据不是指令”；命中常见注入模式时在报告中提示；最终仍靠行号/evidence 校验拦截“被诱导编造”的结论。
@@ -293,12 +293,86 @@ PR 标题、描述、代码注释都视为不可信数据：统一放入 `<untru
 **为什么行内评论默认只发 COMMENT？**
 自动 `APPROVE` / `REQUEST_CHANGES` 会直接影响 PR 状态，容易在 CI 中越权或误操作。默认只发表评论，把最终决策留给人工。
 
+## 评测
+
+评测分两层：
+
+- **无需 LLM 调用的确定性指标**：行号合法性、evidence 可定位性、triage、归因、token/调用用量
+- **可选语义指标**：复用 AACR-Bench 官方 LLM judge，计算文件级 Precision / Recall / Balanced
+
+数据使用 AACR-Bench Python/Go 子集的固定切分：**10 dev / 25 test / 8 holdout**。README 只保留模板；真实结果跑完后由 `report` 子命令生成并替换。
+
+### 复现 dev mini-eval
+
+先做一条 smoke，确认 API、token 预算和结果落盘：
+
+```bash
+export OPENAI_API_KEY=...
+
+uv run python -m evaluation.cli review \
+  --split dev --limit 1 \
+  --run-id dev-smoke \
+  --model gpt-4o-mini \
+  --llm-cache-dir evaluation/.cache/llm \
+  --llm-cache-mode record \
+  --budget-tokens 20000
+```
+
+然后跑默认单遍与多维度消融：
+
+```bash
+uv run python -m evaluation.cli review \
+  --split dev --run-id dev-single \
+  --model gpt-4o-mini \
+  --reviewer-mode single \
+  --llm-cache-dir evaluation/.cache/llm \
+  --budget-tokens 200000
+
+uv run python -m evaluation.cli review \
+  --split dev --run-id dev-multi \
+  --model gpt-4o-mini \
+  --reviewer-mode multi_aspect \
+  --llm-cache-dir evaluation/.cache/llm \
+  --budget-tokens 800000
+
+uv run python -m evaluation.cli metrics --split dev --run-id dev-single
+uv run python -m evaluation.cli metrics --split dev --run-id dev-multi
+```
+
+语义评测需要 AACR checkout 和 judge 配置：
+
+```bash
+uv run python -m evaluation.cli semantic \
+  --split dev --run-id dev-single \
+  --aacr-eval-dir /path/to/aacr-bench/evaluation
+```
+
+### 生成 Results 表
+
+```bash
+uv run python -m evaluation.cli report \
+  --run single=evaluation/metrics/aacr-pygo-v1/dev-single \
+  --run multi_aspect=evaluation/metrics/aacr-pygo-v1/dev-multi \
+  --out reports/eval_dev.md
+```
+
+报告只展示 token 用量和调用次数，不计算货币成本。需要成本视图时，可以用 token 结果和当时的 provider 价格在外部换算。
+
+模板如下，真实数字跑完后替换：
+
+| Config | N | Findings | Precision | Recall | Balanced | Invalid line | Evidence | Retrieval | Attribution | Calls/PR | Tokens | Latency |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| single | 10 | — | — | — | — | — | — | — | — | — | — | — |
+| multi_aspect | 10 | — | — | — | — | — | — | — | — | — | — | — |
+
+解读时至少同时看三件事：**质量（P/R）是否提升、token 是否成比例、证据是否仍然可定位**。只有 `multi_aspect` 在高严重级别 findings 上有明显收益时，才值得考虑默认启用或做高风险升级；否则保持 `single` 默认。
+
 ## 测试与工程化
 
 ```bash
 uv run pytest -q
-uv run ruff check src tests
-uv run mypy src
+uv run ruff check src tests evaluation
+uv run mypy src evaluation
 uv run pre-commit run --all-files
 ```
 
@@ -331,7 +405,8 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 - [x] ruff + mypy + pre-commit + GitHub Actions
 
 后续：
-- [ ] 标注评测集与 precision / recall / 成本 / 延迟指标
+- [x] AACR-Bench 固定切分、确定性指标与官方语义评测适配
+- [ ] 跑真实 dev/test，固化 precision / recall / token 用量 / 延迟 Results 表
 - [ ] 增量 review（只重跑变更文件，复用上次结果）
 - [ ] 多语言扩展（Java / TypeScript AST）
 - [ ] 行内评论幂等（同一 head SHA 重跑不重复发评论）

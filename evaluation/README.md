@@ -10,8 +10,8 @@
 
 评测分两层：
 
-1. **零成本确定性指标**（每次 CI 都能跑）：行号合法性、证据可定位性、triage 跳过、维度归因、validator 统计、成本。
-2. **可选语义指标**（调用 LLM judge，花钱）：复用 AACR-Bench 官方的文件级语义 P/R / balanced score。
+1. **无需 LLM 调用的确定性指标**（每次 CI 都能跑）：行号合法性、证据可定位性、triage 跳过、维度归因、validator 统计、token 用量。
+2. **可选语义指标**（调用 LLM judge，消耗 token）：复用 AACR-Bench 官方的文件级语义 P/R / balanced score。
 
 ---
 
@@ -68,7 +68,7 @@ uv run python -m evaluation.cli prepare --download
 `--no-verify-source` 跳过校验。它只影响校验，不会把数据标记成官方版本；
 manifest 的 `source.sha256` 会记录实际文件哈希。
 
-### 1. Mock review（零成本链路验证）
+### 1. Mock review（不调用真实 LLM）
 
 ```bash
 uv run python -m evaluation.cli review \
@@ -95,7 +95,7 @@ uv run python -m evaluation.cli metrics \
 - `evaluation/metrics/aacr-pygo-v1/dev-mock/deterministic_dev-mock.json`
 - `evaluation/metrics/aacr-pygo-v1/dev-mock/retrieval_dev-mock.json`
 
-`deterministic_*.json` 覆盖行号合法性、证据可定位性、维度归因与成本；
+`deterministic_*.json` 覆盖行号合法性、证据可定位性、维度归因与 token 用量；
 `retrieval_*.json` 是 Phase 1 的检索质量指标，完全不调用 LLM：
 
 - `file_recall` / `index_file_recall`：reference comment 指向的文件是否被上下文覆盖
@@ -107,19 +107,35 @@ uv run python -m evaluation.cli metrics \
 做检索消融时加 `--no-hybrid-retrieval`，关闭 FTS5 符号索引，只保留 tree-sitter
 AST 检索；两次 run 使用不同 `--run-id`，再比较 `retrieval_*.json`。
 
-### 3. 真实模型（按需，产生费用）
+### 3. 真实模型（按需，消耗 token）
 
 ```bash
 export OPENAI_API_KEY=...
+
+# 先看 token 估算，不 clone、不调用 LLM
+uv run python -m evaluation.cli review \
+  --split dev \
+  --estimate-only
+
+# 再跑一条 smoke，确认 API、token 预算和结果落盘
+uv run python -m evaluation.cli review \
+  --split dev \
+  --limit 1 \
+  --run-id dev-gpt4o-mini-smoke \
+  --model gpt-4o-mini \
+  --budget-tokens 20000
+
+# 完整 dev
 uv run python -m evaluation.cli review \
   --split dev \
   --run-id dev-gpt4o-mini \
-  --model gpt-4o-mini
+  --model gpt-4o-mini \
+  --budget-tokens 200000
 ```
 
-建议先只跑 `--split dev --limit 1` 验证 API 与预算，再跑完整 dev。按当前子集规模，
-`gpt-4o-mini` 的 dev 成本大致在 **几美元**；完整 43 个 PR 约 **10–20 美元**，
-实际取决于 diff 大小和重试次数。没有预算时不要直接跑 `--split all`。
+`--budget-tokens` 是批次级 preflight：用 manifest 的变更行数/评论数估算
+input + output token，超过上限就在任何 LLM 调用前退出。实际 diff 大小和重试次数
+仍会影响最终用量；没有设置 token 预算时不要直接跑 `--split all`。
 
 ### 4. 可选：AACR 官方语义评测
 
@@ -145,6 +161,22 @@ AACR OCR 兼容字段（`review.comments[].content`、`review.summary.input_toke
 `reviewer="openreview"` 会走 AACR 的 OCR builder 分支。
 
 如果 AACR 目录不存在，跳过这一步即可；确定性指标仍然可用。
+
+### 5. 汇总多次 run
+
+`report` 子命令会把 `deterministic_*.json`、`retrieval_*.json` 和可选的
+`metrics_openreview_*.json` 合成 Markdown 表格，方便贴到 README / PR / 面试材料：
+
+```bash
+uv run python -m evaluation.cli report \
+  --run single=evaluation/metrics/aacr-pygo-v1/dev-single \
+  --run multi_aspect=evaluation/metrics/aacr-pygo-v1/dev-multi \
+  --out reports/eval_dev.md
+```
+
+- 报告展示 token 总量、调用次数和延迟，不计算货币成本
+- 语义文件默认在 metrics 目录里自动查找最新的 `metrics_openreview_*.json`
+- 也可以显式指定：`--semantic single=/path/to/metrics_openreview_xxx.json`
 
 ---
 
@@ -244,11 +276,12 @@ deduplicated`
 
 多批次 review 会逐批累加，不会只保留最后一批。
 
-### cost
+### cost（token / 调用量，不含价格）
 
 - `llm_calls`、`input_tokens`、`output_tokens`
 - `duration_seconds`
 - 平均值按成功实例数计算
+- `cost` 只是历史字段名，里面不包含货币金额
 
 ---
 
@@ -320,9 +353,10 @@ evaluation/
   aacr.py            # 原始数据校验、Python/Go 过滤、确定性 manifest
   repos.py           # clone / fetch / 按 commit 读文件
   results.py         # run_local + AACR OCR 兼容结果 JSON
-  deterministic.py   # 零成本指标
+  deterministic.py   # 确定性指标
   semantic.py        # 可选：AACR 官方 LLM judge 适配
-  cli.py             # prepare / review / metrics / semantic
+  report.py          # 多次 run -> Markdown Results 表
+  cli.py             # prepare / review / metrics / semantic / report
   manifests/
     aacr_pygo_v1.json
 ```

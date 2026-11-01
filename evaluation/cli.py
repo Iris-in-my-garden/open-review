@@ -8,12 +8,17 @@
     # 2) 在 dev 子集上跑 mock review，验证链路
     python -m evaluation.cli review --split dev --run-id dev-mock --mock-llm
 
-    # 3) 零成本确定性指标
+    # 3) 确定性指标（不调用 LLM）
     python -m evaluation.cli metrics --split dev --run-id dev-mock
 
     # 4) 可选：用 AACR 官方 judge 算语义 P/R（需要 AACR checkout + JUDGE_*）
     python -m evaluation.cli semantic --split dev --run-id dev \
         --aacr-eval-dir /path/to/aacr-bench/evaluation
+
+    # 5) 汇总多次 run 为 Markdown 表格
+    python -m evaluation.cli report \
+        --run single=evaluation/metrics/aacr-pygo-v1/dev-single \
+        --run multi_aspect=evaluation/metrics/aacr-pygo-v1/dev-multi
 """
 
 from __future__ import annotations
@@ -37,7 +42,6 @@ from evaluation.aacr import (
     sha256_file,
     write_manifest,
 )
-from evaluation.cost import CostError, estimate_usd, resolve_prices
 from evaluation.deterministic import (
     compute_deterministic_metrics,
     write_metrics,
@@ -122,12 +126,10 @@ def _restrict_to_actual_run(
 def _estimate_aacr_review(
     instances: list[dict],
     *,
-    input_price: float,
-    output_price: float,
     verifier: bool = True,
     reviewer_mode: str = "single",
 ) -> dict:
-    """AACR review 的保守 preflight。
+    """AACR review 的保守 token preflight。
 
     不 clone 仓库，只看 manifest 里的 change_line_count / reference_comments。
     真实 prompt 还受上下文检索和 token 预算影响，因此这里明确标注为估算。
@@ -152,9 +154,7 @@ def _estimate_aacr_review(
         "llm_calls": calls,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
-        "estimated_usd": estimate_usd(
-            prompt_tokens, completion_tokens, input_price, output_price
-        ),
+        "total_tokens": prompt_tokens + completion_tokens,
         "assumption": (
             f"{mode_label} + verifier; ~12 tokens/change line + base context"
         ),
@@ -191,34 +191,25 @@ def cmd_review(args: argparse.Namespace) -> int:
         DEFAULT_RESULTS_ROOT, manifest["version"], run_id
     )
 
-    estimate = None
-    if args.estimate_only or args.budget_usd is not None:
-        input_price, output_price = resolve_prices(
-            args.model,
-            input_price=args.input_price,
-            output_price=args.output_price,
-            mock_llm=args.mock_llm,
-        )
+    if args.estimate_only or args.budget_tokens is not None:
         estimate = _estimate_aacr_review(
             instances,
-            input_price=input_price,
-            output_price=output_price,
             verifier=not args.no_verifier,
             reviewer_mode=args.reviewer_mode,
         )
         print(
             "[estimate] instances={instances} calls={llm_calls} "
             "prompt_tokens={prompt_tokens} completion_tokens={completion_tokens} "
-            "estimated_usd={estimated_usd}".format(**estimate)
+            "total_tokens={total_tokens}".format(**estimate)
         )
         print(f"[estimate] assumption: {estimate['assumption']}")
         if args.estimate_only:
             return 0
-        if estimate["estimated_usd"] > args.budget_usd:
+        if estimate["total_tokens"] > args.budget_tokens:
             print(
-                "error: estimated cost ${:.4f} exceeds --budget-usd ${:.4f}; "
+                "error: estimated {} tokens exceeds --budget-tokens {}; "
                 "abort before any LLM call.".format(
-                    estimate["estimated_usd"], args.budget_usd
+                    estimate["total_tokens"], args.budget_tokens
                 ),
                 file=sys.stderr,
             )
@@ -304,6 +295,63 @@ def cmd_metrics(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_report(args: argparse.Namespace) -> int:
+    from evaluation.report import (
+        RunSpec,
+        build_row,
+        load_run,
+        parse_run_spec,
+        render_report,
+        write_report,
+    )
+
+    try:
+        specs = [parse_run_spec(raw) for raw in args.run]
+        labels = {spec.label for spec in specs}
+        if len(labels) != len(specs):
+            raise ValueError("--run 的 label 不能重复")
+        semantic_paths = {
+            spec.label: spec.path
+            for spec in (
+                parse_run_spec(raw, option="--semantic")
+                for raw in (args.semantic or [])
+            )
+        }
+        unknown = sorted(set(semantic_paths) - labels)
+        if unknown:
+            raise ValueError(
+                "--semantic 的 label 不在 --run 中: " + ", ".join(unknown)
+            )
+
+        rows = []
+        for spec in specs:
+            spec = RunSpec(
+                label=spec.label,
+                path=spec.path,
+                semantic_path=semantic_paths.get(spec.label),
+            )
+            deterministic, retrieval, semantic = load_run(spec)
+            rows.append(
+                build_row(
+                    spec.label,
+                    deterministic,
+                    retrieval,
+                    semantic,
+                )
+            )
+    except (FileNotFoundError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+    text = render_report(specs, rows, title=args.title)
+    if args.out:
+        path = write_report(text, args.out)
+        print(f"report -> {path}")
+    else:
+        print(text)
+    return 0
+
+
 def cmd_semantic(args: argparse.Namespace) -> int:
     from evaluation.semantic import run_semantic_eval
 
@@ -341,38 +389,26 @@ def cmd_synthetic(args: argparse.Namespace) -> int:
         cases = cases[: args.limit]
     modes = ["full", "baseline"] if args.mode == "both" else [args.mode]
 
-    input_price, output_price = resolve_prices(
-        args.model,
-        input_price=args.input_price,
-        output_price=args.output_price,
-        mock_llm=args.mock_llm,
-    )
     estimates = [
-        estimate_synthetic_run(
-            cases,
-            mode=mode,
-            input_price=input_price,
-            output_price=output_price,
-        )
-        for mode in modes
+        estimate_synthetic_run(cases, mode=mode) for mode in modes
     ]
-    if args.estimate_only or args.budget_usd is not None:
+    if args.estimate_only or args.budget_tokens is not None:
         for estimate in estimates:
             print(
                 "[estimate] mode={mode} cases={cases} calls={llm_calls} "
                 "prompt_tokens={prompt_tokens} "
                 "completion_tokens={completion_tokens} "
-                "estimated_usd={estimated_usd}".format(**estimate)
+                "total_tokens={total_tokens}".format(**estimate)
             )
             print(f"[estimate] assumption: {estimate['assumption']}")
         if args.estimate_only:
             return 0
-        total_estimate = sum(item["estimated_usd"] for item in estimates)
-        if total_estimate > args.budget_usd:
+        total_estimate = sum(item["total_tokens"] for item in estimates)
+        if total_estimate > args.budget_tokens:
             print(
-                "error: estimated cost ${:.4f} exceeds --budget-usd ${:.4f}; "
+                "error: estimated {} tokens exceeds --budget-tokens {}; "
                 "abort before creating repositories or calling LLMs.".format(
-                    total_estimate, args.budget_usd
+                    total_estimate, args.budget_tokens
                 ),
                 file=sys.stderr,
             )
@@ -390,11 +426,9 @@ def cmd_synthetic(args: argparse.Namespace) -> int:
             results_dir=run_root / mode,
             work_dir=work_root,
             mock_llm=args.mock_llm,
-            input_price=input_price,
-            output_price=output_price,
             resume=args.resume,
             keep_worktrees=args.keep_worktrees,
-            budget_usd=args.budget_usd,
+            budget_tokens=args.budget_tokens,
             hybrid_retrieval_enabled=args.hybrid_retrieval,
             verifier_enabled=not args.no_verifier,
             fail_fast=args.fail_fast,
@@ -404,13 +438,14 @@ def cmd_synthetic(args: argparse.Namespace) -> int:
     if len(summaries) > 1:
         print("\nSynthetic comparison")
         for summary in summaries:
-            cost = summary["cost"]
+            usage = summary["cost"]
+            total_tokens = usage["input_tokens"] + usage["output_tokens"]
             print(
                 f"- {summary['mode']}: bug_recall={summary['bug_recall']} "
                 f"precision={summary['finding_precision']} "
                 f"clean_fp={summary['clean_case_false_positive_rate']} "
-                f"llm_calls={cost['llm_calls']} "
-                f"estimated_usd={cost['estimated_usd']}"
+                f"llm_calls={usage['llm_calls']} "
+                f"total_tokens={total_tokens}"
             )
 
     failed = any(
@@ -457,7 +492,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     review = sub.add_parser("review", parents=[common], help="调用 run_local 跑评测")
     review.add_argument("--results-dir", type=Path, default=None)
-    review.add_argument("--mock-llm", action="store_true", help="零成本 mock，仅验证链路")
+    review.add_argument(
+        "--mock-llm", action="store_true", help="mock LLM，仅验证链路"
+    )
     review.add_argument("--model", default=None)
     review.add_argument("--base-url", default=None)
     review.add_argument(
@@ -486,25 +523,13 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument(
         "--estimate-only",
         action="store_true",
-        help="只打印成本估算，不 clone、不调用 LLM",
+        help="只打印 token 估算，不 clone、不调用 LLM",
     )
     review.add_argument(
-        "--budget-usd",
-        type=float,
+        "--budget-tokens",
+        type=int,
         default=None,
-        help="preflight 估算超过该金额则直接退出（USD）",
-    )
-    review.add_argument(
-        "--input-price",
-        type=float,
-        default=None,
-        help="覆盖 input 价格（USD / 1M tokens）",
-    )
-    review.add_argument(
-        "--output-price",
-        type=float,
-        default=None,
-        help="覆盖 output 价格（USD / 1M tokens）",
+        help="preflight 估算的批次总 token 超过该值时退出",
     )
     review.add_argument(
         "--review-cache",
@@ -532,7 +557,7 @@ def build_parser() -> argparse.ArgumentParser:
     review.set_defaults(func=cmd_review)
 
     synthetic = sub.add_parser(
-        "synthetic", help="合成 bug / clean-control benchmark（零成本可先 mock）"
+        "synthetic", help="合成 bug / clean-control benchmark（可先用 mock）"
     )
     synthetic.add_argument(
         "--mode",
@@ -558,23 +583,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="full 模式下关闭 verifier（消融用）",
     )
-    synthetic.add_argument("--model", default=None)
-    synthetic.add_argument("--input-price", type=float, default=None)
-    synthetic.add_argument("--output-price", type=float, default=None)
     synthetic.add_argument(
         "--estimate-only",
         action="store_true",
-        help="只打印 preflight 成本估算，不创建仓库、不调用 LLM",
+        help="只打印 preflight token 估算，不创建仓库、不调用 LLM",
     )
     synthetic.add_argument(
-        "--budget-usd",
-        type=float,
+        "--budget-tokens",
+        type=int,
         default=None,
-        help="preflight 估算超过该金额则退出（USD）",
+        help="preflight 估算或运行累计 token 超过该值时退出",
     )
     synthetic.set_defaults(func=cmd_synthetic)
 
-    metrics = sub.add_parser("metrics", parents=[common], help="零成本确定性指标")
+    metrics = sub.add_parser(
+        "metrics", parents=[common], help="确定性指标（不调用 LLM）"
+    )
     metrics.add_argument("--results-dir", type=Path, default=None)
     metrics.add_argument("--metrics-dir", type=Path, default=None)
     metrics.set_defaults(func=cmd_metrics)
@@ -589,6 +613,26 @@ def build_parser() -> argparse.ArgumentParser:
     semantic.add_argument("--use-deprecated-score", action="store_true")
     semantic.set_defaults(func=cmd_semantic)
 
+    report = sub.add_parser(
+        "report", help="把多次 run 的 metrics 汇总成 Markdown 表格"
+    )
+    report.add_argument(
+        "--run",
+        action="append",
+        required=True,
+        metavar="LABEL=METRICS_DIR",
+        help="一次 run，例如 single=evaluation/metrics/aacr-pygo-v1/dev-single",
+    )
+    report.add_argument(
+        "--semantic",
+        action="append",
+        metavar="LABEL=JSON",
+        help="显式指定 AACR semantic metrics JSON；默认自动查找 metrics 目录",
+    )
+    report.add_argument("--title", default="OpenReview 评测结果")
+    report.add_argument("--out", type=Path, default=None)
+    report.set_defaults(func=cmd_report)
+
     return parser
 
 
@@ -597,7 +641,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
-    except (CostError, ManifestError) as error:
+    except ManifestError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 

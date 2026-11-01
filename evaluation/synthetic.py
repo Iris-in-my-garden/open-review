@@ -1,13 +1,13 @@
-"""合成 bug / clean-control benchmark：零成本先验证评测口径。
+"""合成 bug / clean-control benchmark：不调用真实 LLM 先验证评测口径。
 
-真实 AACR-Bench 很贵，而且 reference comment 稀疏。这个 benchmark 用一组
+真实 AACR-Bench 调用量大，而且 reference comment 稀疏。这个 benchmark 用一组
 可解释的小 PR 回答三个问题：
 
 1. 注入的 bug 有没有被检出（bug recall）；
 2. clean / no-op 控制组会不会被强行找茬（clean false positive）；
-3. 检出同样数量的 bug 时，full pipeline 是否比简化 baseline 更贵。
+3. 检出同样数量的 bug 时，full pipeline 是否比简化 baseline 消耗更多 token。
 
-它不替代真实数据，只作为 CI 里的低成本回归和面试时可复现的 demo。
+它不替代真实数据，只作为 CI 里的轻量回归和面试时可复现的 demo。
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ from textwrap import dedent
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from evaluation.baseline import build_baseline_pipeline
-from evaluation.cost import estimate_usd
 from evaluation.results import issue_comment, safe_id
 from openreview.review.report_writer import PotentialIssue, ReviewResult
 from openreview.review.token_budget import estimate_tokens
@@ -511,8 +510,6 @@ def _aggregate_rows(
     rows: List[Dict[str, Any]],
     *,
     mode: str,
-    input_price: float,
-    output_price: float,
     cases_requested: int,
 ) -> Dict[str, Any]:
     ok_rows = [row for row in rows if row.get("status") == "ok"]
@@ -534,9 +531,6 @@ def _aggregate_rows(
     output_tokens = sum(int(row.get("output_tokens") or 0) for row in ok_rows)
     llm_calls = sum(int(row.get("llm_calls") or 0) for row in ok_rows)
     duration = sum(float(row.get("duration_seconds") or 0) for row in ok_rows)
-    estimated_usd = estimate_usd(
-        input_tokens, output_tokens, input_price, output_price
-    )
 
     def _rate(numerator: int, denominator: int) -> Optional[float]:
         return round(numerator / denominator, 3) if denominator else None
@@ -565,10 +559,8 @@ def _aggregate_rows(
             "llm_calls": llm_calls,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
             "duration_seconds": round(duration, 2),
-            "estimated_usd": estimated_usd,
-            "input_price_per_million": input_price,
-            "output_price_per_million": output_price,
         },
         "per_case": rows,
     }
@@ -578,10 +570,8 @@ def estimate_synthetic_run(
     cases: Sequence[SyntheticCase],
     *,
     mode: str,
-    input_price: float,
-    output_price: float,
 ) -> Dict[str, Any]:
-    """不调用 LLM 的保守 preflight，用于 --estimate-only / --budget-usd。"""
+    """不调用 LLM 的保守 token preflight，用于 --estimate-only / --budget-tokens。"""
     if mode not in {"full", "baseline"}:
         raise ValueError(f"unknown mode: {mode}")
 
@@ -612,9 +602,7 @@ def estimate_synthetic_run(
         "llm_calls": calls,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
-        "estimated_usd": estimate_usd(
-            prompt_tokens, completion_tokens, input_price, output_price
-        ),
+        "total_tokens": prompt_tokens + completion_tokens,
         "assumption": assumption,
     }
 
@@ -636,12 +624,10 @@ def run_synthetic_benchmark(
     results_dir: Path,
     work_dir: Path,
     mock_llm: bool = False,
-    input_price: float = 0.0,
-    output_price: float = 0.0,
     limit: Optional[int] = None,
     resume: bool = False,
     keep_worktrees: bool = False,
-    budget_usd: Optional[float] = None,
+    budget_tokens: Optional[int] = None,
     hybrid_retrieval_enabled: bool = False,
     verifier_enabled: bool = True,
     fail_fast: bool = False,
@@ -671,7 +657,7 @@ def run_synthetic_benchmark(
     rows: List[Dict[str, Any]] = []
     resumed = 0
     stopped_by_budget = False
-    cumulative_usd = 0.0
+    cumulative_tokens = 0
 
     try:
         for index, case in enumerate(selected, start=1):
@@ -742,16 +728,17 @@ def run_synthetic_benchmark(
             row["result_path"] = str(result_path)
             rows.append(row)
 
-            cumulative_usd += estimate_usd(
-                int(row.get("input_tokens") or 0),
-                int(row.get("output_tokens") or 0),
-                input_price,
-                output_price,
+            cumulative_tokens += int(row.get("input_tokens") or 0) + int(
+                row.get("output_tokens") or 0
             )
-            if budget_usd is not None and cumulative_usd > budget_usd:
+            if (
+                budget_tokens is not None
+                and cumulative_tokens > budget_tokens
+            ):
                 print(
-                    f"[budget] estimated ${cumulative_usd:.4f} exceeds "
-                    f"--budget-usd {budget_usd:.4f}; stopping before remaining cases."
+                    f"[budget] estimated {cumulative_tokens} tokens exceeds "
+                    f"--budget-tokens {budget_tokens}; "
+                    "stopping before remaining cases."
                 )
                 stopped_by_budget = True
                 break
@@ -761,8 +748,6 @@ def run_synthetic_benchmark(
     summary = _aggregate_rows(
         rows,
         mode=mode,
-        input_price=input_price,
-        output_price=output_price,
         cases_requested=len(selected),
     )
     summary["resumed"] = resumed
@@ -794,13 +779,13 @@ def print_synthetic_summary(summary: Dict[str, Any]) -> None:
         f"{summary['clean_case_false_positive_rate']} "
         f"({summary['control_cases_with_findings']}/{summary['control_cases']})"
     )
-    cost = summary["cost"]
+    usage = summary["cost"]
     print(
-        f"cost: llm_calls={cost['llm_calls']} "
-        f"input_tokens={cost['input_tokens']} "
-        f"output_tokens={cost['output_tokens']} "
-        f"estimated_usd={cost['estimated_usd']} "
-        f"duration={cost['duration_seconds']}s"
+        f"usage: llm_calls={usage['llm_calls']} "
+        f"input_tokens={usage['input_tokens']} "
+        f"output_tokens={usage['output_tokens']} "
+        f"total_tokens={usage['total_tokens']} "
+        f"duration={usage['duration_seconds']}s"
     )
     print("=" * 60)
 

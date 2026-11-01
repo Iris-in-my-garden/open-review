@@ -44,7 +44,7 @@ def test_budgeted_client_enforces_hard_call_limit_across_retries():
     with pytest.raises(BudgetExceeded):
         client.generate_structured("sys", "user", Output)
 
-    # 第二次调用在进入 provider 前就被拦截，不会产生真实费用。
+    # 第二次调用在进入 provider 前就被拦截，不会产生真实调用。
     assert inner.calls == 1
     assert budget.used_llm_calls == 1
     assert client.temperature == 0.0

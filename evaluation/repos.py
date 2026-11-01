@@ -62,7 +62,7 @@ def _clone(
 ) -> None:
     # 刻意不用 --filter=blob:none：review 内部的 impact / retriever 会跑
     # `git grep`，partial clone 会为缺失的 blob 触发懒加载，轻则变慢，重则
-    # 在无网 CI 上直接挂住。评测仓库是一次性成本，优先保证可预测。
+    # 在无网 CI 上直接挂住。评测仓库是一次性准备，优先保证可预测。
     path.parent.mkdir(parents=True, exist_ok=True)
     run_git(
         None,

@@ -11,7 +11,7 @@ AACR 的 OCR 结果格式是::
     }
 
 我们额外保留 severity / category / confidence / source_aspects / evidence，
-方便做零成本归因分析；AACR 的评测器会忽略不认识的字段。
+方便做确定性归因分析；AACR 的评测器会忽略不认识的字段。
 """
 
 from __future__ import annotations

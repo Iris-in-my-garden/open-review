@@ -1,4 +1,4 @@
-"""零成本确定性指标：不调用裁判模型，CI 每次都能跑。
+"""确定性指标：不调用裁判模型，CI 每次都能跑。
 
 这些指标不替代 AACR 的语义 P/R，而是回答“系统有没有基本工程问题”：
 
@@ -391,8 +391,9 @@ def print_summary(metrics: Dict[str, Any]) -> None:
         f"{metrics['retrieval']['mean_changed_file_coverage']}"
     )
     print(
-        f"cost: llm_calls={metrics['cost']['llm_calls']} "
+        f"usage: llm_calls={metrics['cost']['llm_calls']} "
         f"input_tokens={metrics['cost']['input_tokens']} "
+        f"output_tokens={metrics['cost']['output_tokens']} "
         f"duration={metrics['cost']['duration_seconds']}s"
     )
     print("=" * 60)
