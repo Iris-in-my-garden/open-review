@@ -1,4 +1,8 @@
-"""Phase 1 检索质量指标（完全不调用 LLM）。
+"""检索质量指标（完全不调用 LLM）。
+
+Phase 1 覆盖 file recall / symbol coverage / citation / context 膨胀；
+Phase 2 追加 call graph / import graph 的实际注入上下文数，用于
+AST vs +FTS vs +graph 消融。
 
 这里回答四个面试里最容易被追问的问题：
 
@@ -68,6 +72,7 @@ def compute_retrieval_metrics(
     context_kinds: Dict[str, int] = {}
     retrieval_stats: Dict[str, float] = {}
     symbol_coverages: List[float] = []
+    graph_contexts_total = 0
 
     for instance in instances:
         instance_id = str(instance.get("instance_id") or "")
@@ -139,6 +144,15 @@ def compute_retrieval_metrics(
                 if isinstance(value, (int, float)):
                     retrieval_stats[key] = retrieval_stats.get(key, 0) + float(value)
 
+        # 优先使用 review 阶段统计的“实际注入上下文数”；
+        # 老结果没有该字段时，回退到 context_kinds。
+        graph_contexts = int(metrics.get("graph_contexts") or 0)
+        if not graph_contexts and isinstance(kinds, dict):
+            graph_contexts = sum(
+                int(kinds.get(kind) or 0)
+                for kind in ("caller", "callee", "import", "dependency")
+            )
+
         rows.append(
             {
                 "instance_id": instance_id,
@@ -153,6 +167,7 @@ def compute_retrieval_metrics(
                 "contexts": contexts,
                 "duplicate_contexts": duplicates,
                 "symbol_coverage": symbol_coverage,
+                "graph_contexts": graph_contexts,
                 "patch_checked": len(checkable_patches),
                 "patch_valid": valid_patches,
                 "patch_invalid": invalid_patches,
@@ -170,6 +185,7 @@ def compute_retrieval_metrics(
         patch_checked += len(checkable_patches)
         patch_valid += valid_patches
         patch_invalid += invalid_patches
+        graph_contexts_total += graph_contexts
 
     return {
         "run_id": run_id,
@@ -186,6 +202,13 @@ def compute_retrieval_metrics(
             "duplicate_context_rate": _rate(
                 duplicate_contexts_total, contexts_total
             ),
+            "graph_contexts_total": graph_contexts_total,
+            "graph_contexts_avg": _rate(graph_contexts_total, len(rows)),
+            "graph_context_kinds": {
+                kind: context_kinds[kind]
+                for kind in ("caller", "callee", "import", "dependency")
+                if context_kinds.get(kind)
+            },
             "context_kinds": context_kinds,
             "stats": {
                 key: round(value, 3) for key, value in sorted(retrieval_stats.items())
@@ -232,6 +255,7 @@ def print_retrieval_summary(metrics: Dict[str, Any]) -> None:
     print(
         f"- duplicate contexts: {_fmt(retrieval.get('duplicate_context_rate'))}"
     )
+    print(f"- graph contexts:     {_fmt(retrieval.get('graph_contexts_avg'))}")
     print(
         f"- patch valid:        {_fmt(patch.get('valid_rate'))} "
         f"({patch.get('valid', 0)}/{patch.get('checked', 0)})"

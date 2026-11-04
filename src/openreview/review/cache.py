@@ -17,7 +17,7 @@ from openreview.review.report_writer import ReviewResult
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "review-v4"
+PROMPT_VERSION = "review-v5"
 
 
 def default_review_cache_dir() -> Path:

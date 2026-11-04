@@ -228,6 +228,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         impact_enabled=not args.no_impact,
         verifier_enabled=not args.no_verifier,
         hybrid_retrieval_enabled=not args.no_hybrid_retrieval,
+        graph_retrieval_enabled=not args.no_graph_retrieval,
         budget_calls=args.budget_calls,
         review_cache_enabled=bool(review_cache_dir),
         review_cache_dir=str(review_cache_dir) if review_cache_dir else None,
@@ -512,6 +513,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-hybrid-retrieval",
         action="store_true",
         help="关闭 FTS5 符号索引，仅用 tree-sitter AST 检索（消融用）",
+    )
+    review.add_argument(
+        "--no-graph-retrieval",
+        action="store_true",
+        help="关闭 import/call graph 扩展，用于 +FTS vs +graph 消融",
     )
     review.add_argument("--keep-worktrees", action="store_true")
     review.add_argument("--fail-fast", action="store_true")

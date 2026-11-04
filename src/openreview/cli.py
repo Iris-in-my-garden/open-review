@@ -104,6 +104,16 @@ def review(
         "--verifier/--no-verifier",
         help="Run a second-pass semantic verifier on critical/high findings",
     ),
+    hybrid_retrieval_enabled: bool = typer.Option(
+        True,
+        "--hybrid-retrieval/--no-hybrid-retrieval",
+        help="Enable FTS5 symbol index on top of tree-sitter AST retrieval",
+    ),
+    graph_retrieval_enabled: bool = typer.Option(
+        True,
+        "--graph-retrieval/--no-graph-retrieval",
+        help="Enable import/call graph expansion for changed symbols",
+    ),
     budget_calls: int = typer.Option(
         0,
         "--budget-calls",
@@ -174,6 +184,8 @@ def review(
                 tool.strip() for tool in static_tools.split(",") if tool.strip()
             ),
             verifier_enabled=verifier_enabled,
+            hybrid_retrieval_enabled=hybrid_retrieval_enabled,
+            graph_retrieval_enabled=graph_retrieval_enabled,
             budget_calls=budget_calls,
             budget_tokens=budget_tokens,
             budget_seconds=budget_seconds,

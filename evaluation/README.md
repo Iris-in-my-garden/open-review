@@ -96,16 +96,19 @@ uv run python -m evaluation.cli metrics \
 - `evaluation/metrics/aacr-pygo-v1/dev-mock/retrieval_dev-mock.json`
 
 `deterministic_*.json` 覆盖行号合法性、证据可定位性、维度归因与 token 用量；
-`retrieval_*.json` 是 Phase 1 的检索质量指标，完全不调用 LLM：
+`retrieval_*.json` 是 Phase 1/2 的检索质量指标，完全不调用 LLM：
 
 - `file_recall` / `index_file_recall`：reference comment 指向的文件是否被上下文覆盖
 - `symbol_coverage`：diff 里的 changed symbols 有多少被检索回来
 - `citation_rate`：finding 是否真的引用了注入的 `context_refs`
 - `duplicate_context_rate` / `avg_contexts`：上下文是否重复或膨胀
+- `graph_contexts_avg` / `graph_context_kinds`：每个样本由 import/call graph 实际注入的上下文数及类型
 - `patch_validation`：`suggested_patch` 有多少能通过 `git apply --check`
 
-做检索消融时加 `--no-hybrid-retrieval`，关闭 FTS5 符号索引，只保留 tree-sitter
-AST 检索；两次 run 使用不同 `--run-id`，再比较 `retrieval_*.json`。
+做检索消融时组合以下开关，每次使用不同 `--run-id`，再比较 `retrieval_*.json`：
+
+- `--no-hybrid-retrieval`：只保留 tree-sitter AST 检索
+- `--no-graph-retrieval`：保留 FTS5 符号索引，关闭 import/call graph
 
 ### 3. 真实模型（按需，消耗 token）
 
@@ -169,12 +172,14 @@ AACR OCR 兼容字段（`review.comments[].content`、`review.summary.input_toke
 
 ```bash
 uv run python -m evaluation.cli report \
-  --run single=evaluation/metrics/aacr-pygo-v1/dev-single \
+  --run ast=evaluation/metrics/aacr-pygo-v1/dev-ast \
+  --run fts=evaluation/metrics/aacr-pygo-v1/dev-fts \
+  --run graph=evaluation/metrics/aacr-pygo-v1/dev-graph \
   --run multi_aspect=evaluation/metrics/aacr-pygo-v1/dev-multi \
   --out reports/eval_dev.md
 ```
 
-- 报告展示 token 总量、调用次数和延迟，不计算货币成本
+- 报告展示 P/R、检索覆盖、citation、graph context、调用次数和延迟
 - 语义文件默认在 metrics 目录里自动查找最新的 `metrics_openreview_*.json`
 - 也可以显式指定：`--semantic single=/path/to/metrics_openreview_xxx.json`
 
@@ -303,12 +308,16 @@ deduplicated`
 # 规则 triage on/off
 --no-triage
 
+# 检索消融：AST-only / +FTS / +graph
+--no-hybrid-retrieval
+--no-graph-retrieval
+
 # 模型档位
 --model gpt-4o-mini
 ```
 
-建议保持三个主消融：**reviewer 策略、verifier、impact/tool-loop**，模型档位和
-triage 作为补充。不要一次性展开太多维度，否则 43 个 PR 的样本量撑不住结论。
+建议保持三个主消融：**reviewer 策略、verifier、检索层（AST/FTS/graph）**，
+模型档位和 triage 作为补充。不要一次性展开太多维度，否则 43 个 PR 的样本量撑不住结论。
 
 ### 录制 / 回放，避免重复付费
 
@@ -354,6 +363,7 @@ evaluation/
   repos.py           # clone / fetch / 按 commit 读文件
   results.py         # run_local + AACR OCR 兼容结果 JSON
   deterministic.py   # 确定性指标
+  retrieval.py       # 检索 / graph 指标（零 LLM 调用）
   semantic.py        # 可选：AACR 官方 LLM judge 适配
   report.py          # 多次 run -> Markdown Results 表
   cli.py             # prepare / review / metrics / semantic / report
@@ -370,5 +380,9 @@ evaluation/
 - 当前 `tree_sitter_retriever.py` / `impact.py` 内部仍会调用 `git grep`，所以不要
   宣称“完全不用 grep”；这里的“无独立 grep retriever”指的是没有单独的 grep
   检索器 fallback。
+- call graph 是 best-effort：Python 用 `ast` 抽取，Go 调用边暂不默认启用；它只补充
+  candidate context，不保证完整类型解析。
+- `graph_contexts_avg` 统计的是最终注入的 caller/callee/import/dependency 上下文，
+  不是候选边数量；候选命中数仍保留在 `stats` 里。
 - 评测是串行的。同一 repo 反复建 worktree 时并发收益有限，但更容易把临时目录
   和磁盘打爆；需要提速时优先按 repo 分组并行。

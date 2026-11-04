@@ -45,9 +45,19 @@ def test_compute_retrieval_metrics(tmp_path: Path):
                         "index_context_file_list": ["src/auth.py"],
                         "changed_symbols": 2,
                         "symbol_coverage": 0.5,
-                        "context_kinds": {"enclosing": 1, "import": 1},
-                        "stats": {"index_symbol_hits": 1},
-                    }
+                        "context_kinds": {
+                            "enclosing": 1,
+                            "caller": 1,
+                            "import": 1,
+                        },
+                        "graph_contexts": 2,
+                        "graph_context_kinds": {"caller": 1, "import": 1},
+                        "stats": {
+                            "index_symbol_hits": 1,
+                            "graph_caller_hits": 1,
+                            "graph_callee_hits": 2,
+                        },
+                    },
                 },
             },
         },
@@ -93,7 +103,14 @@ def test_compute_retrieval_metrics(tmp_path: Path):
     assert retrieval["citation_rate"] == 0.5
     assert retrieval["avg_contexts"] == 1.5
     assert retrieval["duplicate_context_rate"] == 0.333
-    assert retrieval["context_kinds"] == {"enclosing": 1, "import": 1}
+    assert retrieval["context_kinds"] == {
+        "enclosing": 1,
+        "caller": 1,
+        "import": 1,
+    }
+    assert retrieval["graph_contexts_total"] == 2
+    assert retrieval["graph_contexts_avg"] == 1.0
+    assert retrieval["graph_context_kinds"] == {"caller": 1, "import": 1}
     assert metrics["patch_validation"]["valid_rate"] == 1.0
 
     path = write_retrieval_metrics(metrics, tmp_path / "metrics", run_id="test")

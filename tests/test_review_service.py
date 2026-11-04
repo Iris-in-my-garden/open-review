@@ -84,7 +84,14 @@ class FakeReviewer:
     def __init__(self):
         self.calls = []
 
-    def review(self, pr_info, parsed_diff, contexts, repo_path=None, aspects=None):
+    def review(
+        self,
+        pr_info,
+        parsed_diff,
+        contexts,
+        repo_path=None,
+        aspects=None,
+    ):
         self.calls.append((parsed_diff, repo_path))
         return ReviewResult(
             owner=pr_info.owner,
@@ -134,10 +141,61 @@ class FakeContextRetriever:
         ]
 
 
+class FakeGraphContextRetriever(FakeContextRetriever):
+    """模拟 call graph / import graph 实际注入的上下文。"""
+
+    def retrieve(self, repo_path, parsed_diff, base_path=None):
+        self.calls += 1
+        filename = parsed_diff.files[0].filename
+        return [
+            CodeContext(
+                file_path=filename,
+                reason="definition",
+                snippet="def x(): ...",
+                score=0.9,
+                kind="definition",
+                symbol="x",
+                start_line=1,
+                end_line=1,
+            ),
+            CodeContext(
+                file_path="src/api.py",
+                reason="caller `handle` calls changed symbol `x`",
+                snippet="def handle():\n    x()",
+                score=0.58,
+                kind="caller",
+                symbol="handle",
+                start_line=1,
+                end_line=2,
+            ),
+            CodeContext(
+                file_path="src/app.py",
+                reason="import of `src.file_0`",
+                snippet="from src.file_0 import x",
+                score=0.6,
+                kind="import",
+                symbol="x",
+                start_line=1,
+                end_line=1,
+            ),
+        ]
+
+
 class FakeContextReviewer(FakeReviewer):
-    def review(self, pr_info, parsed_diff, contexts, repo_path=None, aspects=None):
+    def review(
+        self,
+        pr_info,
+        parsed_diff,
+        contexts,
+        repo_path=None,
+        aspects=None,
+    ):
         result = super().review(
-            pr_info, parsed_diff, contexts, repo_path=repo_path, aspects=aspects
+            pr_info,
+            parsed_diff,
+            contexts,
+            repo_path=repo_path,
+            aspects=aspects,
         )
         result.potential_issues[0].context_refs = [
             context.ensure_context_id() for context in contexts
@@ -318,6 +376,40 @@ def test_pipeline_surfaces_retrieval_metrics_and_context_refs(tmp_path: Path):
     assert all(issue.context_refs for issue in result.potential_issues)
 
     pipeline.close()
+
+
+def test_pipeline_reports_actual_graph_contexts(tmp_path: Path):
+    files = [
+        ChangedFile(
+            filename="src/file_0.py",
+            status="modified",
+            additions=1,
+            deletions=0,
+            changes=1,
+            patch="@@ -0,0 +1,1 @@\n+def x():\n",
+        )
+    ]
+    pipeline = ReviewPipeline(mock_llm=True, max_batch_tokens=1)
+    pipeline.gh_client = FakeGitHubClient(files=files)
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeGraphContextRetriever()
+    pipeline.reviewer = FakeContextReviewer()
+
+    try:
+        pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+
+        retrieval = pipeline.last_result.metrics["retrieval"]
+        assert retrieval["context_kinds"] == {
+            "caller": 1,
+            "definition": 1,
+            "import": 1,
+        }
+        assert retrieval["graph_contexts"] == 2
+        assert retrieval["graph_context_kinds"] == {"caller": 1, "import": 1}
+        assert retrieval["graph_context_files"] == 2
+        assert retrieval["graph_enabled"] is True
+    finally:
+        pipeline.close()
 
 
 def test_pipeline_llm_usage_is_per_run_not_cumulative(tmp_path: Path):

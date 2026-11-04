@@ -86,6 +86,7 @@ class ReviewPipeline:
         temperature: float = 0.0,
         seed: Optional[int] = None,
         hybrid_retrieval_enabled: bool = True,
+        graph_retrieval_enabled: bool = True,
         index_cache_dir: Optional[str] = None,
         triage_enabled: bool = True,
         impact_enabled: bool = True,
@@ -107,9 +108,11 @@ class ReviewPipeline:
         # HybridRetriever 以 tree-sitter AST 为主路径，FTS5 符号索引只做增强；
         # 关闭时行为与旧版 TreeSitterLocalRetriever 完全一致，方便做消融。
         self.hybrid_retrieval_enabled = hybrid_retrieval_enabled
+        self.graph_retrieval_enabled = graph_retrieval_enabled
         if hybrid_retrieval_enabled:
             self.retriever: Retriever = HybridRetriever(
-                index_cache_dir=index_cache_dir
+                index_cache_dir=index_cache_dir,
+                graph_enabled=graph_retrieval_enabled,
             )
         else:
             self.retriever = TreeSitterLocalRetriever()
@@ -875,6 +878,7 @@ class ReviewPipeline:
             f"static={int(self.static_analysis_enabled)}",
             f"verifier={int(self.verifier_enabled)}",
             f"hybrid={int(self.hybrid_retrieval_enabled)}",
+            f"graph={int(self.graph_retrieval_enabled)}",
         )
 
     def _usage_snapshot(self) -> Dict[str, int]:
@@ -925,11 +929,31 @@ class ReviewPipeline:
         }
         # 只有“符号/定义/import/依赖/引用”这类结构化上下文才算索引召回；
         # test/impact/static 不是 FTS 索引的直接产物。
-        index_kinds = {"symbol", "definition", "import", "dependency", "reference"}
+        index_kinds = {
+            "symbol",
+            "definition",
+            "import",
+            "dependency",
+            "caller",
+            "callee",
+            "reference",
+        }
         index_context_files = {
             context.file_path
             for context in state.all_contexts
             if context.kind in index_kinds
+        }
+        graph_kinds = {"caller", "callee", "import", "dependency"}
+        graph_context_kinds = {
+            kind: context_kinds[kind]
+            for kind in sorted(graph_kinds)
+            if context_kinds.get(kind)
+        }
+        graph_contexts = sum(graph_context_kinds.values())
+        graph_context_files = {
+            context.file_path
+            for context in state.all_contexts
+            if context.kind in graph_kinds
         }
         return {
             "stages_seconds": dict(state.stages),
@@ -968,6 +992,11 @@ class ReviewPipeline:
                 "context_file_list": sorted(context_files)[:100],
                 "index_context_file_list": sorted(index_context_files)[:100],
                 "hybrid_enabled": self.hybrid_retrieval_enabled,
+                "graph_enabled": self.graph_retrieval_enabled,
+                "graph_contexts": graph_contexts,
+                "graph_context_kinds": graph_context_kinds,
+                "graph_context_files": len(graph_context_files),
+                "graph_error": int(state.retrieval_stats.get("graph_error", 0)),
                 "stats": dict(state.retrieval_stats),
             },
             "batches": len(state.batches),

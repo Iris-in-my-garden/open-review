@@ -34,7 +34,7 @@ from openreview.retriever import ast_utils
 logger = logging.getLogger(__name__)
 
 INDEX_SCHEMA_VERSION = "1"
-RETRIEVER_VERSION = "hybrid-v1"
+RETRIEVER_VERSION = "hybrid-v2"
 MAX_INDEXED_FILE_SIZE = 500 * 1024
 MAX_INDEXED_FILES = 20000
 EXCLUDED_DIRS = {
@@ -616,6 +616,65 @@ class RepoIndex:
             )
             for row in rows
         ]
+
+    def callees_of(self, callers: Sequence[str], limit: int = 20) -> List[CallEdge]:
+        """返回 ``caller_symbol`` 调用了谁。
+
+        调用图是 best-effort：``caller_symbol`` 来自定义嵌套栈，顶层函数可能
+        是空字符串；命中不到时调用方应回退到同文件调用点，而不是报错。
+        """
+        cleaned = [name for name in callers if name]
+        if not cleaned:
+            return []
+        clauses: List[str] = []
+        params: List[str] = []
+        for name in cleaned:
+            clauses.append("caller_symbol = ?")
+            params.append(name)
+            # 方法调用：diff 里通常只有 ``login``，索引里是 ``AuthService.login``。
+            # 必须转义 LIKE 通配符：Python 符号里的 ``_`` 不是“任意单字符”。
+            clauses.append("caller_symbol LIKE ? ESCAPE '\\'")
+            params.append(f"%.{_escape_like(name)}")
+        rows = self._conn.execute(
+            "SELECT caller_file, caller_symbol, callee_name, line FROM calls "
+            f"WHERE {' OR '.join(clauses)} LIMIT ?",
+            (*params, max(1, limit)),
+        ).fetchall()
+        return [
+            CallEdge(
+                caller_file=row["caller_file"],
+                caller_symbol=row["caller_symbol"],
+                callee_name=row["callee_name"],
+                line=int(row["line"]),
+            )
+            for row in rows
+        ]
+
+    def enclosing_symbol(
+        self, file_path: str, line: int
+    ) -> Optional[IndexedSymbol]:
+        """返回覆盖指定行的最小符号定义，用于把调用点扩展成完整函数。"""
+        if not file_path or line <= 0:
+            return None
+        row = self._conn.execute(
+            """
+            SELECT * FROM symbols
+            WHERE file_path = ? AND start_line <= ? AND end_line >= ?
+            ORDER BY (end_line - start_line) ASC
+            LIMIT 1
+            """,
+            (file_path, line, line),
+        ).fetchone()
+        return _row_to_symbol(row, score=1.0) if row is not None else None
+
+
+def _escape_like(value: str) -> str:
+    """转义 SQL LIKE 的通配符，避免符号名里的 ``_`` / ``%`` 误匹配。"""
+    return (
+        value.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
 
 
 def _row_to_symbol(row: sqlite3.Row, score: float) -> IndexedSymbol:

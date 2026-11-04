@@ -86,7 +86,7 @@ class AspectReviewerWorker:
         self,
         pr_info: PullRequestInfo,
         parsed_diff: ParsedDiff,
-        contexts: List[CodeContext]
+        contexts: List[CodeContext],
     ) -> AspectReviewTaskResult:
         """执行单一维度的代码评审任务"""
         # 1. 根据当前维度构建专属 Prompt 与对应的 Response Schema
@@ -166,7 +166,11 @@ class ReviewOrchestrator:
         )
         future_to_aspect = {
             executor.submit(
-                self._review_aspect_with_retry, worker, pr_info, parsed_diff, contexts
+                self._review_aspect_with_retry,
+                worker,
+                pr_info,
+                parsed_diff,
+                contexts,
             ): worker.aspect
             for worker in workers
         }

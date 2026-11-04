@@ -1,10 +1,10 @@
-"""Hybrid code retrieval：AST 结构 + 符号索引 + import 关系。
+"""Hybrid code retrieval：AST 结构 + 符号索引 + import/call graph。
 
 它是现有 ``TreeSitterLocalRetriever`` 的超集，不替换原有的 AST 主路径：
 
 1. AST enclosing：变更行所属函数/类，权重最高
 2. FTS5 符号索引：精确定义 + BM25 召回
-3. import 关系：谁 import 了变更模块 / 变更文件依赖了谁
+3. import/call graph：谁 import 了变更模块、谁调用了变更符号、变更函数调用了谁
 
 向量检索不在这里默认开启。对 code review 来说，精确符号和结构关系比
 “语义相似”更重要；语义检索更适合历史 review 知识（Phase 3）。
@@ -20,6 +20,7 @@ from openreview.repo.diff_parser import ParsedDiff
 from openreview.retriever.ast_utils import read_line_range
 from openreview.retriever.base import Retriever
 from openreview.retriever.code_context import CodeContext, make_context_id
+from openreview.retriever.graph import GraphRetriever
 from openreview.retriever.index import RepoIndex
 from openreview.retriever.query import QueryBuilder, RetrievalQuery
 from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
@@ -28,8 +29,6 @@ logger = logging.getLogger(__name__)
 
 MAX_HYBRID_CONTEXTS = 24
 MAX_SYMBOL_CONTEXTS = 12
-MAX_IMPORTER_CONTEXTS = 6
-MAX_DEPENDENCY_CONTEXTS = 6
 
 
 class HybridRetriever:
@@ -39,6 +38,8 @@ class HybridRetriever:
         index_cache_dir: Optional[str | Path] = None,
         enabled: bool = True,
         max_contexts: int = MAX_HYBRID_CONTEXTS,
+        graph_enabled: bool = True,
+        graph_retriever: Optional[GraphRetriever] = None,
     ):
         self.ast_retriever: Retriever = ast_retriever or TreeSitterLocalRetriever()
         self.index_cache_dir = (
@@ -47,6 +48,8 @@ class HybridRetriever:
             else None
         )
         self.enabled = enabled
+        self.graph_enabled = graph_enabled
+        self.graph_retriever = graph_retriever or GraphRetriever()
         self.max_contexts = max(1, max_contexts)
         self.query_builder = QueryBuilder()
         self._index_cache: Dict[str, RepoIndex] = {}
@@ -70,9 +73,12 @@ class HybridRetriever:
         stats: Dict[str, float] = {
             "ast_contexts": len(contexts),
             "index_symbol_hits": 0,
+            "graph_caller_hits": 0,
+            "graph_callee_hits": 0,
             "index_importer_hits": 0,
             "index_dependency_hits": 0,
             "index_error": 0,
+            "graph_error": 0,
         }
 
         if not self.enabled:
@@ -86,12 +92,12 @@ class HybridRetriever:
                 contexts.extend(
                     self._symbol_contexts(repo_path, index, query, stats)
                 )
-                contexts.extend(
-                    self._importer_contexts(repo_path, index, query, stats)
-                )
-                contexts.extend(
-                    self._dependency_contexts(repo_path, index, query, stats)
-                )
+                if self.graph_enabled:
+                    contexts.extend(
+                        self.graph_retriever.retrieve(
+                            repo_path, index, query, stats=stats
+                        )
+                    )
             except Exception as exc:  # noqa: BLE001 - 检索增强失败不能拖垮 review
                 stats["index_error"] = 1
                 logger.warning("Hybrid retrieval failed, falling back to AST: %s", exc)
@@ -179,86 +185,6 @@ class HybridRetriever:
                 )
             )
             stats["index_symbol_hits"] += 1
-        return contexts
-
-    def _importer_contexts(
-        self,
-        repo_path: Path,
-        index: RepoIndex,
-        query: RetrievalQuery,
-        stats: Dict[str, float],
-    ) -> List[CodeContext]:
-        contexts: List[CodeContext] = []
-        seen: set[tuple[str, int]] = set()
-        for edge in index.importers_of(query.modules, limit=MAX_IMPORTER_CONTEXTS):
-            key = (edge.src_file, edge.line)
-            if key in seen:
-                continue
-            seen.add(key)
-            start = max(1, edge.line - 4)
-            end = edge.line + 8
-            snippet = read_line_range(repo_path / edge.src_file, start, end)
-            if not snippet:
-                continue
-            contexts.append(
-                CodeContext(
-                    file_path=edge.src_file,
-                    reason=(
-                        f"import of `{edge.dst_module}`"
-                        + (f" (`{edge.symbol}`)" if edge.symbol else "")
-                    ),
-                    snippet=snippet,
-                    score=0.6,
-                    kind="import",
-                    symbol=edge.symbol,
-                    start_line=start,
-                    end_line=end,
-                    context_id=make_context_id(
-                        edge.src_file, start, end, "import", fallback=edge.dst_module
-                    ),
-                )
-            )
-            stats["index_importer_hits"] += 1
-        return contexts
-
-    def _dependency_contexts(
-        self,
-        repo_path: Path,
-        index: RepoIndex,
-        query: RetrievalQuery,
-        stats: Dict[str, float],
-    ) -> List[CodeContext]:
-        contexts: List[CodeContext] = []
-        for symbol in index.definitions_in_modules(
-            query.imports, limit=MAX_DEPENDENCY_CONTEXTS
-        ):
-            snippet = read_line_range(
-                repo_path / symbol.file_path, symbol.start_line, symbol.end_line
-            )
-            if not snippet:
-                continue
-            contexts.append(
-                CodeContext(
-                    file_path=symbol.file_path,
-                    reason=(
-                        f"imported dependency `{symbol.qualname}` "
-                        f"(lines {symbol.start_line}-{symbol.end_line})"
-                    ),
-                    snippet=snippet,
-                    score=0.62,
-                    kind="dependency",
-                    symbol=symbol.name,
-                    start_line=symbol.start_line,
-                    end_line=symbol.end_line,
-                    context_id=make_context_id(
-                        symbol.file_path,
-                        symbol.start_line,
-                        symbol.end_line,
-                        "dependency",
-                    ),
-                )
-            )
-            stats["index_dependency_hits"] += 1
         return contexts
 
 

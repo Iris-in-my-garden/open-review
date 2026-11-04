@@ -11,9 +11,10 @@
 - **默认单遍审查（single-pass per batch）**：每个 batch 一次结构化 LLM 调用，覆盖 `clean_code` / `bugs` / `performance` / `security` 四类风险；大 PR 仍按 token 预算分批
 - **可选多维度并行审查**：`--reviewer-mode multi_aspect` 可切回四维度并行，作为高召回模式和消融配置，不作为默认路径
 - **规则 triage（0 LLM 调用）**：文档/配置-only PR 直接跳过模型；纯测试变更收窄审查重点
-- **混合上下文检索**（默认启用）：tree-sitter AST 提供结构化主路径，SQLite FTS5 符号索引与 import 关系补充跨文件候选：
+- **混合上下文检索**（默认启用）：tree-sitter AST 提供结构化主路径，SQLite FTS5 符号索引与 import/call graph 补充跨文件候选：
   - 只要改动了函数体，就能自动定位并抽取所属函数/类
   - 符号索引支持精确匹配与 BM25 召回，import 关系补充模块使用方及依赖
+  - call graph 补充“谁调用了变更符号 / 变更函数调用了谁”，把影响面从文件级提升到函数级
   - 关联测试文件检索，用于测试缺口分析
   - base worktree 检索被删除符号的历史实现
   - 仅支持 Python / Go（刻意收窄范围）；其他语言只使用 diff，不注入结构上下文
@@ -74,7 +75,8 @@ GitHub PR URL
 │ Evidence Collectors          │
 │ 1. ImpactAnalyzer：跨文件引用 │
 │ 2. StaticAnalysis：ruff/mypy │
-│ 3. Retriever：AST + FTS5 + imports │
+│ 3. Retriever：AST + FTS5 +    │
+│    import/call graph          │
 └────────┬─────────────────────┘
          ▼
 ┌──────────────────────────────┐
@@ -151,6 +153,10 @@ openreview review https://github.com/owner/repo/pull/123 \
   --reviewer-mode multi_aspect \
   --max-workers 2
 
+# 检索消融：AST-only / +FTS / +graph
+openreview review https://github.com/owner/repo/pull/123 --no-hybrid-retrieval
+openreview review https://github.com/owner/repo/pull/123 --no-graph-retrieval
+
 # 用量控制：禁用 triage / 关闭 verifier / 设置硬预算
 openreview review https://github.com/owner/repo/pull/123 \
   --no-triage \
@@ -220,8 +226,9 @@ src/openreview/
 ├── retriever/
 │   ├── base.py                # Retriever 协议
 │   ├── tree_sitter_retriever.py  # AST 边界 + 定义/引用 + 测试文件 + base 检索
-│   ├── hybrid.py                # AST + 符号索引 + import 关系融合与去重
-│   ├── index.py                 # SQLite FTS5 符号索引与 import 关系
+│   ├── hybrid.py                # AST + 符号索引 + graph 融合与去重
+│   ├── index.py                 # SQLite FTS5 符号索引与 import/call 关系
+│   ├── graph.py                 # import/call graph 扩展（caller/callee/依赖）
 │   └── query.py                 # 从 Diff 构造检索查询
 ├── review/
 │   ├── prompt_builder.py      # 带行号 Patch、不可信数据包裹、token 预算
@@ -247,8 +254,8 @@ src/openreview/
 
 ## 设计取舍
 
-**为什么检索采用 AST + 符号索引？**
-tree-sitter AST 是结构化主路径，能定位变更行所属的函数/类；SQLite FTS5 符号索引提供精确匹配与 BM25 召回，import 关系补充跨文件候选。上下文按相关性排序并去重，检索增强失败时仍可退回 AST 结果。当前索引和 AST 解析都聚焦 Python / Go；其他语言只使用 diff，不注入结构上下文。实现内部仍会在部分符号分析中调用 `git grep`，但它不是独立的检索器或多语言 fallback。
+**为什么检索采用 AST + 符号索引 + 图扩展？**
+tree-sitter AST 是结构化主路径，能定位变更行所属的函数/类；SQLite FTS5 符号索引提供精确匹配与 BM25 召回；import/call graph 再补上“谁调用了变更符号 / 变更函数调用了谁”，把影响面从文件级提升到函数级。上下文按相关性排序并去重，任何增强失败时仍可退回 AST 结果。call graph 是 best-effort：Python 用 `ast` 抽取 caller/callee，Go 的调用边暂不默认启用，不宣称完整类型解析。当前索引和 AST 解析都聚焦 Python / Go；其他语言只使用 diff，不注入结构上下文。实现内部仍会在部分符号分析中调用 `git grep`，但它不是独立的检索器或多语言 fallback。
 
 **为什么 triage 只用规则、不用模型？**
 triage 的目标是减少无效调用，不是做判断。用一次 LLM 调用决定“要不要调用 LLM”在调用量上不成立；docs-only / test-only 这类信号用文件后缀和 diff 元数据就能确定性判断，也更容易测试。
@@ -339,6 +346,33 @@ uv run python -m evaluation.cli metrics --split dev --run-id dev-single
 uv run python -m evaluation.cli metrics --split dev --run-id dev-multi
 ```
 
+Phase 2 检索消融：固定模型与 reviewer mode，只切换检索开关。建议使用同一份 LLM
+record/replay 缓存，保证差异来自检索而不是采样：
+
+```bash
+# AST only
+uv run python -m evaluation.cli review \
+  --split dev --run-id dev-ast \
+  --model gpt-4o-mini --no-hybrid-retrieval \
+  --llm-cache-dir evaluation/.cache/llm --budget-tokens 200000
+
+# AST + FTS5 symbol index (graph off)
+uv run python -m evaluation.cli review \
+  --split dev --run-id dev-fts \
+  --model gpt-4o-mini --no-graph-retrieval \
+  --llm-cache-dir evaluation/.cache/llm --budget-tokens 200000
+
+# AST + FTS5 + graph（默认）
+uv run python -m evaluation.cli review \
+  --split dev --run-id dev-graph \
+  --model gpt-4o-mini \
+  --llm-cache-dir evaluation/.cache/llm --budget-tokens 200000
+
+for run in dev-ast dev-fts dev-graph; do
+  uv run python -m evaluation.cli metrics --split dev --run-id "$run"
+done
+```
+
 语义评测需要 AACR checkout 和 judge 配置：
 
 ```bash
@@ -351,6 +385,9 @@ uv run python -m evaluation.cli semantic \
 
 ```bash
 uv run python -m evaluation.cli report \
+  --run ast=evaluation/metrics/aacr-pygo-v1/dev-ast \
+  --run fts=evaluation/metrics/aacr-pygo-v1/dev-fts \
+  --run graph=evaluation/metrics/aacr-pygo-v1/dev-graph \
   --run single=evaluation/metrics/aacr-pygo-v1/dev-single \
   --run multi_aspect=evaluation/metrics/aacr-pygo-v1/dev-multi \
   --out reports/eval_dev.md
@@ -360,12 +397,15 @@ uv run python -m evaluation.cli report \
 
 模板如下，真实数字跑完后替换：
 
-| Config | N | Findings | Precision | Recall | Balanced | Invalid line | Evidence | Retrieval | Attribution | Calls/PR | Tokens | Latency |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| single | 10 | — | — | — | — | — | — | — | — | — | — | — |
-| multi_aspect | 10 | — | — | — | — | — | — | — | — | — | — | — |
+| Config | N | Findings | Precision | Recall | Balanced | Invalid line | Evidence | File recall | Symbol cov | Citation | Graph ctx | Attribution | Calls/PR | Tokens | Latency |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| ast | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| fts | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| graph | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| single | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| multi_aspect | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 
-解读时至少同时看三件事：**质量（P/R）是否提升、token 是否成比例、证据是否仍然可定位**。只有 `multi_aspect` 在高严重级别 findings 上有明显收益时，才值得考虑默认启用或做高风险升级；否则保持 `single` 默认。
+解读时至少同时看四件事：**质量（P/R）是否提升、检索覆盖是否提升、token 是否成比例、证据是否仍然可定位**。只有 `multi_aspect` 或 graph 在高严重级别 findings 上有明显收益时，才值得考虑默认启用或做高风险升级；否则保持当前 `single + AST/FTS/graph` 默认。
 
 ## 测试与工程化
 
@@ -391,7 +431,7 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 - [x] Prompt Injection 防护与红队测试
 - [x] RepoManager：FileLock、blobless clone、平台缓存目录、LRU 式缓存淘汰
 - [x] GitHub API 429/5xx/限流重试，CLI `finally` 关闭 HTTP 连接
-- [x] 默认混合检索：tree-sitter AST 主路径 + SQLite FTS5 符号索引 + import 关系；支持 AST-only 检索消融
+- [x] 默认混合检索：tree-sitter AST 主路径 + SQLite FTS5 符号索引 + import/call graph；支持 AST-only / +FTS / +graph 检索消融
 - [x] 默认采用单遍 Review（每个 batch 1 次调用）；multi-aspect 保留为高召回/消融配置
 - [x] 有界工作流（`workflow.py`）：条件节点、`ReviewBudget`、trace
 - [x] 规则 triage：docs-only 跳过、test-only 收窄审查重点
@@ -413,6 +453,7 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 
 已知限制：
 - 只支持 Python / Go；其他语言没有 AST 上下文，效果未做承诺
+- call graph 是 best-effort：Python 用 `ast` 抽取，Go 调用边暂不默认启用，不做完整类型解析
 - patch/context 的 token 数仍是保守估算（1 token ≈ 3 字符），用于预算与截断；真实用量单独记录
 - 行内评论只能落在 diff 可见行；不在 diff 内的问题会退化为文件级描述
 - 单文件极大时会在 Prompt 层截断，可能漏掉文件后半部分的问题

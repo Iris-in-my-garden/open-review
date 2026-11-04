@@ -39,7 +39,14 @@ def _fixture(tmp_path: Path) -> Path:
     )
     _write(
         metrics_dir / "retrieval_dev-single.json",
-        {"retrieval": {"file_recall": 0.8}},
+        {
+            "retrieval": {
+                "file_recall": 0.8,
+                "symbol_coverage": 0.75,
+                "citation_rate": 0.5,
+                "graph_contexts_avg": 2.5,
+            }
+        },
     )
     _write(
         metrics_dir / "metrics_openreview_20260101_120000.json",
@@ -70,12 +77,17 @@ def test_load_run_builds_row_and_markdown(tmp_path: Path):
     assert row["precision"] == 0.6
     assert row["recall"] == 0.5
     assert row["retrieval_file_recall"] == 0.8
+    assert row["retrieval_symbol_coverage"] == 0.75
+    assert row["retrieval_citation_rate"] == 0.5
+    assert row["graph_contexts_avg"] == 2.5
     assert row["total_tokens"] == 1200
 
     table = render_table([row])
     assert "| single | 2/2 | 10 | 60.0% | 50.0% | 54.5% |" in table
     assert "90.0%" in table
     assert "80.0%" in table
+    assert "75.0%" in table
+    assert "2.50 | 100.0% |" in table
     assert "1.2k" in table
 
 
