@@ -163,19 +163,20 @@ class QueryBuilder:
                     continue
                 line = raw_line[1:]
                 for match in _IDENTIFIER.findall(line):
+                    # 先判断再追加：否则已经到上限后，每个后续行仍会多收一个。
+                    if len(identifiers) >= MAX_ADDED_LINE_IDENTIFIERS:
+                        break
                     if (
                         match.lower() not in _COMMON_NAMES
                         and match not in identifiers
                     ):
                         identifiers.append(match)
-                        if len(identifiers) >= MAX_ADDED_LINE_IDENTIFIERS:
-                            break
                 for match in _STRING_LITERAL.findall(line):
+                    if len(strings) >= MAX_STRING_TERMS:
+                        break
                     cleaned = match.strip()
                     if cleaned and cleaned not in strings:
                         strings.append(cleaned)
-                        if len(strings) >= MAX_STRING_TERMS:
-                            break
                 if (
                     len(identifiers) >= MAX_ADDED_LINE_IDENTIFIERS
                     and len(strings) >= MAX_STRING_TERMS

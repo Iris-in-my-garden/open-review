@@ -73,3 +73,28 @@ def test_impact_returns_empty_for_missing_repo(tmp_path: Path):
     report = ImpactAnalyzer().analyze(parsed, tmp_path / "missing")
 
     assert report.findings == []
+
+
+def test_impact_works_when_repo_lives_under_excluded_dir_name(tmp_path: Path):
+    """仓库本身位于 build/ 下时，不能用绝对路径的 parts 排除所有文件。"""
+    repo_root = tmp_path / "build" / "repo"
+    _write(repo_root / "src" / "core.py", "def helper(value):\n    return value\n")
+    _write(
+        repo_root / "src" / "caller.py",
+        "from core import helper\n\nresult = helper(1)\n",
+    )
+
+    parsed = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="src/core.py",
+                status="modified",
+                patch="@@ -1,2 +1,2 @@\n-def helper(value):\n+def helper(value):\n",
+                changed_symbols=["helper"],
+            )
+        ]
+    )
+
+    report = ImpactAnalyzer().analyze(parsed, repo_root)
+
+    assert any(item.file == "src/caller.py" for item in report.findings)

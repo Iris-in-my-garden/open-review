@@ -497,9 +497,10 @@ class RepoIndex:
                         logger.debug("FTS query failed, falling back to LIKE: %s", exc)
 
             if len(results) < limit:
-                like = f"%{cleaned[0]}%"
+                like = f"%{_escape_like(cleaned[0])}%"
                 rows = self._conn.execute(
-                    "SELECT * FROM symbols WHERE name LIKE ? OR qualname LIKE ? "
+                    "SELECT * FROM symbols WHERE name LIKE ? ESCAPE '\\' "
+                    "OR qualname LIKE ? ESCAPE '\\' "
                     "ORDER BY name LIMIT ?",
                     (like, like, remaining),
                 ).fetchall()
@@ -524,8 +525,9 @@ class RepoIndex:
             rows.extend(
                 self._conn.execute(
                     "SELECT src_file, dst_module, symbol, line FROM imports "
-                    "WHERE dst_module = ? OR dst_module LIKE ? LIMIT ?",
-                    (module, f"%.{module}", max(1, limit)),
+                    "WHERE dst_module = ? OR dst_module LIKE ? ESCAPE '\\' "
+                    "LIMIT ?",
+                    (module, f"%.{_escape_like(module)}", max(1, limit)),
                 ).fetchall()
             )
         result: List[ImportEdge] = []
@@ -580,10 +582,10 @@ class RepoIndex:
                     """
                     SELECT s.* FROM symbols s
                     JOIN files f ON f.path = s.file_path
-                    WHERE f.module = ? OR f.module LIKE ?
+                    WHERE f.module = ? OR f.module LIKE ? ESCAPE '\\'
                     LIMIT ?
                     """,
-                    (module, f"%.{module}", max(1, limit)),
+                    (module, f"%.{_escape_like(module)}", max(1, limit)),
                 ).fetchall()
             )
         result: List[IndexedSymbol] = []

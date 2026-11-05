@@ -3,10 +3,10 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from openreview.repo.diff_parser import DiffParser
+from openreview.repo.diff_parser import DiffParser, ParsedChangedFile, ParsedDiff
 from openreview.retriever.hybrid import HybridRetriever
 from openreview.retriever.index import RepoIndex
-from openreview.retriever.query import QueryBuilder
+from openreview.retriever.query import MAX_ADDED_LINE_IDENTIFIERS, QueryBuilder
 
 
 def _init_repo(root: Path) -> None:
@@ -177,3 +177,64 @@ def test_hybrid_retriever_adds_index_contexts_with_ids(tmp_path: Path):
         assert len(ids) == len(set(ids))
     finally:
         retriever.close()
+
+
+def test_index_like_lookups_escape_wildcards(tmp_path: Path):
+    """符号/模块里的 ``_`` 不能被 SQL LIKE 当成“任意单字符”。"""
+    root = tmp_path / "repo"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "pkg" / "foo_bar.py").write_text(
+        "def get_user():\n    return 1\n", encoding="utf-8"
+    )
+    (root / "pkg" / "fooXbar.py").write_text(
+        "def getXuser():\n    return 2\n", encoding="utf-8"
+    )
+    (root / "pkg" / "user.py").write_text(
+        "from pkg.foo_bar import get_user\n", encoding="utf-8"
+    )
+    (root / "pkg" / "decoy.py").write_text(
+        "from pkg.fooXbar import getXuser\n", encoding="utf-8"
+    )
+    _init_repo(root)
+
+    index = RepoIndex.for_worktree(root, cache_dir=tmp_path / "idx")
+    try:
+        importers = index.importers_of(["pkg.foo_bar"])
+        importer_files = {edge.src_file for edge in importers}
+        assert "pkg/user.py" in importer_files
+        assert "pkg/decoy.py" not in importer_files
+
+        definitions = index.definitions_in_modules(["pkg.foo_bar"])
+        definition_names = {symbol.name for symbol in definitions}
+        assert "get_user" in definition_names
+        assert "getXuser" not in definition_names
+
+        # 精确命中之后仍会走 FTS/LIKE 兜底，兜底同样必须转义。
+        symbols = index.search_symbols(["get_user"], limit=20)
+        symbol_names = {symbol.name for symbol in symbols}
+        assert "get_user" in symbol_names
+        assert "getXuser" not in symbol_names
+    finally:
+        index.close()
+
+
+def test_query_builder_caps_added_line_identifiers():
+    patch = "\n".join(
+        f"+alpha_{index:03d} = compute_{index:03d}" for index in range(100)
+    )
+    parsed = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="pkg/sample.py",
+                status="modified",
+                patch=patch,
+            )
+        ]
+    )
+
+    identifiers, _ = QueryBuilder._collect_added_line_terms(parsed)
+
+    assert len(identifiers) == MAX_ADDED_LINE_IDENTIFIERS
+    assert len(identifiers) == len(set(identifiers))
+

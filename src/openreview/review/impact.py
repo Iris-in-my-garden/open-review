@@ -227,7 +227,13 @@ class ImpactAnalyzer:
         for path in repo_path.rglob("*"):
             if not path.is_file():
                 continue
-            if any(part in EXCLUDED_DIRS for part in path.parts):
+            # 只检查仓库内的相对路径：仓库本身可能位于 build/、dist/ 或
+            # venv/ 下，用绝对路径判断会把所有文件都误排除。
+            try:
+                relative = path.relative_to(repo_path)
+            except ValueError:
+                continue
+            if any(part in EXCLUDED_DIRS for part in relative.parts):
                 continue
             try:
                 if path.stat().st_size > 500 * 1024:

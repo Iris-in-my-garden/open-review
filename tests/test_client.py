@@ -12,6 +12,17 @@ def _client_with_handler(handler, token: str | None = None) -> GitHubClient:
     return GitHubClient(token=token, transport=httpx.MockTransport(handler))
 
 
+def test_client_sets_explicit_request_timeout():
+    """大 PR 的 patch 响应可能很慢，不能依赖 httpx 的 5 秒默认值。"""
+    with _client_with_handler(lambda request: httpx.Response(200, json={})) as client:
+        timeout = client.client.timeout
+
+    assert timeout.connect == 10.0
+    assert timeout.read == 30.0
+    assert timeout.write == 30.0
+    assert timeout.pool == 30.0
+
+
 def test_get_pull_request_success():
     ref = GitHubPRRef(owner="octocat", repo="Hello-World", pr_number=1342)
 

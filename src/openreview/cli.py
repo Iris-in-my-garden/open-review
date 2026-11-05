@@ -149,6 +149,11 @@ def review(
         "--llm-cache-mode",
         help="LLM cache mode: auto | record | replay",
     ),
+    llm_max_retries: int = typer.Option(
+        0,
+        "--llm-max-retries",
+        help="Retries for transient LLM API failures (default: 0)",
+    ),
     verbose: bool = typer.Option(
         False,
         "--verbose",
@@ -193,6 +198,7 @@ def review(
             review_cache_dir=cache_dir,
             llm_cache_dir=llm_cache_dir,
             llm_cache_mode=llm_cache_mode,
+            llm_max_retries=llm_max_retries,
         )
         report_path = pipeline.run(
             pr_url,

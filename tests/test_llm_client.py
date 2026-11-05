@@ -1,8 +1,11 @@
+import sys
+import threading
 from unittest.mock import patch
 
 import pytest
 
-from openreview.review.llm_client import LLMClient
+from openreview.review.llm_client import LLMClient, MockLLMClient
+from openreview.review.output_parser import AspectReviewOutputSchema
 from openreview.services.review_service import ReviewPipeline
 
 
@@ -37,3 +40,28 @@ def test_pipeline_does_not_reuse_github_token_as_llm_key():
     # GitHub Token 只能传给 GitHubClient，不能传给 LLMClient
     assert mock_github.call_args.kwargs["token"] == "ghp_github_token"
     assert mock_llm.call_args.kwargs["api_key"] is None
+
+
+def test_mock_client_usage_increment_is_thread_safe():
+    client = MockLLMClient()
+    workers = 8
+    calls_per_worker = 100
+    barrier = threading.Barrier(workers)
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+
+    def worker() -> None:
+        barrier.wait()
+        for _ in range(calls_per_worker):
+            client.generate_structured("sys", "", AspectReviewOutputSchema)
+
+    threads = [threading.Thread(target=worker) for _ in range(workers)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        sys.setswitchinterval(old_interval)
+
+    assert client.usage["calls"] == workers * calls_per_worker

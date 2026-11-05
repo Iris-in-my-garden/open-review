@@ -50,6 +50,7 @@ from openreview.review.triage import (
 from openreview.review.verifier import FindingVerifier
 from openreview.review.workflow import (
     BoundedWorkflow,
+    BudgetExceeded,
     ReviewBudget,
     ReviewState,
     WorkflowNode,
@@ -554,6 +555,7 @@ class ReviewPipeline:
         static_contexts = self._collect_static_contexts(state)
 
         batch_results: List[ReviewResult] = []
+        failed_batches = 0
         with self._timed(state, "retrieve_and_review"):
             for index, batch in enumerate(batches, start=1):
                 self._log(
@@ -637,13 +639,33 @@ class ReviewPipeline:
                     break
 
                 calls_before = state.budget.used_llm_calls
-                result = self.reviewer.review(
-                    pr_info=state.pr_info,
-                    parsed_diff=batch,
-                    contexts=contexts,
-                    repo_path=state.local_repo_path,
-                    aspects=aspects,
-                )
+                try:
+                    result = self.reviewer.review(
+                        pr_info=state.pr_info,
+                        parsed_diff=batch,
+                        contexts=contexts,
+                        repo_path=state.local_repo_path,
+                        aspects=aspects,
+                    )
+                except BudgetExceeded:
+                    state.add_note(
+                        "[budget] LLM 预算在批次 "
+                        f"{index}/{len(batches)} 内耗尽，后续批次未执行。"
+                    )
+                    logger.warning(
+                        "Budget exhausted during batch %d/%d", index, len(batches)
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001 - 单批失败不应丢掉已完成的批次
+                    failed_batches += 1
+                    state.add_note(
+                        f"[error] 批次 {index}/{len(batches)} 审查失败"
+                        f"（{type(exc).__name__}），已跳过。"
+                    )
+                    logger.warning(
+                        "Batch %d/%d review failed: %s", index, len(batches), exc
+                    )
+                    continue
                 # 真实客户端由 BudgetedLLMClient 扣账；FakeReviewer / 自定义
                 # reviewer 绕过客户端时，这里补一次，保证预算语义一致。
                 # 注意：LLM cache hit 也不会增加 used_llm_calls，但它本来就
@@ -674,6 +696,11 @@ class ReviewPipeline:
             raise RuntimeError(
                 "No review results were produced. "
                 "Check the LLM budget or the review cache configuration."
+                + (
+                    f" ({failed_batches} batch(es) failed; see review notes.)"
+                    if failed_batches
+                    else ""
+                )
             )
 
         review_result = (

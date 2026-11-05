@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 MAX_BACKOFF_SECONDS = 8.0
 MAX_RATE_LIMIT_WAIT_SECONDS = 30.0
+# 大 PR 的 files?per_page=100 响应可能包含大量 patch，httpx 默认 5s 容易超时。
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
 
 
 class PullRequestInfo(BaseModel):
@@ -57,6 +60,10 @@ class GitHubClient:
             base_url="https://api.github.com",
             headers=self._get_headers(),
             transport=transport,
+            timeout=httpx.Timeout(
+                DEFAULT_REQUEST_TIMEOUT_SECONDS,
+                connect=DEFAULT_CONNECT_TIMEOUT_SECONDS,
+            ),
         )
 
     def _get_headers(self) -> dict:

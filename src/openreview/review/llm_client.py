@@ -72,15 +72,23 @@ class BudgetedLLMClient:
         user_prompt: str,
         response_schema: Type[T],
     ) -> T:
+        estimated = 0
         if self._budget is not None:
             estimated = estimate_tokens(system_prompt) + estimate_tokens(user_prompt)
             # 检查与扣减在同一临界区完成：4 个 aspect 并发时不会同时越过上限。
             self._budget.reserve(calls=1, tokens=estimated)
-        return self.inner.generate_structured(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            response_schema=response_schema,
-        )
+        try:
+            return self.inner.generate_structured(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                response_schema=response_schema,
+            )
+        except Exception:
+            # 调用失败（超时、限流、解析失败）不应消耗预算，否则重试会
+            # 被“预算不足”提前终止，掩盖真正的失败原因。
+            if self._budget is not None:
+                self._budget.refund(calls=1, tokens=estimated)
+            raise
 
     def __getattr__(self, name: str) -> Any:
         # 透传 cache wrapper 的 hits/misses 等统计字段。
@@ -200,6 +208,8 @@ class MockLLMClient:
             "completion_tokens": 0,
             "total_tokens": 0,
         }
+        # 多维度模式会并发调用；未加锁的 ``+=`` 会丢计数。
+        self._usage_lock = threading.Lock()
 
     @staticmethod
     def _extract_anchor(user_prompt: str, filename: str) -> tuple[Optional[int], Optional[str]]:
@@ -224,7 +234,8 @@ class MockLLMClient:
             user_prompt: str,
             response_schema: Type[T],
     ) -> T:
-        self.usage["calls"] += 1
+        with self._usage_lock:
+            self.usage["calls"] += 1
 
         # 1. 如果用户自定义了匹配的实例，优先返回
         if self.custom_schema and isinstance(self.custom_schema, response_schema):

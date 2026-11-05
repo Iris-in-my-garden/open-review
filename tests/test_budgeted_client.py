@@ -80,6 +80,25 @@ def test_budgeted_client_can_be_rebound_per_run():
     assert second.used_llm_calls == 1
 
 
+def test_budgeted_client_refunds_budget_when_inner_call_fails():
+    class FailingClient(FakeClient):
+        def generate_structured(self, system_prompt, user_prompt, response_schema):
+            self.calls += 1
+            raise RuntimeError("provider timeout")
+
+    inner = FailingClient()
+    budget = ReviewBudget(max_llm_calls=1, max_input_tokens=1000)
+    client = BudgetedLLMClient(inner, budget)
+
+    with pytest.raises(RuntimeError, match="provider timeout"):
+        client.generate_structured("system prompt", "user prompt", Output)
+
+    # 失败的调用不占用预算，后续重试仍然可以通过。
+    assert budget.used_llm_calls == 0
+    assert budget.used_input_tokens == 0
+    assert budget.allow(calls=1)
+
+
 def test_budget_reserve_is_atomic_under_concurrency():
     """reserve() 必须把 check + consume 放在同一个临界区。
 

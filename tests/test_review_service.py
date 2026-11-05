@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from openreview.github.client import ChangedFile, PullRequestInfo
 from openreview.retriever.code_context import CodeContext
 from openreview.review.aspect_reviewer import ReviewOrchestrator
@@ -212,6 +214,48 @@ class FakeCachedReviewer(FakeReviewer):
     def __init__(self):
         super().__init__()
         self.llm_client = self._CachedClient()
+
+
+class FlakyReviewer(FakeReviewer):
+    """第一批失败、后续批次成功，用于验证批级故障隔离。"""
+
+    def __init__(self, fail_all: bool = False):
+        super().__init__()
+        self.fail_all = fail_all
+
+    def review(
+        self,
+        pr_info,
+        parsed_diff,
+        contexts,
+        repo_path=None,
+        aspects=None,
+    ):
+        self.calls.append((parsed_diff, repo_path))
+        if self.fail_all or len(self.calls) == 1:
+            raise RuntimeError("provider timeout")
+        return ReviewResult(
+            owner=pr_info.owner,
+            repo=pr_info.repo,
+            pr_number=pr_info.pr_number,
+            summary=f"batch {len(self.calls)}",
+            risk_level="HIGH",
+            risk_reason="reason",
+            potential_issues=[
+                PotentialIssue(
+                    file=parsed_diff.files[0].filename,
+                    severity="high",
+                    category="security",
+                    confidence=0.9,
+                    reasoning="Issue.",
+                    suggestion="Fix it.",
+                    line=1,
+                )
+            ],
+            final_decision="REQUEST_CHANGES",
+            final_summary="summary",
+            review_notes=[],
+        )
 
 
 def test_pipeline_batches_merges_and_posts_comments(tmp_path: Path):
@@ -547,5 +591,58 @@ def test_single_shot_budget_does_not_partially_run_aspects(tmp_path: Path):
         assert any(
             "LLM 调用预算已用尽" in note for note in pipeline.last_state.notes
         )
+    finally:
+        pipeline.close()
+
+
+def test_pipeline_isolates_batch_failure_and_keeps_successful_batches(
+    tmp_path: Path,
+):
+    pipeline = ReviewPipeline(
+        mock_llm=True,
+        max_batch_tokens=1,
+        verifier_enabled=False,
+    )
+    pipeline.gh_client = FakeGitHubClient()
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+    pipeline.reviewer = FlakyReviewer()
+
+    try:
+        report_path = pipeline.run(
+            "https://github.com/org/repo/pull/1", tmp_path / "reports"
+        )
+
+        # 两个文件各成一批：第一批失败，第二批仍然完成并写入报告。
+        assert len(pipeline.reviewer.calls) == 2
+        assert report_path.exists()
+        assert pipeline.last_result is not None
+        assert len(pipeline.last_result.potential_issues) == 1
+        assert pipeline.last_state is not None
+        assert any(
+            "批次 1/2 审查失败" in note for note in pipeline.last_state.notes
+        )
+    finally:
+        pipeline.close()
+
+
+def test_pipeline_raises_when_every_batch_fails(tmp_path: Path):
+    pipeline = ReviewPipeline(
+        mock_llm=True,
+        max_batch_tokens=1,
+        verifier_enabled=False,
+    )
+    pipeline.gh_client = FakeGitHubClient()
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+    pipeline.reviewer = FlakyReviewer(fail_all=True)
+
+    try:
+        with pytest.raises(RuntimeError, match="batch\\(es\\) failed"):
+            pipeline.run(
+                "https://github.com/org/repo/pull/1", tmp_path / "reports"
+            )
+        # 单个批次失败不会中断循环，所有批次都被尝试过。
+        assert len(pipeline.reviewer.calls) == 2
     finally:
         pipeline.close()

@@ -96,6 +96,12 @@ class ReviewBudget:
         with self._lock:
             self._consume_unlocked(calls, tokens)
 
+    def refund(self, calls: int = 0, tokens: int = 0) -> None:
+        """退还一次失败调用占用的预算，避免重试把预算提前耗尽。"""
+        with self._lock:
+            self.used_llm_calls = max(0, self.used_llm_calls - max(0, calls))
+            self.used_input_tokens = max(0, self.used_input_tokens - max(0, tokens))
+
     def reserve(self, calls: int = 1, tokens: int = 0) -> None:
         """原子地检查并扣减预算；不足时抛 ``BudgetExceeded``。
 

@@ -120,6 +120,8 @@ pip install -e .
 | `OPENAI_BASE_URL` | 否 | 兼容 OpenAI 协议的服务地址（如代理、本地模型网关） |
 | `GITHUB_TOKEN` | 否 | 访问私有仓库或避免 GitHub API 限流时填写 |
 | `OPENREVIEW_CACHE_DIR` | 否 | 覆盖仓库缓存目录；默认 macOS 为 `~/Library/Caches/openreview/repos`，Linux 为 `$XDG_CACHE_HOME/openreview/repos`（缺省 `~/.cache/openreview/repos`） |
+| `OPENREVIEW_INDEX_DIR` | 否 | 覆盖 FTS5 符号索引目录；默认在仓库缓存同级 `index/` |
+| `OPENREVIEW_REVIEW_CACHE_DIR` | 否 | 覆盖 review 结果缓存目录；默认在仓库缓存同级 `review/` |
 
 > GitHub Token 与 LLM API Key 是两套独立凭证，互不复用。
 
@@ -140,6 +142,9 @@ openreview review https://github.com/owner/repo/pull/123
 openreview review https://github.com/owner/repo/pull/123 \
   --model gpt-4.1-mini \
   --base-url https://your-gateway.example.com/v1
+
+# 真实审查时对瞬时失败（超时、429、5xx）开启重试
+openreview review https://github.com/owner/repo/pull/123 --llm-max-retries 2
 
 # 把问题作为 GitHub 行内评论发回 PR（默认 event=COMMENT，不会自动 approve）
 openreview review https://github.com/owner/repo/pull/123 --post-comment
