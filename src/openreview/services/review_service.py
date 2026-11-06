@@ -27,6 +27,7 @@ from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
 from openreview.review.aspect_reviewer import ReviewOrchestrator
 from openreview.review.cache import ReviewCache
 from openreview.review.config import ReviewConfig
+from openreview.review.debug_sink import DebugSink
 from openreview.review.finding_validator import FindingValidator
 from openreview.review.llm_cache import FileLLMCacheClient
 from openreview.review.llm_client import (
@@ -88,6 +89,7 @@ class ReviewPipeline:
         review_cache_dir: Optional[str] = None,
         llm_cache_dir: Optional[str] = None,
         llm_cache_mode: str = "auto",
+        debug_dir: Optional[str] = None,
     ):
         self.config = ReviewConfig(
             mock_llm=mock_llm,
@@ -121,6 +123,7 @@ class ReviewPipeline:
             review_cache_dir=review_cache_dir,
             llm_cache_dir=llm_cache_dir,
             llm_cache_mode=llm_cache_mode,
+            debug_dir=debug_dir,
         )
 
         self.gh_client = GitHubClient(token=github_token)
@@ -164,12 +167,13 @@ class ReviewPipeline:
             )
         self.llm_client = client
 
+        self.debug_sink = DebugSink(debug_dir) if debug_dir else None
         prompt_builder = PromptBuilder(
             max_patch_tokens=max_patch_tokens,
             max_context_tokens=max_context_tokens,
         )
         output_parser = OutputParser()
-        validator = FindingValidator()
+        validator = FindingValidator(debug_sink=self.debug_sink)
         self.reviewer: ReviewOrchestrator
         if self.config.reviewer_mode == "single":
             self.reviewer = SingleShotReviewer(
@@ -179,6 +183,7 @@ class ReviewPipeline:
                 validator=validator,
                 max_workers=max_workers,
                 aspect_timeout=aspect_timeout,
+                debug_sink=self.debug_sink,
             )
         else:
             self.reviewer = ReviewOrchestrator(
@@ -188,11 +193,13 @@ class ReviewPipeline:
                 validator=validator,
                 max_workers=max_workers,
                 aspect_timeout=aspect_timeout,
+                debug_sink=self.debug_sink,
             )
         self.verifier = (
             FindingVerifier(
                 self.llm_client,
                 verify_severities=self.config.verify_severities,
+                debug_sink=self.debug_sink,
             )
             if verifier_enabled
             else None
@@ -289,6 +296,7 @@ class ReviewPipeline:
             review_cache=self.review_cache,
             llm_client=self.llm_client,
             budgeted_client=self._budgeted_client,
+            debug_sink=self.debug_sink,
         )
 
     def _execute(self, executor: ReviewExecutor, state: ReviewState) -> Path:

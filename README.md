@@ -184,9 +184,29 @@ openreview review https://github.com/owner/repo/pull/123 \
 openreview review https://github.com/owner/repo/pull/123 \
   --json-out reports/result.json
 
+# 导出调试中间结果：prompt、LLM 解析结果、逐条 validator/verifier 决策
+openreview review https://github.com/owner/repo/pull/123 --mock_llm \
+  --dump-intermediates reports/debug/run-001
+
 # 打开 debug 日志（阶段耗时、检索数量、重试等）
 openreview review https://github.com/owner/repo/pull/123 --verbose
 ```
+
+`--dump-intermediates` 的产物结构：
+
+```text
+reports/debug/run-001/
+  state.json                  # PR、parsed_diff、batches、contexts、stats、trace、outcome
+  metrics.json
+  prompts/01_single_shot.system.txt
+  prompts/01_single_shot.user.txt
+  llm/01_single_shot.parsed.json
+  validation/01.json          # 每条 finding 的 confidence 变化、丢弃原因、patch 校验
+  verifier/01.json            # 每条 finding 的 verdict / reason / confidence
+```
+
+该目录只用于本地排查，默认不创建；`--dump-intermediates` 不参与 review cache key，
+不会影响缓存命中。
 
 ### 本地仓库模式（评测 / 离线回放）
 

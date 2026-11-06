@@ -73,6 +73,7 @@ class ReviewExecutor:
         review_cache: ReviewCache,
         llm_client,
         budgeted_client,
+        debug_sink=None,
     ):
         self.config = config
         self.gh_client = gh_client
@@ -84,6 +85,7 @@ class ReviewExecutor:
         self.review_cache = review_cache
         self.llm_client = llm_client
         self.budgeted_client = budgeted_client
+        self.debug_sink = debug_sink
 
         self.last_state: Optional[ReviewState] = None
         self.last_result: Optional[ReviewResult] = None
@@ -631,6 +633,9 @@ class ReviewExecutor:
             and outcome.ok
         ):
             self.review_cache.set(state.cache_key, result)
+
+        if self.debug_sink is not None:
+            self.debug_sink.record_state(state)
 
     # ------------------------------------------------------------------
     # 证据增强

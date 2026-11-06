@@ -22,15 +22,18 @@ from openreview.review.output_parser import (
 from openreview.review.report_writer import ReviewResult
 
 SINGLE_SHOT_INSTRUCTION = """### 【一次性审查任务】
-请在一次输出中覆盖以下四类风险，并在每个 issue 的 category 中标明类别：
+请在一次输出中覆盖以下五类风险，并在每个 issue 的 category 中标明类别：
 
 - bugs：逻辑错误、边界条件、空值/异常分支
 - security：注入、硬编码密钥、权限校验缺失
 - performance：不必要的重复计算、N+1、内存拷贝
-- clean_code：明显的可维护性问题
+- clean_code：结构性可维护性问题（重复代码、职责过多、魔法数字、隐藏耦合）
+- test_gap：本次改动缺少必要的测试覆盖
 
+报告范围包括本次 diff 引入的问题，以及 Patch/Context 中可见的未改动代码里的历史问题
+（历史问题需在 reasoning 中标注「历史问题，非本次改动引入」）。
 只报告输入中有直接证据的问题；没有发现时 issues 返回空列表。
-行号必须来自 Patch 左侧标注的新文件行号，evidence 必须逐字引用 Patch 或 Context。
+行号必须来自 Patch 左侧标注的新文件行号；evidence 只填代码本身，不要带行号或 `|` 前缀。
 """
 
 
@@ -56,17 +59,22 @@ class SingleShotReviewer(ReviewOrchestrator):
     ) -> ReviewResult:
         # aspects 在单遍模式下是 triage 给出的“审查重点”，不是调用次数。
         focus = self._focus_instruction(aspects)
-        user_prompt = (
-            self.prompt_builder.build_user_prompt(pr_info, parsed_diff, contexts)
-            + "\n\n"
-            + SINGLE_SHOT_INSTRUCTION
-            + focus
+        system_prompt = self.prompt_builder.build_system_prompt()
+        user_prompt = self.prompt_builder.build_user_prompt(
+            pr_info,
+            parsed_diff,
+            contexts,
+            task_instruction=SINGLE_SHOT_INSTRUCTION + focus,
         )
+        if self.debug_sink is not None:
+            self.debug_sink.record_prompt("single_shot", system_prompt, user_prompt)
         raw_data = self.llm_client.generate_structured(
-            system_prompt=self.prompt_builder.build_system_prompt(),
+            system_prompt=system_prompt,
             user_prompt=user_prompt,
             response_schema=AspectReviewOutputSchema,
         )
+        if self.debug_sink is not None:
+            self.debug_sink.record_llm_response("single_shot", raw_data)
         return finalize_review_result(
             prompt_builder=self.prompt_builder,
             output_parser=self.output_parser,

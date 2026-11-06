@@ -155,6 +155,14 @@ def review(
         "--llm-max-retries",
         help="Retries for transient LLM API failures (default: 0)",
     ),
+    dump_intermediates: Optional[Path] = typer.Option(
+        None,
+        "--dump-intermediates",
+        help=(
+            "Write prompts, parsed LLM responses, per-finding validation/verifier "
+            "decisions, and final state to this directory"
+        ),
+    ),
     verbose: bool = typer.Option(
         False,
         "--verbose",
@@ -200,6 +208,7 @@ def review(
             llm_cache_dir=llm_cache_dir,
             llm_cache_mode=llm_cache_mode,
             llm_max_retries=llm_max_retries,
+            debug_dir=str(dump_intermediates) if dump_intermediates else None,
         )
         report_path = pipeline.run(
             pr_url,
@@ -231,6 +240,12 @@ def review(
                     f"Structured result saved to: {json_path.resolve()}",
                     fg=typer.colors.YELLOW,
                 )
+            if dump_intermediates is not None:
+                typer.secho(
+                    "Intermediate artifacts: "
+                    f"{dump_intermediates.resolve()}",
+                    fg=typer.colors.YELLOW,
+                )
             raise typer.Exit(code=outcome.exit_code)
 
         typer.secho(
@@ -241,6 +256,11 @@ def review(
         if json_path is not None:
             typer.secho(
                 f"Structured result saved to: {json_path.resolve()}",
+                fg=typer.colors.GREEN,
+            )
+        if dump_intermediates is not None:
+            typer.secho(
+                f"Intermediate artifacts: {dump_intermediates.resolve()}",
                 fg=typer.colors.GREEN,
             )
 

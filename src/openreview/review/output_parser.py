@@ -1,4 +1,4 @@
-from typing import List, Optional, Type
+from typing import List, Literal, Optional, Type
 
 from pydantic import BaseModel, Field, field_validator
 from pydantic.json_schema import SkipJsonSchema
@@ -14,14 +14,55 @@ from openreview.review.assessment import (
 )
 from openreview.review.report_writer import PotentialIssue, ReviewResult
 
+IssueCategory = Literal[
+    "bugs", "security", "performance", "clean_code", "test_gap"
+]
+_CATEGORY_VALUES = frozenset(
+    {"bugs", "security", "performance", "clean_code", "test_gap"}
+)
+# 模型经常返回单复数/同义词；收敛后再校验，避免一个拼写让整条响应解析失败。
+_CATEGORY_ALIASES = {
+    "bug": "bugs",
+    "logic": "bugs",
+    "correctness": "bugs",
+    "sec": "security",
+    "security_issue": "security",
+    "perf": "performance",
+    "performance_issue": "performance",
+    "clean": "clean_code",
+    "clean-code": "clean_code",
+    "code_quality": "clean_code",
+    "maintainability": "clean_code",
+    "test": "test_gap",
+    "tests": "test_gap",
+    "test_coverage": "test_gap",
+    "testing": "test_gap",
+}
+
 
 class PotentialIssueSchema(BaseModel):
     file: str = Field(description="发生问题的代码文件路径")
     severity: Severity = Field(
-        description="严重程度，取值范围: critical, high, medium, low"
+        description=(
+            "严重程度，取值范围: critical, high, medium, low。"
+            "critical=可达路径上会导致数据损坏/权限绕过/远程代码执行/服务崩溃；"
+            "high=特定输入下产生错误结果或存在明确可利用的安全缺陷；"
+            "medium=边界或异常处理不完整但触发条件较窄；"
+            "low=可维护性问题且不影响当前行为。不确定时用 medium。"
+        )
     )
-    category: str = Field(description="问题分类，对应当前的审查维度")
-    confidence: float = Field(description="置信度分数 0.0 ~ 1.0")
+    category: IssueCategory = Field(
+        description=(
+            "问题分类，必须是 bugs / security / performance / clean_code / "
+            "test_gap 之一"
+        )
+    )
+    confidence: float = Field(
+        description=(
+            "置信度分数 0.0 ~ 1.0。系统会丢弃 confidence < 0.6 的问题；"
+            "真实但证据只覆盖部分路径时给 0.6–0.7 并在 reasoning 中说明。"
+        )
+    )
     reasoning: str = Field(description="问题的原理解释与上下文背景")
     suggestion: str = Field(description="具体的修复或重构建议代码")
     line: Optional[int] = Field(
@@ -34,7 +75,10 @@ class PotentialIssueSchema(BaseModel):
     )
     evidence: Optional[str] = Field(
         default=None,
-        description="支撑该问题的原始代码片段，必须逐字来自 Patch 或 Context",
+        description=(
+            "支撑该问题的原始代码片段，必须逐字来自 Patch 或 Context；"
+            "只填代码本身，不要带左侧行号、`|` 或 `+/-` 前缀"
+        ),
     )
     suggested_patch: Optional[str] = Field(
         default=None,
@@ -58,6 +102,20 @@ class PotentialIssueSchema(BaseModel):
     @classmethod
     def _normalize_severity(cls, value: object) -> Severity:
         return normalize_severity(str(value))
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def _normalize_category(cls, value: object) -> str:
+        text = (
+            str(value or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        text = _CATEGORY_ALIASES.get(text, text)
+        # 未知分类收敛到 clean_code，避免一个拼写错误让整条结构化响应解析失败。
+        return text if text in _CATEGORY_VALUES else "clean_code"
 
 
 class AspectReviewOutputSchema(BaseModel):

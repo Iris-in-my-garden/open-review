@@ -66,6 +66,9 @@ class ReviewConfig:
     llm_cache_dir: Optional[str] = None
     llm_cache_mode: str = "auto"
 
+    # 调试产物目录；None 表示不写。它不影响 review 输出，因此不进 cache key。
+    debug_dir: Optional[str] = None
+
     cache_schema_version: int = REVIEW_CACHE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:

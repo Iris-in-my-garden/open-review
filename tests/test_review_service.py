@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -727,3 +728,81 @@ def test_review_cache_key_includes_output_affecting_config(tmp_path: Path):
     assert key_for(verify_severities=("high",)) != base
     assert key_for(max_workers=2) != base
     assert key_for(aspect_timeout=10.0) != base
+
+
+def test_debug_dir_is_not_part_of_review_cache_key(tmp_path: Path):
+    def key_for(debug_dir: str) -> str:
+        pipeline = ReviewPipeline(
+            mock_llm=True,
+            hybrid_retrieval_enabled=False,
+            verifier_enabled=False,
+            debug_dir=debug_dir,
+        )
+        try:
+            executor = pipeline._executor()
+            state = executor.new_state(
+                "https://github.com/org/repo/pull/1", tmp_path
+            )
+            state.pr_info = PullRequestInfo(
+                owner="org",
+                repo="repo",
+                pr_number=1,
+                title="PR",
+                body="",
+                base_branch="main",
+                head_branch="feature",
+                base_sha="base-sha",
+                head_sha="head-sha",
+                html_url="https://github.com/org/repo/pull/1",
+            )
+            return executor._cache_key(state)
+        finally:
+            pipeline.close()
+
+    assert key_for(str(tmp_path / "a")) == key_for(str(tmp_path / "b"))
+
+
+def test_pipeline_dumps_prompts_responses_and_finding_decisions(tmp_path: Path):
+    debug_dir = tmp_path / "debug"
+    pipeline = ReviewPipeline(
+        mock_llm=True,
+        max_batch_tokens=1,
+        debug_dir=str(debug_dir),
+    )
+    pipeline.gh_client = FakeGitHubClient()
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+
+    try:
+        pipeline.run(
+            "https://github.com/org/repo/pull/1", tmp_path / "reports"
+        )
+
+        # 两个文件各成一批：prompt / response / validation 都应有 2 份。
+        prompts = sorted((debug_dir / "prompts").glob("*.user.txt"))
+        assert len(prompts) == 2
+        assert "untrusted_input" in prompts[0].read_text(encoding="utf-8")
+
+        responses = sorted((debug_dir / "llm").glob("*.parsed.json"))
+        assert len(responses) == 2
+
+        validation = sorted((debug_dir / "validation").glob("*.json"))
+        assert len(validation) == 2
+        records = json.loads(validation[0].read_text(encoding="utf-8"))
+        assert records
+        assert {"status", "confidence_before", "confidence_after"} <= set(
+            records[0]
+        )
+
+        # verifier 至少处理了 high 问题。
+        verifier_files = sorted((debug_dir / "verifier").glob("*.json"))
+        assert verifier_files
+
+        state = json.loads(
+            (debug_dir / "state.json").read_text(encoding="utf-8")
+        )
+        assert len(state["batches"]) == 2
+        assert state["stats"]["validation"]["candidates"] >= 1
+        assert (debug_dir / "metrics.json").exists()
+    finally:
+        pipeline.close()

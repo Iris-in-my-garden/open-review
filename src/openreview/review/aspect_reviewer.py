@@ -75,12 +75,14 @@ class AspectReviewerWorker:
         aspect: str,
         prompt_builder: PromptBuilder,
         llm_client: AbstractLLMClient,
-        output_parser: OutputParser
+        output_parser: OutputParser,
+        debug_sink=None,
     ):
         self.aspect = aspect
         self.prompt_builder = prompt_builder
         self.llm_client = llm_client
         self.output_parser = output_parser
+        self.debug_sink = debug_sink
 
     def review_aspect(
         self,
@@ -97,11 +99,15 @@ class AspectReviewerWorker:
         aspect_schema = self.output_parser.schema_for_aspect(self.aspect)
 
         # 2. 调用 LLM 获得结构化审查数据
+        if self.debug_sink is not None:
+            self.debug_sink.record_prompt(self.aspect, system_prompt, user_prompt)
         raw_data = self.llm_client.generate_structured(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             response_schema=aspect_schema,
         )
+        if self.debug_sink is not None:
+            self.debug_sink.record_llm_response(self.aspect, raw_data)
         # 使用結構化模型封裝
         return AspectReviewTaskResult(aspect=self.aspect, data=raw_data)
 
@@ -121,6 +127,7 @@ class ReviewOrchestrator:
             max_workers: int = 4,
             aspect_timeout: float = 90.0,
             max_attempts: int = 2,
+            debug_sink=None,
     ):
         self.prompt_builder = prompt_builder or PromptBuilder()
         self.llm_client = llm_client or LLMClient()
@@ -128,6 +135,7 @@ class ReviewOrchestrator:
         self.validator = validator or FindingValidator()
         self.aspect_timeout = aspect_timeout
         self.max_attempts = max(1, max_attempts)
+        self.debug_sink = debug_sink
 
         # 定義支援的多維度審查清單
         self.aspects = aspects or ["clean_code", "bugs", "performance", "security"]
@@ -151,7 +159,8 @@ class ReviewOrchestrator:
                 aspect=aspect,
                 prompt_builder=self.prompt_builder,
                 llm_client=self.llm_client,
-                output_parser=self.output_parser
+                output_parser=self.output_parser,
+                debug_sink=self.debug_sink,
             )
             for aspect in selected_aspects
         ]

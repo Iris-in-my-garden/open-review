@@ -3,7 +3,7 @@ import logging
 import re
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
 from openreview.retriever import ast_utils
@@ -92,6 +92,7 @@ class FindingValidator:
         missing_evidence_penalty: float = 0.05,
         ungrounded_evidence_penalty: float = 0.20,
         grounded_evidence_bonus: float = 0.05,
+        debug_sink=None,
     ):
         self.min_confidence = min_confidence
         self.invalid_line_penalty = invalid_line_penalty
@@ -101,6 +102,7 @@ class FindingValidator:
         self.grounded_evidence_bonus = grounded_evidence_bonus
         # 最近一次 validate 的计数，供 pipeline 写入 metrics / 评测分析。
         self.last_stats: Dict[str, int] = {}
+        self.debug_sink = debug_sink
 
     def validate(
         self,
@@ -133,11 +135,33 @@ class FindingValidator:
         }
 
         filtered_issues: List[PotentialIssue] = []
+        records: List[Tuple[Dict[str, Any], PotentialIssue]] = []
         for issue in result.potential_issues:
+            original_confidence = issue.confidence
+            record: Dict[str, Any] = {
+                "file": issue.file,
+                "line": issue.line,
+                "end_line": issue.end_line,
+                "severity": issue.severity,
+                "category": issue.category,
+                "confidence_before": original_confidence,
+                "confidence_after": original_confidence,
+                "evidence": issue.evidence,
+                "context_refs": list(issue.context_refs),
+                "status": "kept",
+                "drop_reason": None,
+                "evidence_method": None,
+                "patch_valid": None,
+                "patch_error": None,
+            }
+            records.append((record, issue))
+
             file_diff = files_by_name.get(issue.file)
             # 规则 1: 防止文件路径幻觉（确保 Issue 指向的文件在 Diff 中存在）
             if file_diff is None:
                 stats["dropped_unknown_file"] += 1
+                record["status"] = "dropped"
+                record["drop_reason"] = "unknown_file"
                 continue
 
             # 规则 1.5: context_refs 只能引用本次实际注入的上下文。
@@ -172,6 +196,7 @@ class FindingValidator:
             grounding, method = self._check_evidence(
                 issue, file_diff, contexts, repo_path
             )
+            record["evidence_method"] = method
             if grounding is None:
                 confidence -= self.missing_evidence_penalty
                 stats["missing_evidence"] += 1
@@ -195,6 +220,8 @@ class FindingValidator:
             patch_valid, patch_error = self._check_suggested_patch(
                 issue, repo_path
             )
+            record["patch_valid"] = patch_valid
+            record["patch_error"] = patch_error
             if patch_valid is not None:
                 stats["patch_checked"] += 1
                 issue.suggested_patch_valid = patch_valid
@@ -205,12 +232,16 @@ class FindingValidator:
                     stats["patch_invalid"] += 1
 
             issue.confidence = round(max(0.0, min(1.0, confidence)), 2)
+            record["confidence_after"] = issue.confidence
             # 规则 4: 过滤低置信度
             if issue.confidence < self.min_confidence:
                 stats["low_confidence"] += 1
+                record["status"] = "dropped"
+                record["drop_reason"] = "low_confidence"
                 continue
 
             issue.severity = normalize_severity(issue.severity)
+            record["severity"] = issue.severity
             filtered_issues.append(issue)
 
         # 规则过滤会改变问题集合，风险等级 / 决策 / 证据必须同步重算，
@@ -220,6 +251,15 @@ class FindingValidator:
         filtered_issues = deduplicate_issues(filtered_issues)
         stats["deduplicated"] = before_dedupe - len(filtered_issues)
         stats["kept"] = len(filtered_issues)
+        kept_ids = {id(issue) for issue in filtered_issues}
+        for record, issue in records:
+            if record["status"] == "kept" and id(issue) not in kept_ids:
+                record["status"] = "deduplicated"
+                record["drop_reason"] = "deduplicated"
+        if self.debug_sink is not None:
+            self.debug_sink.record_validation(
+                [record for record, _ in records]
+            )
         self.last_stats = stats
         result.potential_issues = filtered_issues
         result.risk_level, result.risk_reason = assess_risk(filtered_issues)

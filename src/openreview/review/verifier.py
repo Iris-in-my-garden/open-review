@@ -105,11 +105,13 @@ class FindingVerifier:
         verify_severities: Sequence[str] = ("critical", "high"),
         min_verify_confidence: float = 0.6,
         min_finding_confidence: float = 0.6,
+        debug_sink=None,
     ):
         self.llm_client = llm_client
         self.batch_size = max(1, batch_size)
         self.max_attempts = max(1, max_attempts)
         self.verify_severities = set(verify_severities)
+        self.debug_sink = debug_sink
         self.min_verify_confidence = max(
             0.0, min(1.0, float(min_verify_confidence))
         )
@@ -244,6 +246,46 @@ class FindingVerifier:
                 stats.verified += 1
                 issue.confidence = round(min(1.0, issue.confidence + 0.05), 2)
             kept.append(issue)
+
+        if self.debug_sink is not None:
+            kept_ids = {id(issue) for issue in kept}
+            records: List[Dict[str, object]] = []
+            seen_ids = set()
+            for issue_id, issue in candidates:
+                seen_ids.add(id(issue))
+                decision = decisions.get(issue_id)
+                records.append(
+                    {
+                        "issue_id": issue_id,
+                        "file": issue.file,
+                        "line": issue.line,
+                        "severity": issue.severity,
+                        "verdict": (
+                            decision.verdict if decision else "not_checked"
+                        ),
+                        "confidence": (
+                            decision.confidence if decision else None
+                        ),
+                        "reason": decision.reason if decision else None,
+                        "kept": id(issue) in kept_ids,
+                    }
+                )
+            for issue in kept:
+                if id(issue) in seen_ids:
+                    continue
+                records.append(
+                    {
+                        "issue_id": None,
+                        "file": issue.file,
+                        "line": issue.line,
+                        "severity": issue.severity,
+                        "verdict": "not_applicable",
+                        "confidence": None,
+                        "reason": "severity not in verify_severities",
+                        "kept": True,
+                    }
+                )
+            self.debug_sink.record_verifier(records)
 
         result.potential_issues = kept
         result.risk_level, result.risk_reason = assess_risk(kept)

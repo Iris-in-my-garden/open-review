@@ -161,3 +161,31 @@ def test_context_ids_are_rendered_and_injected_next_to_matching_file():
     assert "src/other.py" in prompt
     # 同文件 context 必须出现在 patch 块和“其他文件”section 之间。
     assert prompt.index("Related context（同文件") < prompt.index("5. Retrieved Context Snippets")
+
+
+def test_output_constraints_cover_evidence_threshold_and_scope():
+    prompt = PromptBuilder().build_user_prompt(_pr(), _diff(), [])
+
+    # evidence 不能带 Patch 左侧的行号/`|` 前缀，否则 validator 无法精确匹配。
+    assert "不要包含左侧行号" in prompt
+    # 模型必须知道系统真实的置信度阈值。
+    assert "低于 0.6 会被直接丢弃" in prompt
+    # 范围同时覆盖本次改动和未改动代码中的历史问题，历史问题需显式标注。
+    assert "本次 diff 引入" in prompt
+    assert "未改动代码里的历史问题" in prompt
+    assert "历史问题，非本次改动引入" in prompt
+    assert "最多报告 8 个问题" in prompt
+    assert "`category` 必须是" in prompt
+
+
+def test_task_instruction_is_placed_before_output_constraints():
+    prompt = PromptBuilder().build_user_prompt(
+        _pr(),
+        _diff(),
+        [],
+        task_instruction="### 【任务】\n只关注安全问题。",
+    )
+
+    assert prompt.index("### 【任务】") < prompt.index("### 【输出约束】")
+    # 输出约束仍然是 prompt 的最后一段，模型最后读到的是格式要求。
+    assert prompt.rstrip().endswith("禁止编造不存在的 ID。")
