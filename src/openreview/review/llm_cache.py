@@ -11,8 +11,9 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 from pathlib import Path
-from typing import Literal, Optional, Type, TypeVar
+from typing import Dict, Literal, Optional, Type, TypeVar
 
 from filelock import FileLock
 from pydantic import BaseModel
@@ -38,6 +39,11 @@ class FileLLMCacheClient:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.hits = 0
         self.misses = 0
+        # 多维度 reviewer 会在线程池里并发调用同一个 wrapper；计数和
+        # “读 cache + 调 provider + 写 cache”都需要保护。
+        self._counter_lock = threading.Lock()
+        self._key_locks_lock = threading.Lock()
+        self._key_locks: Dict[str, threading.Lock] = {}
 
     @property
     def model(self) -> str:
@@ -61,23 +67,54 @@ class FileLLMCacheClient:
         key = self._key(system_prompt, user_prompt, response_schema)
         path = self._path(key)
 
+        # 快速路径：缓存已存在时不需要拿 per-key 锁。
         if self.mode != "record" and path.exists():
             cached = self._load(path, response_schema)
             if cached is not None:
-                self.hits += 1
+                self._record_hit()
                 return cached
 
         if self.mode == "replay":
+            self._record_miss()
             raise LLMCacheMiss(f"No recorded LLM response for key {key}")
 
-        self.misses += 1
-        result = self.inner.generate_structured(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            response_schema=response_schema,
-        )
-        self._save(path, result)
-        return result
+        # 同一个 prompt 的并发调用只允许一个线程走到 provider；其他线程
+        # 等它写回 cache 后直接复用结果。不同 key 仍然可以并行。
+        with self._lock_for_key(key):
+            if self.mode != "record" and path.exists():
+                cached = self._load(path, response_schema)
+                if cached is not None:
+                    self._record_hit()
+                    return cached
+
+            if self.mode == "replay":
+                self._record_miss()
+                raise LLMCacheMiss(f"No recorded LLM response for key {key}")
+
+            self._record_miss()
+            result = self.inner.generate_structured(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                response_schema=response_schema,
+            )
+            self._save(path, result)
+            return result
+
+    def _lock_for_key(self, key: str) -> threading.Lock:
+        with self._key_locks_lock:
+            lock = self._key_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._key_locks[key] = lock
+            return lock
+
+    def _record_hit(self) -> None:
+        with self._counter_lock:
+            self.hits += 1
+
+    def _record_miss(self) -> None:
+        with self._counter_lock:
+            self.misses += 1
 
     def _key(
         self, system_prompt: str, user_prompt: str, response_schema: Type[BaseModel]

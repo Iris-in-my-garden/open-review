@@ -214,6 +214,10 @@ with ReviewPipeline(mock_llm=True) as pipeline:
 （`keep_worktrees=True` 可保留用于排查）。本地模式不会执行 GitHub 写操作，
 `post_comments` 不生效。
 
+`pipeline.last_outcome` 会给出本次运行的结构化状态：`completed` / `skipped` /
+`partial` / `failed`。部分 batch 失败或预算耗尽时仍会生成报告，但状态为
+`partial`，CLI 以非零退出码返回，评测结果也不会把它当成完整成功。
+
 报告默认写入 `reports/<owner>_<repo>_pr_<number>_review.md`，可用 `--output` 指定目录。
 
 `--post-comment` 只发表 `COMMENT` 类型的 Review，不会替用户 `APPROVE` 或 `REQUEST_CHANGES`，避免在 CI 中越权；需要审批动作时请由人工完成。
@@ -236,9 +240,10 @@ src/openreview/
 │   ├── graph.py                 # import/call graph 扩展（caller/callee/依赖）
 │   └── query.py                 # 从 Diff 构造检索查询
 ├── review/
+│   ├── config.py              # ReviewConfig：配置校验 + cache key 指纹
 │   ├── prompt_builder.py      # 带行号 Patch、不可信数据包裹、token 预算
 │   ├── token_budget.py        # token 估算 / 截断 / 大 PR 分批
-│   ├── workflow.py            # 有界工作流、ReviewBudget、trace
+│   ├── workflow.py            # 有界工作流、ReviewBudget、ReviewOutcome、trace
 │   ├── triage.py              # 规则 triage（docs-only / test-only）
 │   ├── impact.py              # 跨文件符号引用分析
 │   ├── static_analysis.py     # ruff/mypy 证据源（默认关闭）
@@ -254,7 +259,9 @@ src/openreview/
 │   ├── comment_builder.py     # GitHub Review body / 行内评论构造
 │   ├── report_writer.py       # Markdown / JSON / Run Metrics 渲染
 │   └── llm_client.py          # 真实 / Mock LLM 客户端（含 token usage）
-└── services/review_service.py # 有界工作流装配与节点实现
+└── services/
+    ├── review_service.py      # ReviewPipeline：组件构造 / 生命周期 facade
+    └── review_executor.py     # 有界工作流节点实现与 metrics
 ```
 
 ## 设计取舍

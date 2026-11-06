@@ -3,6 +3,7 @@ from pathlib import Path
 
 from evaluation.results import build_result_payload, run_reviews, write_result
 from openreview.review.report_writer import PotentialIssue, ReviewResult
+from openreview.review.workflow import ReviewOutcome, ReviewStatus
 
 
 def _instance() -> dict:
@@ -108,3 +109,38 @@ def test_run_reviews_writes_summary_and_result(tmp_path: Path, monkeypatch):
     assert (tmp_path / "results" / "summary_openreview.json").exists()
     assert pipeline.calls[0][1]["owner"] == "owner"
     assert pipeline.calls[0][1]["repo"] == "repo"
+
+
+class _PartialPipeline(_FakePipeline):
+    def __init__(self, result: ReviewResult):
+        super().__init__(result)
+        self.last_outcome = ReviewOutcome(
+            status=ReviewStatus.PARTIAL,
+            failed_batches=1,
+            total_batches=2,
+            degraded_reasons=["batch 2/2 审查失败"],
+        )
+
+
+def test_run_reviews_does_not_report_partial_as_ok(tmp_path: Path, monkeypatch):
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    monkeypatch.setattr(
+        "evaluation.repos.ensure_repo", lambda *args, **kwargs: repo_path
+    )
+    pipeline = _PartialPipeline(_result())
+
+    rows = run_reviews(
+        [_instance()],
+        repo_cache=tmp_path / "cache",
+        results_dir=tmp_path / "results",
+        pipeline=pipeline,
+    )
+
+    assert rows[0]["status"] == "partial"
+    payload = json.loads(
+        (tmp_path / "results" / "owner__repo@abc1234.json").read_text()
+    )
+    assert payload["status"] == "partial"
+    assert payload["degraded_reasons"] == ["batch 2/2 审查失败"]
+    assert payload["outcome"]["status"] == "partial"

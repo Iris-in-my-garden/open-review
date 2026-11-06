@@ -11,6 +11,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
@@ -26,6 +27,51 @@ if TYPE_CHECKING:
 
 class BudgetExceeded(RuntimeError):
     """LLM 调用或 token 预算不足时抛出。"""
+
+
+class ReviewStatus(str, Enum):
+    """一次 review 的最终状态。
+
+    ``PARTIAL`` 是本次重构新增的：过去只要有一个 batch 成功就会生成报告，
+    调用方无法区分“完整成功”和“部分 batch 失败 / 预算耗尽”。显式状态让
+    CLI 和评测不会把降级结果当成完全成功。
+    """
+
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+    PARTIAL = "partial"
+    FAILED = "failed"
+
+
+@dataclass
+class ReviewOutcome:
+    status: ReviewStatus = ReviewStatus.COMPLETED
+    report_path: Optional[Path] = None
+    failed_batches: int = 0
+    total_batches: int = 0
+    budget_exhausted: bool = False
+    degraded_reasons: List[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.status in {ReviewStatus.COMPLETED, ReviewStatus.SKIPPED}
+
+    @property
+    def exit_code(self) -> int:
+        if self.status == ReviewStatus.FAILED:
+            return 1
+        if self.status == ReviewStatus.PARTIAL:
+            return 2
+        return 0
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "status": self.status.value,
+            "failed_batches": self.failed_batches,
+            "total_batches": self.total_batches,
+            "budget_exhausted": self.budget_exhausted,
+            "degraded_reasons": list(self.degraded_reasons),
+        }
 
 
 @dataclass
@@ -185,6 +231,12 @@ class ReviewState:
     skipped_llm: bool = False
     triage_reason: str = ""
 
+    # 降级信息：单批失败、预算耗尽等。outcome 在 workflow 结束时生成。
+    failed_batches: int = 0
+    budget_exhausted: bool = False
+    degraded_reasons: List[str] = field(default_factory=list)
+    outcome: Optional[ReviewOutcome] = None
+
     impact_findings: List[str] = field(default_factory=list)
     static_findings: List[str] = field(default_factory=list)
     impact_count: int = 0
@@ -207,6 +259,12 @@ class ReviewState:
     def add_note(self, note: str) -> None:
         if note and note not in self.notes:
             self.notes.append(note)
+
+    def degrade(self, reason: str) -> None:
+        """记录一个“本次结果不完整”的原因，同时保留在 review notes 里。"""
+        self.add_note(reason)
+        if reason and reason not in self.degraded_reasons:
+            self.degraded_reasons.append(reason)
 
     def trace_node(self, node: str, elapsed_ms: float, status: str = "ok", detail: str = "") -> None:
         self.trace.append(

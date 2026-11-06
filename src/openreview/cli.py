@@ -7,6 +7,7 @@ import typer
 
 from openreview.repo.manager import RepoCommandError
 from openreview.review.report_writer import ReportWriter
+from openreview.review.workflow import ReviewStatus
 from openreview.services.review_service import ReviewPipeline
 
 # 创建应用对象
@@ -213,6 +214,25 @@ def review(
                 raise RuntimeError("Review finished without a result to export.")
             json_path = ReportWriter.write_json(pipeline.last_result, json_out)
 
+        outcome = pipeline.last_outcome
+        if outcome is not None and outcome.status == ReviewStatus.PARTIAL:
+            # 有批次失败 / 预算耗尽时仍会生成报告，但不能伪装成完整成功。
+            typer.secho(
+                "\n⚠️  Review finished with partial results. "
+                f"Report saved to:\n{report_path.resolve()}",
+                fg=typer.colors.YELLOW,
+                bold=True,
+                err=True,
+            )
+            for reason in outcome.degraded_reasons:
+                typer.secho(f"  - {reason}", fg=typer.colors.YELLOW, err=True)
+            if json_path is not None:
+                typer.secho(
+                    f"Structured result saved to: {json_path.resolve()}",
+                    fg=typer.colors.YELLOW,
+                )
+            raise typer.Exit(code=outcome.exit_code)
+
         typer.secho(
             f"\n✨ Review completed successfully! Report saved to:\n{report_path.resolve()}",
             fg=typer.colors.GREEN,
@@ -224,6 +244,8 @@ def review(
                 fg=typer.colors.GREEN,
             )
 
+    except typer.Exit:
+        raise
     except RepoCommandError as e:
         typer.secho(
             f"\n❌ Git Command Error: {e.stderr}", fg=typer.colors.RED, err=True

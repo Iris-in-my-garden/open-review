@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from openreview.review.report_writer import PotentialIssue, ReviewResult
+from openreview.review.workflow import ReviewStatus
 
 REVIEWER_NAME = "openreview"
 
@@ -79,6 +80,8 @@ def build_result_payload(
     started_at: Optional[str] = None,
     status: str = "ok",
     error: Optional[str] = None,
+    degraded_reasons: Optional[List[str]] = None,
+    outcome: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     input_tokens, output_tokens = _token_counts(result)
     comments = [issue_comment(issue) for issue in result.potential_issues]
@@ -115,6 +118,10 @@ def build_result_payload(
     }
     if error:
         payload["error"] = error
+    if degraded_reasons:
+        payload["degraded_reasons"] = list(degraded_reasons)
+    if outcome is not None:
+        payload["outcome"] = outcome
     return payload
 
 
@@ -204,11 +211,36 @@ def run_reviews(
             )
             if pipeline.last_result is None:
                 raise RuntimeError("run_local 结束但没有 last_result")
+            outcome = getattr(pipeline, "last_outcome", None)
+            status = "ok"
+            error = None
+            degraded_reasons: List[str] = []
+            if outcome is not None:
+                degraded_reasons = list(
+                    getattr(outcome, "degraded_reasons", []) or []
+                )
+                if outcome.status == ReviewStatus.PARTIAL:
+                    status = "partial"
+                    error = "; ".join(degraded_reasons) or (
+                        "review finished with partial results"
+                    )
+                elif outcome.status == ReviewStatus.FAILED:
+                    status = "error"
+                    error = "; ".join(degraded_reasons) or "review failed"
             payload = build_result_payload(
                 instance,
                 pipeline.last_result,
                 duration_seconds=time.monotonic() - started,
                 started_at=started_at,
+                status=status,
+                error=error,
+                degraded_reasons=degraded_reasons,
+                outcome=(
+                    outcome.as_dict()
+                    if outcome is not None
+                    and hasattr(outcome, "as_dict")
+                    else None
+                ),
             )
         except Exception as error:  # noqa: BLE001 - 单条失败不应中断整个评测集
             payload = {

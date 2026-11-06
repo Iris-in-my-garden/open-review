@@ -7,6 +7,7 @@ from openreview.retriever.code_context import CodeContext
 from openreview.review.aspect_reviewer import ReviewOrchestrator
 from openreview.review.report_writer import PotentialIssue, ReviewResult
 from openreview.review.single_shot import SingleShotReviewer
+from openreview.review.workflow import ReviewStatus
 from openreview.services.review_service import ReviewPipeline
 
 
@@ -338,6 +339,11 @@ def test_pipeline_degrades_gracefully_when_call_budget_runs_out(tmp_path: Path):
     # 第一个批次用 2 个维度的预算跑完，第二个批次因预算耗尽被跳过
     assert len(pipeline.reviewer.calls) == 1
     assert "预算" in content
+    assert pipeline.last_outcome is not None
+    assert pipeline.last_outcome.status == ReviewStatus.PARTIAL
+    assert pipeline.last_outcome.budget_exhausted is True
+    assert pipeline.last_result is not None
+    assert pipeline.last_result.metrics["outcome"]["status"] == "partial"
 
 
 def test_pipeline_review_cache_skips_second_run(tmp_path: Path):
@@ -622,6 +628,12 @@ def test_pipeline_isolates_batch_failure_and_keeps_successful_batches(
         assert any(
             "批次 1/2 审查失败" in note for note in pipeline.last_state.notes
         )
+        assert pipeline.last_outcome is not None
+        assert pipeline.last_outcome.status == ReviewStatus.PARTIAL
+        assert pipeline.last_outcome.failed_batches == 1
+        assert pipeline.last_outcome.total_batches == 2
+        assert pipeline.last_result.metrics["outcome"]["status"] == "partial"
+        assert pipeline.last_result.metrics["failed_batches"] == 1
     finally:
         pipeline.close()
 
@@ -644,5 +656,74 @@ def test_pipeline_raises_when_every_batch_fails(tmp_path: Path):
             )
         # 单个批次失败不会中断循环，所有批次都被尝试过。
         assert len(pipeline.reviewer.calls) == 2
+        assert pipeline.last_outcome is not None
+        assert pipeline.last_outcome.status == ReviewStatus.FAILED
+        assert pipeline.last_outcome.failed_batches == 2
     finally:
         pipeline.close()
+
+
+def test_partial_review_is_not_written_to_review_cache(tmp_path: Path):
+    pipeline = ReviewPipeline(
+        mock_llm=True,
+        max_batch_tokens=1,
+        verifier_enabled=False,
+        review_cache_enabled=True,
+        review_cache_dir=str(tmp_path / "cache"),
+    )
+    pipeline.gh_client = FakeGitHubClient()
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+    pipeline.reviewer = FlakyReviewer()
+
+    try:
+        pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+        assert pipeline.last_outcome is not None
+        assert pipeline.last_outcome.status == ReviewStatus.PARTIAL
+        assert len(pipeline.reviewer.calls) == 2
+
+        # PARTIAL 结果不能写 cache，否则下一次 run 会误命中并伪装成完整成功。
+        pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+        assert len(pipeline.reviewer.calls) == 4
+    finally:
+        pipeline.close()
+
+
+def test_review_cache_key_includes_output_affecting_config(tmp_path: Path):
+    def key_for(**kwargs) -> str:
+        pipeline = ReviewPipeline(
+            mock_llm=True,
+            hybrid_retrieval_enabled=False,
+            verifier_enabled=False,
+            **kwargs,
+        )
+        try:
+            executor = pipeline._executor()
+            state = executor.new_state(
+                "https://github.com/org/repo/pull/1", tmp_path
+            )
+            state.pr_info = PullRequestInfo(
+                owner="org",
+                repo="repo",
+                pr_number=1,
+                title="PR",
+                body="",
+                base_branch="main",
+                head_branch="feature",
+                base_sha="base-sha",
+                head_sha="head-sha",
+                html_url="https://github.com/org/repo/pull/1",
+            )
+            return executor._cache_key(state)
+        finally:
+            pipeline.close()
+
+    base = key_for()
+    # 以下配置都会改变 prompt / batching / 后处理结果，必须进入 cache key。
+    assert key_for(max_batch_tokens=1) != base
+    assert key_for(max_patch_tokens=100) != base
+    assert key_for(max_context_tokens=100) != base
+    assert key_for(static_tools=("ruff", "mypy")) != base
+    assert key_for(verify_severities=("high",)) != base
+    assert key_for(max_workers=2) != base
+    assert key_for(aspect_timeout=10.0) != base

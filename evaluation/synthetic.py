@@ -26,6 +26,7 @@ from evaluation.baseline import build_baseline_pipeline
 from evaluation.results import issue_comment, safe_id
 from openreview.review.report_writer import PotentialIssue, ReviewResult
 from openreview.review.token_budget import estimate_tokens
+from openreview.review.workflow import ReviewStatus
 from openreview.services.review_service import ReviewPipeline
 
 LINE_TOLERANCE = 2
@@ -697,6 +698,23 @@ def run_synthetic_benchmark(
                     pipeline.last_result,
                     duration_seconds=time.monotonic() - started,
                 )
+                outcome = getattr(pipeline, "last_outcome", None)
+                if outcome is not None and not outcome.ok:
+                    # 部分批次失败 / 预算耗尽的结果仍可用于归因，但不能算作
+                    # 完整成功，否则 summary 的 cases_ok 会虚高。
+                    row["status"] = (
+                        "partial"
+                        if outcome.status == ReviewStatus.PARTIAL
+                        else "error"
+                    )
+                    row["degraded_reasons"] = list(
+                        getattr(outcome, "degraded_reasons", []) or []
+                    )
+                    row["outcome"] = (
+                        outcome.as_dict()
+                        if hasattr(outcome, "as_dict")
+                        else None
+                    )
             except Exception as error:  # noqa: BLE001 - 单 case 失败不应中断整批
                 row = {
                     "case_id": case.case_id,

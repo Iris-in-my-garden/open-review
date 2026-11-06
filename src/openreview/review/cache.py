@@ -13,6 +13,7 @@ from typing import Optional
 from filelock import FileLock
 
 from openreview.repo.manager import default_cache_dir
+from openreview.review.config import REVIEW_CACHE_SCHEMA_VERSION
 from openreview.review.report_writer import ReviewResult
 
 logger = logging.getLogger(__name__)
@@ -54,8 +55,17 @@ class ReviewCache:
             return None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            return ReviewResult.model_validate(payload)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            if not isinstance(payload, dict):
+                return None
+            if payload.get("schema_version") != REVIEW_CACHE_SCHEMA_VERSION:
+                # 旧缓存（或未来版本）可能由不完整的 cache key 生成，
+                # 直接当 miss 处理，避免把错误结果复用到新配置上。
+                logger.info(
+                    "Ignoring review cache with incompatible schema: %s", path
+                )
+                return None
+            return ReviewResult.model_validate(payload["result"])
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             logger.warning("Ignoring corrupt review cache %s: %s", path, exc)
             return None
 
@@ -71,7 +81,14 @@ class ReviewCache:
             )
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    json.dump(result.model_dump(mode="json"), handle, ensure_ascii=False)
+                    json.dump(
+                        {
+                            "schema_version": REVIEW_CACHE_SCHEMA_VERSION,
+                            "result": result.model_dump(mode="json"),
+                        },
+                        handle,
+                        ensure_ascii=False,
+                    )
                 os.replace(tmp_name, path)
             finally:
                 if os.path.exists(tmp_name):
