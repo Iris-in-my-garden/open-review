@@ -48,3 +48,4 @@ dist/
 evaluation/.cache/
 evaluation/results/
 evaluation/metrics/
+/reports/debug/

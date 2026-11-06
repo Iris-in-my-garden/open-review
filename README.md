@@ -136,60 +136,60 @@ openreview review https://github.com/encode/httpx/pull/1055 --mock_llm
 # 真实审查
 export OPENAI_API_KEY=sk-...
 export GITHUB_TOKEN=ghp_...
-openreview review https://github.com/owner/repo/pull/123
+openreview review https://github.com/microsoft/typescript-go/pull/1354
 
 # 指定模型 / 兼容网关
-openreview review https://github.com/owner/repo/pull/123 \
+openreview review https://github.com/microsoft/typescript-go/pull/1354 \
   --model gpt-4.1-mini \
   --base-url https://your-gateway.example.com/v1
 
 # 真实审查时对瞬时失败（超时、429、5xx）开启重试
-openreview review https://github.com/owner/repo/pull/123 --llm-max-retries 2
+openreview review https://github.com/microsoft/typescript-go/pull/1354 --llm-max-retries 2
 
 # 把问题作为 GitHub 行内评论发回 PR（默认 event=COMMENT，不会自动 approve）
-openreview review https://github.com/owner/repo/pull/123 --post-comment
+openreview review https://github.com/microsoft/typescript-go/pull/1354 --post-comment
 
 # 大 PR：调小单批 token 预算
-openreview review https://github.com/owner/repo/pull/123 \
+openreview review https://github.com/microsoft/typescript-go/pull/1354 \
   --max-batch-tokens 40000
 
 # 高召回模式：切回四维度并行（默认 single，token 消耗更高）
-openreview review https://github.com/owner/repo/pull/123 \
+openreview review https://github.com/microsoft/typescript-go/pull/1354 \
   --reviewer-mode multi_aspect \
   --max-workers 2
 
 # 检索消融：AST-only / +FTS / +graph
-openreview review https://github.com/owner/repo/pull/123 --no-hybrid-retrieval
-openreview review https://github.com/owner/repo/pull/123 --no-graph-retrieval
+openreview review https://github.com/microsoft/typescript-go/pull/1354 --no-hybrid-retrieval
+openreview review https://github.com/microsoft/typescript-go/pull/1354 --no-graph-retrieval
 
 # 用量控制：禁用 triage / 关闭 verifier / 设置硬预算
-openreview review https://github.com/owner/repo/pull/123 \
+openreview review https://github.com/microsoft/typescript-go/pull/1354 \
   --no-triage \
   --no-verifier \
   --budget-calls 8 \
   --budget-seconds 120
 
 # 静态分析作为证据源（默认关闭；会在本地执行 ruff/mypy）
-openreview review https://github.com/owner/repo/pull/123 \
+openreview https://github.com/microsoft/typescript-go/pull/1354 \
   --static-analysis \
   --static-tools ruff
 
 # 复用同一 PR head 的 review 结果；LLM 响应可录制后离线回放
-openreview review https://github.com/owner/repo/pull/123 \
+openreview review https://github.com/microsoft/typescript-go/pull/1354 \
   --cache-review \
   --llm-cache-dir .cache/llm \
   --llm-cache-mode record
 
 # 同时导出机器可读结果（含 source_aspects / Run Metrics），供评测脚本消费
-openreview review https://github.com/owner/repo/pull/123 \
+openreview review https://github.com/microsoft/typescript-go/pull/1354 \
   --json-out reports/result.json
 
 # 导出调试中间结果：prompt、LLM 解析结果、逐条 validator/verifier 决策
-openreview review https://github.com/owner/repo/pull/123 --mock_llm \
+openreview review https://github.com/microsoft/typescript-go/pull/1354 --mock_llm \
   --dump-intermediates reports/debug/run-001
 
 # 打开 debug 日志（阶段耗时、检索数量、重试等）
-openreview review https://github.com/owner/repo/pull/123 --verbose
+openreview review https://github.com/microsoft/typescript-go/pull/1354 --verbose
 ```
 
 `--dump-intermediates` 的产物结构：
