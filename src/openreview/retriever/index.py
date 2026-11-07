@@ -802,6 +802,8 @@ def _git_head(repo_path: Path) -> Optional[str]:
             ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
             check=False,
         )

@@ -224,6 +224,8 @@ class TreeSitterLocalRetriever:
                 ["git", "-C", str(repo_path), "ls-files"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
         except FileNotFoundError as exc:
@@ -375,6 +377,8 @@ class TreeSitterLocalRetriever:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
                 timeout=GIT_GREP_TIMEOUT_SECONDS,
             )

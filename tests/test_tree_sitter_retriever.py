@@ -92,6 +92,35 @@ def test_reference_is_not_misclassified_as_definition(sample_repo: Path):
     assert by_reason[reference_reasons[0]].score == SCORE_REFERENCE
 
 
+def test_git_grep_tolerates_non_utf8_source(tmp_path: Path):
+    """git grep 输出里混入非 UTF-8 字节时，检索不能把整次 review 挂掉。"""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "mod.py").write_bytes(
+        b"def target(x):\n"
+        b"    return x\n"
+        b"\n"
+        b"def caller():\n"
+        b'    return target("\xf0\x28\x8c\x28")\n'
+    )
+    _init_repo(tmp_path)
+
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="pkg/mod.py",
+                status="modified",
+                changed_symbols=["target"],
+                changed_lines=[1],
+            )
+        ]
+    )
+
+    contexts = TreeSitterLocalRetriever().retrieve(tmp_path, diff)
+
+    assert contexts
+
+
 def test_linked_test_file_is_retrieved(sample_repo: Path):
     diff = ParsedDiff(
         files=[

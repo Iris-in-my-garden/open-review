@@ -358,6 +358,8 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
         ["git", "-C", str(repo), *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
         check=False,
     )
@@ -400,6 +402,8 @@ def materialize_case(case: SyntheticCase, root: Path) -> MaterializedCase:
         ["git", "init", "-q", str(repo)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
         check=True,
     )
