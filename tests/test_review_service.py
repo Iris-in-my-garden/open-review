@@ -8,6 +8,11 @@ from openreview.retriever.code_context import CodeContext
 from openreview.review.aspect_reviewer import ReviewOrchestrator
 from openreview.review.report_writer import PotentialIssue, ReviewResult
 from openreview.review.single_shot import SingleShotReviewer
+from openreview.review.token_budget import (
+    DEFAULT_HARD_PROMPT_TOKENS,
+    DEFAULT_SOFT_PROMPT_TOKENS,
+    context_reserve_tokens_for,
+)
 from openreview.review.workflow import ReviewStatus
 from openreview.services.review_service import ReviewPipeline
 
@@ -724,10 +729,26 @@ def test_review_cache_key_includes_output_affecting_config(tmp_path: Path):
     assert key_for(max_batch_tokens=1) != base
     assert key_for(max_patch_tokens=100) != base
     assert key_for(max_context_tokens=100) != base
+    assert key_for(soft_prompt_tokens=9_000) != base
+    assert key_for(hard_prompt_tokens=15_000) != base
     assert key_for(static_tools=("ruff", "mypy")) != base
     assert key_for(verify_severities=("high",)) != base
     assert key_for(max_workers=2) != base
     assert key_for(aspect_timeout=10.0) != base
+
+
+def test_pipeline_derives_effective_prompt_caps_internally():
+    pipeline = ReviewPipeline(mock_llm=True)
+    try:
+        # 外部传入的 max_patch/context 只是硬上限；真正的预算由内部策略决定。
+        assert pipeline.config.max_patch_tokens == DEFAULT_HARD_PROMPT_TOKENS
+        assert pipeline.config.max_context_tokens == context_reserve_tokens_for(
+            DEFAULT_SOFT_PROMPT_TOKENS
+        )
+        assert pipeline.config.soft_prompt_tokens == DEFAULT_SOFT_PROMPT_TOKENS
+        assert pipeline.config.hard_prompt_tokens == DEFAULT_HARD_PROMPT_TOKENS
+    finally:
+        pipeline.close()
 
 
 def test_debug_dir_is_not_part_of_review_cache_key(tmp_path: Path):

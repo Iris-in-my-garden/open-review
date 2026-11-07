@@ -149,7 +149,8 @@ openreview review https://github.com/microsoft/typescript-go/pull/1354 --llm-max
 # 把问题作为 GitHub 行内评论发回 PR（默认 event=COMMENT，不会自动 approve）
 openreview review https://github.com/microsoft/typescript-go/pull/1354 --post-comment
 
-# 大 PR：调小单批 token 预算
+# 大 PR 默认会按内部 prompt 预算自动拆分；如需进一步压低单批上限，
+# 可用 --max-batch-tokens（高级逃生阀，不是质量调参项）
 openreview review https://github.com/microsoft/typescript-go/pull/1354 \
   --max-batch-tokens 40000
 
@@ -316,9 +317,12 @@ validator 做的是确定性校验：文件是否存在、行号是否在 diff �
 模型自报的 confidence 很容易“看起来很自信”。这里用 evidence grounding 做二次校准：证据能在真实代码中定位则加分，找不到则显著减分，低于阈值直接丢弃。这样“自信但编造”的问题会被过滤掉。
 
 **大 PR 会不会塞爆上下文？**
-会。所以有两层控制：
-1. `split_parsed_diff` 按文件 patch 的估算 token 贪心分批，单文件超预算时独占一批
-2. `PromptBuilder` 再按 `max_patch_tokens` / `max_context_tokens` 截断，并优先保留源码、其次测试、最后配置/文档
+会。所以有三层控制：
+1. **内部 prompt 预算策略**（不暴露 CLI）：总 prompt 没超过 hard cap 时不拆分，保留完整上下文；超过后才按 soft target 把内容尽量装满每个 bin，避免无谓地拆成很多小调用。
+2. **文件过大时按 hunk / enclosing symbol 切片**：优先把同一函数的 hunk 放在一起；只有单个 hunk 仍超预算时才截断。
+3. `PromptBuilder` 仍保留 `max_patch_tokens` / `max_context_tokens` 作为最后的安全上限，并优先保留源码、其次测试、最后配置/文档。
+
+默认策略是 `soft=10k / hard=14k`：先扣掉约 2k 的固定 prompt 开销和 2.5k 的 context 预留，patch 的 soft/hard 预算约为 5.5k / 9.5k。`--max-batch-tokens` 现在只是外部硬上限（可以让 batch 更小），不再是主要的“质量旋钮”。
 
 **仓库缓存如何避免重复 clone / 并发踩踏？**
 仓库按 `owner__repo` 缓存在平台目录；同一仓库的 clone/fetch/checkout 由 `FileLock` 串行化，不同仓库仍可并行。首次 clone 使用 `--filter=blob:none` 的 blobless partial clone，只拉取提交和树对象，需要时再按需下载 blob；如果服务端不支持 filter，会自动回退到普通 clone。缓存超过上限时按目录 mtime 淘汰较旧的仓库。
@@ -488,7 +492,7 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 - call graph 是 best-effort：Python 用 `ast` 抽取，Go 调用边暂不默认启用，不做完整类型解析
 - patch/context 的 token 数仍是保守估算（1 token ≈ 3 字符），用于预算与截断；真实用量单独记录
 - 行内评论只能落在 diff 可见行；不在 diff 内的问题会退化为文件级描述
-- 单文件极大时会在 Prompt 层截断，可能漏掉文件后半部分的问题
+- 单文件极大时会先按 hunk / symbol 切片；只有单个 hunk 仍超预算时才截断，可能漏掉该 hunk 后半部分的问题
 - 单遍审查的 findings 受单次输出 token 限制；大 PR 会按 batch 拆分，但单个 batch 仍可能截断
 - 静态分析默认关闭，且只覆盖 Python；开启时会在本地执行 ruff/mypy
 - `--mock_llm` 仅验证流程与报告格式，不代表审查质量；仓库中的示例报告也是 mock 演示输出，不应作为真实漏洞发现或评测结果

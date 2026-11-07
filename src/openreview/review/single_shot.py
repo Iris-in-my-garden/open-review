@@ -1,8 +1,8 @@
 """单遍审查（single-pass）实现。
 
 默认生产路径使用一次结构化 LLM 调用覆盖四类风险；大 PR 仍由
-``split_parsed_diff`` 按 token 预算拆成多个 batch，因此“single-shot”指
-每个 batch 一次调用，而不是整个 PR 只调用一次。
+``plan_review_batches`` 按内部 prompt 预算拆成多个 batch，因此
+“single-shot”指每个 batch 一次调用，而不是整个 PR 只调用一次。
 
 多维度并行审查保留在 ``aspect_reviewer.py``，作为高召回模式和消融配置。
 """

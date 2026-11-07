@@ -68,7 +68,10 @@ def review(
     max_batch_tokens: int = typer.Option(
         60000,
         "--max-batch-tokens",
-        help="Max estimated patch tokens per review batch (0 disables batching)",
+        help=(
+            "Optional extra upper bound on estimated patch tokens per batch; "
+            "0 removes this cap, but the internal prompt budget still applies"
+        ),
     ),
     reviewer_mode: str = typer.Option(
         "single",

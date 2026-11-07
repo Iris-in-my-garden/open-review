@@ -37,7 +37,11 @@ from openreview.review.comment_builder import (
 )
 from openreview.review.config import ReviewConfig
 from openreview.review.report_writer import ReportWriter, ReviewResult
-from openreview.review.token_budget import estimate_tokens, split_parsed_diff
+from openreview.review.token_budget import (
+    context_reserve_tokens_for,
+    estimate_tokens,
+    plan_review_batches,
+)
 from openreview.review.triage import (
     ALL_ASPECTS,
     TriageDecision,
@@ -351,8 +355,14 @@ class ReviewExecutor:
         ):
             raise RuntimeError("Repository or parsed diff is missing.")
 
-        batches = split_parsed_diff(
-            state.parsed_diff, self.config.max_batch_tokens
+        batches = plan_review_batches(
+            state.parsed_diff,
+            soft_prompt_tokens=self.config.soft_prompt_tokens,
+            hard_prompt_tokens=self.config.hard_prompt_tokens,
+            max_batch_tokens=self.config.max_batch_tokens,
+            context_reserve_tokens=context_reserve_tokens_for(
+                self.config.soft_prompt_tokens
+            ),
         )
         state.batches = batches
         self._log(

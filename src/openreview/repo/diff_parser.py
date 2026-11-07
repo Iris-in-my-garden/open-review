@@ -1,6 +1,6 @@
 import re
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional, Sequence, Set
 
 from pydantic import BaseModel, Field
 
@@ -293,6 +293,96 @@ class DiffParser:
                 seen.add(line)
                 unique_lines.append(line)
         return unique_lines
+
+    @staticmethod
+    def split_patch_into_hunks(patch: Optional[str]) -> List[str]:
+        """把 patch 按 ``@@`` header 切成独立 hunk。
+
+        返回的每个元素都包含自己的 hunk header 和行内容；第一个 hunk 会
+        吸收 header 之前可能存在的 diff 元信息，避免丢失内容。
+        """
+        if not patch:
+            return []
+
+        hunks: List[str] = []
+        current: List[str] = []
+        preamble: List[str] = []
+        seen_hunk = False
+
+        for line in patch.splitlines(keepends=True):
+            if line.startswith("@@"):
+                if current:
+                    hunks.append("".join(current))
+                current = [line]
+                seen_hunk = True
+            elif seen_hunk:
+                current.append(line)
+            else:
+                preamble.append(line)
+
+        if current:
+            hunks.append("".join(current))
+        if preamble:
+            if hunks:
+                hunks[0] = "".join(preamble) + hunks[0]
+            else:
+                hunks.append("".join(preamble))
+        return hunks
+
+    @classmethod
+    def with_patch(
+        cls,
+        file: ParsedChangedFile,
+        patch: str,
+    ) -> ParsedChangedFile:
+        """用新的 patch 重建文件，并重新计算所有行号/符号元数据。
+
+        hunk 切片和同批次合并都通过这里重建，保证 ``changed_lines`` /
+        ``visible_lines`` 与 patch 内容一致；下游 reviewer / validator 仍然
+        只看到 ``ParsedChangedFile``，不需要感知拆分逻辑。
+        """
+        added, removed, contexts = cls.extract_symbols_and_contexts(
+            patch, file.language
+        )
+        changed_lines = cls.extract_changed_lines(patch)
+        visible_lines = cls.extract_visible_lines(patch)
+        # 只统计 hunk 内的行；hunk 之前的 `---` / `+++` 是文件头，不是变更。
+        # 不能用 `startswith("+++")` 判断，因为内容以 `++` 开头的真实新增行
+        # 在 patch 里也会显示成 `+++...`。
+        additions = 0
+        deletions = 0
+        in_hunk = False
+        for line in patch.splitlines():
+            if line.startswith("@@"):
+                in_hunk = True
+                continue
+            if not in_hunk:
+                continue
+            if line.startswith("+"):
+                additions += 1
+            elif line.startswith("-"):
+                deletions += 1
+        return file.model_copy(
+            update={
+                "patch": patch,
+                "additions": additions,
+                "deletions": deletions,
+                "changed_symbols": added,
+                "removed_symbols": removed,
+                "enclosing_contexts": contexts,
+                "changed_lines": changed_lines,
+                "visible_lines": visible_lines,
+            }
+        )
+
+    @classmethod
+    def slice_changed_file(
+        cls,
+        file: ParsedChangedFile,
+        hunks: Sequence[str],
+    ) -> ParsedChangedFile:
+        """用选中的 hunk 构造一个子文件，并重新计算元数据。"""
+        return cls.with_patch(file, "".join(hunks))
 
     @classmethod
     def parse_file(cls, file_data: dict) -> ParsedChangedFile:

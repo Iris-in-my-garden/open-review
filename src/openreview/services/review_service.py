@@ -40,6 +40,11 @@ from openreview.review.output_parser import OutputParser
 from openreview.review.prompt_builder import PromptBuilder
 from openreview.review.report_writer import ReviewResult
 from openreview.review.single_shot import SingleShotReviewer
+from openreview.review.token_budget import (
+    DEFAULT_HARD_PROMPT_TOKENS,
+    DEFAULT_SOFT_PROMPT_TOKENS,
+    context_reserve_tokens_for,
+)
 from openreview.review.verifier import FindingVerifier
 from openreview.review.workflow import ReviewOutcome, ReviewState
 from openreview.services.review_executor import ReviewExecutor
@@ -66,6 +71,8 @@ class ReviewPipeline:
         max_batch_tokens: int = 60000,
         max_patch_tokens: int = 48000,
         max_context_tokens: int = 16000,
+        soft_prompt_tokens: int = DEFAULT_SOFT_PROMPT_TOKENS,
+        hard_prompt_tokens: int = DEFAULT_HARD_PROMPT_TOKENS,
         reviewer_mode: str = "single",
         max_workers: int = 4,
         aspect_timeout: float = 90.0,
@@ -91,6 +98,12 @@ class ReviewPipeline:
         llm_cache_mode: str = "auto",
         debug_dir: Optional[str] = None,
     ):
+        # prompt 预算由内部策略决定；max_patch/context 只是外部硬上限。
+        effective_context_tokens = min(
+            max_context_tokens,
+            context_reserve_tokens_for(soft_prompt_tokens),
+        )
+        effective_patch_tokens = min(max_patch_tokens, hard_prompt_tokens)
         self.config = ReviewConfig(
             mock_llm=mock_llm,
             github_token=github_token,
@@ -98,8 +111,10 @@ class ReviewPipeline:
             llm_model=llm_model,
             llm_base_url=llm_base_url,
             max_batch_tokens=max_batch_tokens,
-            max_patch_tokens=max_patch_tokens,
-            max_context_tokens=max_context_tokens,
+            max_patch_tokens=effective_patch_tokens,
+            max_context_tokens=effective_context_tokens,
+            soft_prompt_tokens=soft_prompt_tokens,
+            hard_prompt_tokens=hard_prompt_tokens,
             reviewer_mode=reviewer_mode,
             max_workers=max_workers,
             aspect_timeout=aspect_timeout,
@@ -169,8 +184,8 @@ class ReviewPipeline:
 
         self.debug_sink = DebugSink(debug_dir) if debug_dir else None
         prompt_builder = PromptBuilder(
-            max_patch_tokens=max_patch_tokens,
-            max_context_tokens=max_context_tokens,
+            max_patch_tokens=effective_patch_tokens,
+            max_context_tokens=effective_context_tokens,
         )
         output_parser = OutputParser()
         validator = FindingValidator(debug_sink=self.debug_sink)

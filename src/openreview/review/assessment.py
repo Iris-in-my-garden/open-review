@@ -195,7 +195,7 @@ def _unique_strings(values: Iterable[str]) -> list[str]:
 
 
 def merge_review_results(results: list) -> "ReviewResult":
-    """合并多个批次（split_parsed_diff）的审查结果，并重新计算全局结论。"""
+    """合并多个批次（plan_review_batches）的审查结果，并重新计算全局结论。"""
     from openreview.review.report_writer import ReviewResult
 
     if not results:

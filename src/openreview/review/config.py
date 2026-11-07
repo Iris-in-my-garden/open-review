@@ -13,6 +13,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
+from openreview.review.token_budget import (
+    DEFAULT_HARD_PROMPT_TOKENS,
+    DEFAULT_SOFT_PROMPT_TOKENS,
+)
+
 REVIEWER_MODES = frozenset({"single", "multi_aspect"})
 LLM_CACHE_MODES = frozenset({"auto", "record", "replay"})
 REVIEW_CACHE_SCHEMA_VERSION = 2
@@ -38,6 +43,10 @@ class ReviewConfig:
     max_batch_tokens: int = 60000
     max_patch_tokens: int = 48000
     max_context_tokens: int = 16000
+    # 内部 prompt 预算策略（不暴露 CLI）：
+    # soft 用于把超限内容打包成多个调用，hard 是触发拆分的上限。
+    soft_prompt_tokens: int = DEFAULT_SOFT_PROMPT_TOKENS
+    hard_prompt_tokens: int = DEFAULT_HARD_PROMPT_TOKENS
 
     # reviewer / 并发
     reviewer_mode: str = "single"
@@ -79,6 +88,16 @@ class ReviewConfig:
                 f"got {self.reviewer_mode!r}"
             )
         object.__setattr__(self, "reviewer_mode", normalized_mode)
+
+        if self.soft_prompt_tokens <= 0 or self.hard_prompt_tokens <= 0:
+            raise ValueError(
+                "soft_prompt_tokens and hard_prompt_tokens must be positive"
+            )
+        if self.soft_prompt_tokens > self.hard_prompt_tokens:
+            raise ValueError(
+                "soft_prompt_tokens must be <= hard_prompt_tokens, "
+                f"got {self.soft_prompt_tokens} > {self.hard_prompt_tokens}"
+            )
 
         normalized_cache_mode = self.llm_cache_mode.strip().lower()
         if normalized_cache_mode not in LLM_CACHE_MODES:
@@ -127,6 +146,8 @@ class ReviewConfig:
             f"max_batch_tokens={self.max_batch_tokens}",
             f"max_patch_tokens={self.max_patch_tokens}",
             f"max_context_tokens={self.max_context_tokens}",
+            f"soft_prompt_tokens={self.soft_prompt_tokens}",
+            f"hard_prompt_tokens={self.hard_prompt_tokens}",
             f"max_workers={self.max_workers}",
             f"aspect_timeout={self.aspect_timeout}",
             f"llm_timeout={self.llm_timeout}",

@@ -126,3 +126,49 @@ def test_pure_deletion_hunk_falls_back_to_hunk_start():
     assert parsed.changed_lines == [5]
     assert parsed.removed_symbols == ["gone"]
     assert parsed.changed_symbols == []
+
+
+def test_with_patch_counts_added_lines_that_start_with_plus():
+    patch = """diff --git a/src/a.c b/src/a.c
+--- a/src/a.c
++++ b/src/a.c
+@@ -1,2 +1,3 @@
+ int i = 0;
+---i;
++++i;
++++j;
+"""
+    file = DiffParser.parse_file(
+        {
+            "filename": "src/a.c",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "patch": patch,
+        }
+    )
+
+    rebuilt = DiffParser.with_patch(file, patch)
+
+    # `+++i;` 是内容为 `++i;` 的新增行，不是文件头；不能被漏计。
+    assert rebuilt.additions == 2
+    assert rebuilt.deletions == 1
+
+
+def test_split_patch_into_hunks_keeps_preamble_with_first_hunk():
+    patch = """diff --git a/src/a.py b/src/a.py
+--- a/src/a.py
++++ b/src/a.py
+@@ -1,1 +1,2 @@
+ x = 1
++y = 2
+@@ -10,1 +11,2 @@
+ z = 1
++w = 2
+"""
+    hunks = DiffParser.split_patch_into_hunks(patch)
+
+    assert len(hunks) == 2
+    assert hunks[0].startswith("diff --git")
+    assert "@@ -10,1 +11,2 @@" in hunks[1]
+    assert "".join(hunks) == patch
