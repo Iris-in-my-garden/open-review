@@ -1,10 +1,57 @@
 """ 把 ReviewResult 写成 Markdown 文件。 """
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
 from openreview.review.assessment import Severity, normalize_severity
+
+# 问题是否由本次 diff 引入。历史问题默认不进入风险计算和行内评论，
+# 避免把“既有代码里的老问题”算到本次 PR 头上，稀释真正的新增风险。
+IssueScope = Literal["introduced", "pre_existing"]
+# 行号属于 diff 的哪一侧：RIGHT=新文件侧，LEFT=删除行（旧文件侧）。
+IssueSide = Literal["RIGHT", "LEFT"]
+
+_SCOPE_ALIASES = {
+    "introduced": "introduced",
+    "introduced_by_diff": "introduced",
+    "diff": "introduced",
+    "new": "introduced",
+    "changed": "introduced",
+    "本次": "introduced",
+    "本次引入": "introduced",
+    "pre_existing": "pre_existing",
+    "preexisting": "pre_existing",
+    "existing": "pre_existing",
+    "historical": "pre_existing",
+    "history": "pre_existing",
+    "old": "pre_existing",
+    "历史": "pre_existing",
+    "历史问题": "pre_existing",
+}
+
+_SIDE_ALIASES = {
+    "right": "RIGHT",
+    "new": "RIGHT",
+    "new_side": "RIGHT",
+    "added": "RIGHT",
+    "left": "LEFT",
+    "old": "LEFT",
+    "old_side": "LEFT",
+    "deleted": "LEFT",
+    "deletion": "LEFT",
+    "removed": "LEFT",
+}
+
+
+def normalize_scope(value: object) -> IssueScope:
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return _SCOPE_ALIASES.get(text, "introduced")  # type: ignore[return-value]
+
+
+def normalize_side(value: object) -> IssueSide:
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return _SIDE_ALIASES.get(text, "RIGHT")  # type: ignore[return-value]
 
 
 class PotentialIssue(BaseModel):
@@ -18,6 +65,10 @@ class PotentialIssue(BaseModel):
     end_line: Optional[int] = None
     evidence: Optional[str] = None
     suggested_patch: Optional[str] = None
+    # 本次 diff 引入 vs 未改动代码中的历史问题；默认只保留前者。
+    scope: IssueScope = "introduced"
+    # RIGHT 使用新文件行号，LEFT 使用删除行的旧文件行号。
+    side: IssueSide = "RIGHT"
     # 引用了哪些检索上下文；评测用于 citation rate / context precision。
     context_refs: List[str] = Field(default_factory=list)
     # 由 FindingValidator 写入：git apply --check 的结果（None 表示未检查）。
@@ -31,6 +82,16 @@ class PotentialIssue(BaseModel):
     @classmethod
     def _normalize_severity(cls, value: object) -> Severity:
         return normalize_severity(str(value))
+
+    @field_validator("scope", mode="before")
+    @classmethod
+    def _normalize_scope(cls, value: object) -> IssueScope:
+        return normalize_scope(value)
+
+    @field_validator("side", mode="before")
+    @classmethod
+    def _normalize_side(cls, value: object) -> IssueSide:
+        return normalize_side(value)
 
 
 class ReviewResult(BaseModel):
@@ -90,6 +151,8 @@ class ReportWriter:
                     location += f":{issue.line}"
                     if issue.end_line and issue.end_line != issue.line:
                         location += f"-{issue.end_line}"
+                    if issue.side == "LEFT":
+                        location += " (deleted line)"
                 location = f"`{location}`"
 
                 issue_lines = [
@@ -98,9 +161,15 @@ class ReportWriter:
                     f"- **severity**: {issue.severity}",
                     f"- **category**: {issue.category}",
                     f"- **confidence**: {issue.confidence}",
-                    f"- **reasoning**: {issue.reasoning}",
-                    f"- **suggestion**: {issue.suggestion}",
                 ]
+                if issue.scope == "pre_existing":
+                    issue_lines.append("- **scope**: pre_existing")
+                issue_lines.extend(
+                    [
+                        f"- **reasoning**: {issue.reasoning}",
+                        f"- **suggestion**: {issue.suggestion}",
+                    ]
+                )
                 if issue.evidence:
                     issue_lines.append(f"- **evidence**: `{issue.evidence}`")
                 if issue.context_refs:

@@ -5,7 +5,11 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
+from openreview.repo.diff_parser import (
+    HUNK_RANGE_PATTERN,
+    ParsedChangedFile,
+    ParsedDiff,
+)
 from openreview.retriever import ast_utils
 from openreview.retriever.code_context import CodeContext
 from openreview.review.assessment import (
@@ -18,6 +22,9 @@ from openreview.review.assessment import (
 from openreview.review.report_writer import PotentialIssue, ReviewResult
 
 logger = logging.getLogger(__name__)
+
+# 校验器行为版本；写入 review cache key，避免换了过滤规则后仍复用旧结果。
+VALIDATOR_VERSION = "validator-v2"
 
 MAX_GROUNDING_FILE_SIZE = 500 * 1024
 MAX_SUGGESTED_PATCH_SIZE = 100_000
@@ -92,6 +99,7 @@ class FindingValidator:
         missing_evidence_penalty: float = 0.05,
         ungrounded_evidence_penalty: float = 0.20,
         grounded_evidence_bonus: float = 0.05,
+        keep_pre_existing: bool = False,
         debug_sink=None,
     ):
         self.min_confidence = min_confidence
@@ -100,6 +108,9 @@ class FindingValidator:
         self.missing_evidence_penalty = missing_evidence_penalty
         self.ungrounded_evidence_penalty = ungrounded_evidence_penalty
         self.grounded_evidence_bonus = grounded_evidence_bonus
+        # 默认只保留“本次 diff 引入”的问题；历史问题既不计风险也不发
+        # 行内评论，避免把既有债务算到当前 PR 头上。
+        self.keep_pre_existing = keep_pre_existing
         # 最近一次 validate 的计数，供 pipeline 写入 metrics / 评测分析。
         self.last_stats: Dict[str, int] = {}
         self.debug_sink = debug_sink
@@ -118,6 +129,7 @@ class FindingValidator:
             "candidates": len(result.potential_issues),
             "kept": 0,
             "dropped_unknown_file": 0,
+            "dropped_pre_existing": 0,
             "invalid_line": 0,
             "missing_line": 0,
             "missing_evidence": 0,
@@ -144,6 +156,8 @@ class FindingValidator:
                 "end_line": issue.end_line,
                 "severity": issue.severity,
                 "category": issue.category,
+                "scope": issue.scope,
+                "side": issue.side,
                 "confidence_before": original_confidence,
                 "confidence_after": original_confidence,
                 "evidence": issue.evidence,
@@ -174,21 +188,43 @@ class FindingValidator:
                     issue.context_refs
                 )
 
+            # 规则 1.8: 历史问题默认直接丢弃，不参与风险计算和行内评论。
+            if issue.scope == "pre_existing" and not self.keep_pre_existing:
+                stats["dropped_pre_existing"] += 1
+                record["status"] = "dropped"
+                record["drop_reason"] = "pre_existing"
+                continue
+
             confidence = issue.confidence
 
-            # 规则 2: 行号必须落在 Patch 的新文件侧可见行内
+            # 规则 2: 行号必须落在 Patch 对应侧的可见行内。
+            # 无效行号不再“降级成文件级问题”：那会让幻觉行号在报告里
+            # 以低置信度继续存在，还会把证据读取退化成文件头部。
             if issue.line is not None:
-                if issue.line not in file_diff.visible_lines:
-                    issue.line = None
-                    issue.end_line = None
-                    confidence -= self.invalid_line_penalty
+                visible = (
+                    file_diff.old_visible_lines
+                    if issue.side == "LEFT"
+                    else file_diff.visible_lines
+                )
+                if visible:
+                    if issue.line not in visible:
+                        stats["invalid_line"] += 1
+                        record["status"] = "dropped"
+                        record["drop_reason"] = "invalid_line"
+                        continue
+                elif file_diff.patch:
+                    # 有 patch 但该侧没有任何可见行（例如 LEFT 侧没有删除/上下文），
+                    # 说明行号不可能落在 diff 内。
                     stats["invalid_line"] += 1
-                elif issue.end_line is not None:
+                    record["status"] = "dropped"
+                    record["drop_reason"] = "invalid_line"
+                    continue
+                if issue.end_line is not None:
                     if issue.end_line < issue.line:
                         issue.end_line = None
-                    elif issue.end_line not in file_diff.visible_lines:
+                    elif visible and issue.end_line not in visible:
                         issue.end_line = None
-            elif file_diff.visible_lines:
+            elif file_diff.visible_lines or file_diff.old_visible_lines:
                 confidence -= self.missing_line_penalty
                 stats["missing_line"] += 1
 
@@ -291,12 +327,33 @@ class FindingValidator:
         if len(evidence) < 6:
             return None, None
 
+        # 1) 行级窗口优先：证据必须能定位到报告行附近，而不是文件任意角落。
+        window_parts: List[str] = []
+        if issue.line is not None:
+            patch_window = _extract_patch_window(
+                file_diff.patch or "",
+                issue.line,
+                issue.end_line or issue.line,
+                issue.side,
+            )
+            if patch_window:
+                window_parts.append(patch_window)
+            if repo_path is not None and issue.side == "RIGHT":
+                source = self._read_source_for_issue(repo_path, issue)
+                if source:
+                    window_parts.append(source)
+        window = "\n".join(window_parts)
+        if window and _evidence_matches(evidence, window, strict=False):
+            method = _evidence_method(evidence, window)
+            return True, method or "evidence_line_match"
+
+        # 2) 再回退到该文件的 Patch / 检索上下文。没有行号时只看这些
+        #    有界区域，绝不读取文件头部来“兜底”。
         haystack_parts = [file_diff.patch or ""]
         haystack_parts.extend(
             ctx.snippet for ctx in contexts if ctx.file_path == issue.file
         )
-
-        if repo_path is not None:
+        if repo_path is not None and issue.line is not None and issue.side == "RIGHT":
             source = self._read_source_for_issue(repo_path, issue)
             if source:
                 haystack_parts.append(source)
@@ -304,35 +361,9 @@ class FindingValidator:
         haystack = "\n".join(part for part in haystack_parts if part)
         if not haystack:
             return None, None
-
-        normalized_evidence = _normalize_text(evidence)
-        normalized_haystack = _normalize_text(haystack)
-        if normalized_evidence and normalized_evidence in normalized_haystack:
-            return True, "evidence_exact"
-
-        evidence_lines = [
-            _normalize_text(line)
-            for line in evidence.splitlines()
-            if len(TOKEN_PATTERN.findall(line)) >= 2
-        ]
-        haystack_lines = [
-            _normalize_text(line) for line in haystack.splitlines() if line.strip()
-        ]
-        if evidence_lines and all(
-            any(_line_token_containment(line, hay) >= 0.9 for hay in haystack_lines)
-            for line in evidence_lines
-        ):
-            return True, "evidence_line_match"
-
-        evidence_tokens = set(TOKEN_PATTERN.findall(evidence.lower()))
-        if len(evidence_tokens) < 3:
-            return False, None
-
-        haystack_tokens = set(TOKEN_PATTERN.findall(haystack.lower()))
-        overlap = len(evidence_tokens & haystack_tokens) / len(evidence_tokens)
-        distinctive = evidence_tokens - COMMON_EVIDENCE_TOKENS
-        if overlap >= 0.85 and len(distinctive) >= 2:
-            return True, "evidence_token_match"
+        if _evidence_matches(evidence, haystack, strict=True):
+            method = _evidence_method(evidence, haystack)
+            return True, method or "evidence_token_match"
         return False, None
 
     @staticmethod
@@ -409,8 +440,12 @@ class FindingValidator:
             return text
 
         if issue.line is None:
-            # 没有行号时只看文件头部，避免“证据在文件任意角落”造成假阳性。
-            return "\n".join(lines[:200])
+            # 没有行号时不再读取文件头部：文件级问题不应靠“头部恰好
+            # 包含相似 token”获得证据加分，否则幻觉行号会绕过校验。
+            return None
+        if issue.side == "LEFT":
+            # 删除行只存在于 patch / base 版本，不应回到 head 源码里找。
+            return None
 
         # 优先用 AST 包围定义作为证据窗口；解析失败再退回 ±20 行。
         try:
@@ -424,6 +459,97 @@ class FindingValidator:
         start = max(0, issue.line - 21)
         end = min(len(lines), issue.line + 20)
         return "\n".join(lines[start:end])
+
+
+def _evidence_matches(evidence: str, haystack: str, *, strict: bool) -> bool:
+    """判断 evidence 是否能在给定文本中定位。
+
+    ``strict=True`` 用于文件级回退：要求更高的 token 覆盖率，防止
+    “同文件里出现过类似词”就放行。行级窗口使用 ``strict=False``。
+    """
+    normalized_evidence = _normalize_text(evidence)
+    if normalized_evidence and normalized_evidence in _normalize_text(haystack):
+        return True
+
+    evidence_lines = [
+        _normalize_text(line)
+        for line in evidence.splitlines()
+        if len(TOKEN_PATTERN.findall(line)) >= 2
+    ]
+    haystack_lines = [
+        _normalize_text(line) for line in haystack.splitlines() if line.strip()
+    ]
+    if evidence_lines and all(
+        any(_line_token_containment(line, hay) >= 0.9 for hay in haystack_lines)
+        for line in evidence_lines
+    ):
+        return True
+
+    evidence_tokens = set(TOKEN_PATTERN.findall(evidence.lower()))
+    if len(evidence_tokens) < 3:
+        return False
+    haystack_tokens = set(TOKEN_PATTERN.findall(haystack.lower()))
+    overlap = len(evidence_tokens & haystack_tokens) / len(evidence_tokens)
+    distinctive = evidence_tokens - COMMON_EVIDENCE_TOKENS
+    if strict:
+        return overlap >= 0.9 and len(distinctive) >= 3
+    return overlap >= 0.85 and len(distinctive) >= 2
+
+
+def _evidence_method(evidence: str, haystack: str) -> Optional[str]:
+    if _normalize_text(evidence) in _normalize_text(haystack):
+        return "evidence_exact"
+    evidence_lines = [
+        _normalize_text(line)
+        for line in evidence.splitlines()
+        if len(TOKEN_PATTERN.findall(line)) >= 2
+    ]
+    haystack_lines = [
+        _normalize_text(line) for line in haystack.splitlines() if line.strip()
+    ]
+    if evidence_lines and all(
+        any(_line_token_containment(line, hay) >= 0.9 for hay in haystack_lines)
+        for line in evidence_lines
+    ):
+        return "evidence_line_match"
+    return "evidence_token_match"
+
+
+def _extract_patch_window(
+    patch: str, start_line: int, end_line: int, side: str
+) -> str:
+    """从 patch 中截取指定侧的连续行窗口（含删除行）。"""
+    if not patch or not start_line:
+        return ""
+    start = min(start_line, end_line)
+    end = max(start_line, end_line)
+    old_line: Optional[int] = None
+    new_line: Optional[int] = None
+    selected: List[str] = []
+
+    for raw_line in patch.splitlines():
+        header = HUNK_RANGE_PATTERN.match(raw_line)
+        if header:
+            old_line = int(header.group(1))
+            new_line = int(header.group(3))
+            continue
+        if old_line is None or new_line is None:
+            continue
+        if raw_line.startswith("+"):
+            if side != "LEFT" and start <= new_line <= end:
+                selected.append(raw_line[1:])
+            new_line += 1
+        elif raw_line.startswith("-"):
+            if side == "LEFT" and start <= old_line <= end:
+                selected.append(raw_line[1:])
+            old_line += 1
+        elif raw_line.startswith(" "):
+            current = old_line if side == "LEFT" else new_line
+            if start <= current <= end:
+                selected.append(raw_line[1:])
+            old_line += 1
+            new_line += 1
+    return "\n".join(selected)
 
 
 def _normalize_text(text: str) -> str:

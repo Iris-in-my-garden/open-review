@@ -250,9 +250,21 @@ def compute_deterministic_metrics(
                     if repo_path is not None
                     else None
                 )
-            haystack = "\n".join(
-                part for part in [head_cache[path] or "", file_diff.patch or ""] if part
-            )
+            haystack_parts = [file_diff.patch or ""]
+            if line is not None:
+                source = head_cache[path] or ""
+                source_lines = source.splitlines()
+                try:
+                    line_number = int(line)
+                except (TypeError, ValueError):
+                    line_number = 0
+                if line_number > 0 and source_lines:
+                    start = max(0, line_number - 8)
+                    end = min(len(source_lines), line_number + 8)
+                    haystack_parts.append("\n".join(source_lines[start:end]))
+            # 没有行号时只信任 patch，不再用整个 head 文件兜底；否则
+            # “证据在同文件任意角落”会被算作 grounded，指标失去意义。
+            haystack = "\n".join(part for part in haystack_parts if part)
             counters["evidence_checked"] += 1
             row_evidence_checked += 1
             if evidence_is_grounded(str(evidence), haystack):

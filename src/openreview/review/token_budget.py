@@ -5,7 +5,7 @@
 """
 
 import math
-from typing import List
+from typing import Dict, Iterable, List, Mapping, Optional
 
 from openreview.repo.diff_parser import (
     HUNK_CONTEXT_PATTERN,
@@ -196,6 +196,50 @@ def _coalesce_same_file_units(
     return merged
 
 
+def _order_units_by_dependency(
+    units: List[ParsedChangedFile],
+    dependencies: Optional[Mapping[str, Iterable[str]]],
+) -> List[ParsedChangedFile]:
+    """把有依赖关系的文件排在一起，让它们在预算允许时进入同一批。
+
+    batch 是按顺序贪心打包的；如果 ``a.py`` 和它的调用方 / 测试文件被
+    分到不同批次，模型就看不到跨文件交互，容易漏报真实问题或产生误报。
+    这里用并查集把依赖图拆成连通分量，再按第一次出现的顺序稳定排序。
+    同一文件的所有 hunk unit 共享同一个分量，因此文件内部顺序不变。
+    """
+    if not dependencies:
+        return units
+
+    parent: Dict[str, str] = {}
+
+    def find(name: str) -> str:
+        parent.setdefault(name, name)
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    def union(left: str, right: str) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for source, targets in dependencies.items():
+        if not source:
+            continue
+        for target in targets:
+            if target:
+                union(source, target)
+
+    group_order: Dict[str, int] = {}
+    for unit in units:
+        root = find(unit.filename)
+        group_order.setdefault(root, len(group_order))
+
+    # sorted 是稳定排序：同一连通分量内保持原始 diff 顺序。
+    return sorted(units, key=lambda unit: group_order[find(unit.filename)])
+
+
 def _pack_units(
     units: List[ParsedChangedFile],
     target_tokens: int,
@@ -235,6 +279,7 @@ def plan_review_batches(
     max_batch_tokens: int = 0,
     prompt_overhead_tokens: int = PROMPT_OVERHEAD_TOKENS,
     context_reserve_tokens: int | None = None,
+    dependencies: Optional[Mapping[str, Iterable[str]]] = None,
 ) -> List[ParsedDiff]:
     """按最终 prompt 预算规划 review batch。
 
@@ -243,7 +288,9 @@ def plan_review_batches(
     - 总 patch 成本 <= ``patch_hard`` 时**不拆**，保留完整上下文；
     - 超过 ``patch_hard`` 才拆，并尽量按 ``patch_soft`` 把 bin 装到接近上限；
     - 文件过大时先按 hunk / 符号切片，保持语义连续；
-    - ``max_batch_tokens`` 作为外部硬上限（兼容旧调用），只能让 batch 更小。
+    - ``max_batch_tokens`` 作为外部硬上限（兼容旧调用），只能让 batch 更小；
+    - ``dependencies`` 描述文件之间的依赖（import / 测试关联），用于把相关
+      文件尽量排进同一批次。
     """
     if not parsed_diff.files:
         return [parsed_diff]
@@ -277,6 +324,8 @@ def plan_review_batches(
         units.extend(_file_to_units(file_diff, patch_soft))
     if not units:
         return [parsed_diff]
+
+    units = _order_units_by_dependency(units, dependencies)
 
     # 先决定最少需要几个 bin，再把预算平均分配，避免最后一个 bin 过小。
     bin_count = max(1, math.ceil(total_cost / patch_soft))

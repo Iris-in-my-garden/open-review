@@ -20,10 +20,10 @@ SECURITY_SYSTEM_SUFFIX = """
 """
 
 OUTPUT_CONSTRAINTS = """### 【输出约束】（必须遵守）
-1. `line` 必须是下方 Patch 中标注的新文件行号；无法确定时填 null，禁止猜测。
-2. `evidence` 只填代码本身，必须逐字引用 Patch 或 Context；不要包含左侧行号、`|` 或 `+/-` 前缀。找不到证据就不要报告该问题。
+1. `line` 必须是下方 Patch 中标注的行号；新增/上下文行使用新文件行号并设 `side: "RIGHT"`；删除行使用以 `L` 标注的旧文件行号并设 `side: "LEFT"`。无法确定时填 null，禁止猜测。
+2. `evidence` 只填代码本身，必须逐字引用 Patch 或 Context；不要包含行号、`L`/`|` 或 `+/-` 前缀。找不到证据就不要报告该问题。
 3. `suggested_patch` 使用 unified diff 格式，只修改与问题相关的行；无法给出时留空。
-4. 报告范围包括两部分：本次 diff 引入（或本次改动直接使其变得危险）的问题，以及 Patch/Context 中可见的未改动代码里的历史问题。历史问题需在 `reasoning` 中标注「历史问题，非本次改动引入」，并按真实严重程度报告，不要因为不是本次引入就降级或隐瞒。
+4. 只报告本次 diff 引入（或本次改动直接使其变得危险）的问题，`scope` 填 `introduced`。未改动代码里的历史问题默认不要报告；如果确实要报告，必须把 `scope` 填为 `pre_existing`，系统默认会过滤这类 finding，且不计入风险等级和行内评论。
 5. `confidence` 是系统过滤依据：低于 0.6 会被直接丢弃。如果问题真实但证据只覆盖部分路径，给 0.6–0.7 并在 `reasoning` 中说明缺少哪段上下文；不要因为不确定就给 0.5。
 6. 最多报告 8 个问题，按 `severity` 从高到低排序；超过时只保留最严重的。
 7. `category` 必须是 `bugs`、`security`、`performance`、`clean_code`、`test_gap` 之一。
@@ -51,7 +51,7 @@ DEFAULT_SYSTEM_PROMPT = """你是一位资深、严谨的软件架构师和 Code
 ### 【审查与判断原则】（严格遵守）
 1. **基于事实，禁止幻觉**：所有的结论、问题和证据必须有输入数据（Diff 或 Context）的直接依据。严禁编造不存在的文件、函数、类名或测试结果。
 2. **拒绝强行找茬**：不要为了显现审查价值而强行捏造低质量或不存在的问题。如果代码质量良好或信息不足，`issues` 返回空列表，不要为了凑数编造问题。
-3. **覆盖本次改动与相关历史问题**：优先报告由本次 diff 新增/修改的代码引入、或本次改动直接使其变得危险的问题；同时也要报告你在 Patch 或 Context 中发现的未改动代码里的历史问题（如既有的空指针、注入、资源泄漏等）。报告历史问题时，在 `reasoning` 中明确标注「历史问题，非本次改动引入」，并保持真实的严重程度，不要因为不是本次引入就降级或隐瞒。
+3. **只报本次改动引入的问题**：报告由本次 diff 新增/修改的代码引入、或本次改动直接使其变得危险的问题，并把 `scope` 设为 `introduced`。未改动代码里的历史问题默认不要报告；如果它确实与本次改动直接相关，才报告并把 `scope` 设为 `pre_existing`（系统默认会过滤）。
 4. **关注核心风险**：优先关注 Correctness（正确性）、Edge Cases（边界条件）、Security（安全性）以及 Test Gap（测试缺失）。尽量忽略单纯的语法风格、命名偏好或格式问题。
 5. **严重程度标准**：critical 表示可达路径上会导致数据损坏、权限绕过、远程代码执行或服务崩溃；high 表示特定输入下产生错误结果或存在明确可利用的安全缺陷；medium 表示边界/异常处理不完整但触发条件较窄；low 表示可维护性问题且不影响当前行为。不确定时用 medium，不要用 high 兜底。
 6. **置信度把关**：只有在逻辑链条完整且有明确证据时才给出高置信度；对于假设性或推测性的问题，标明低置信度或直接不予报告。系统会丢弃 confidence < 0.6 的问题。
@@ -137,18 +137,24 @@ class PromptBuilder:
 
     @staticmethod
     def format_patch_with_line_numbers(patch: str) -> str:
-        """把原始 diff 渲染成带新文件行号的文本，降低 LLM 猜行号的概率。"""
+        """把原始 diff 渲染成带行号的文本，降低 LLM 猜行号的概率。
+
+        新文件侧（新增/上下文行）显示裸行号，删除行显示 ``L<old_line>``，
+        配合 ``side`` 字段即可无歧义地定位 RIGHT / LEFT。
+        """
         output: List[str] = []
+        old_line: Optional[int] = None
         new_line: Optional[int] = None
 
         for raw_line in patch.splitlines():
             header = HUNK_RANGE_PATTERN.match(raw_line)
             if header:
+                old_line = int(header.group(1))
                 new_line = int(header.group(3))
                 output.append(raw_line)
                 continue
 
-            if new_line is None:
+            if new_line is None or old_line is None:
                 output.append(raw_line)
                 continue
 
@@ -156,9 +162,11 @@ class PromptBuilder:
                 output.append(f"{new_line:>6} | {raw_line}")
                 new_line += 1
             elif raw_line.startswith("-"):
-                output.append(f"{'':>6} | {raw_line}")
+                output.append(f"{'L' + str(old_line):>6} | {raw_line}")
+                old_line += 1
             elif raw_line.startswith(" "):
                 output.append(f"{new_line:>6} | {raw_line}")
+                old_line += 1
                 new_line += 1
             else:
                 output.append(f"{'':>6} | {raw_line}")
@@ -245,23 +253,52 @@ class PromptBuilder:
         这样模型在读到某个文件的 diff 时，立刻能看到该文件的 enclosing/symbol
         上下文，而不是在 prompt 尾部跨文件查找。
         """
-        block_files = {filename for filename, _ in patch_blocks}
+        block_order = [filename for filename, _ in patch_blocks]
+        block_files = set(block_order)
         by_file: Dict[str, List[str]] = {}
         other_blocks: List[str] = []
         remaining = self.max_context_tokens
         omitted = 0
+        ordered = sorted(contexts, key=lambda item: item.score, reverse=True)
 
-        for ctx in sorted(contexts, key=lambda item: item.score, reverse=True):
+        # 先为每个变更文件保留至少一段上下文，避免全局按分数排序时
+        # 一个大文件的高分片段把小文件的上下文全部挤掉。
+        reserved: set[int] = set()
+        per_file_count: Dict[str, int] = {}
+        for filename in block_order:
+            for ctx in ordered:
+                if ctx.file_path != filename or id(ctx) in reserved:
+                    continue
+                rendered = self._render_context(ctx)
+                cost = estimate_tokens(rendered) + 20
+                if cost > remaining:
+                    continue
+                remaining -= cost
+                by_file.setdefault(filename, []).append(rendered)
+                per_file_count[filename] = per_file_count.get(filename, 0) + 1
+                reserved.add(id(ctx))
+                break
+
+        max_per_file = max(2, min(8, len(ordered)))
+        for ctx in ordered:
+            if id(ctx) in reserved:
+                continue
             rendered = self._render_context(ctx)
             cost = estimate_tokens(rendered) + 20
             if cost > remaining:
                 omitted += 1
                 continue
-            remaining -= cost
             if ctx.file_path in block_files:
+                if per_file_count.get(ctx.file_path, 0) >= max_per_file:
+                    omitted += 1
+                    continue
                 by_file.setdefault(ctx.file_path, []).append(rendered)
+                per_file_count[ctx.file_path] = (
+                    per_file_count.get(ctx.file_path, 0) + 1
+                )
             else:
                 other_blocks.append(rendered)
+            remaining -= cost
 
         rendered_blocks: List[str] = []
         for filename, block in patch_blocks:

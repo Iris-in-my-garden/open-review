@@ -42,6 +42,33 @@ def _write_repo(root: Path) -> None:
     )
 
 
+def test_hybrid_related_files_links_imports_and_tests(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_repo(root)
+    (root / "tests").mkdir()
+    (root / "tests" / "test_auth.py").write_text(
+        "from pkg.auth import AuthService\n", encoding="utf-8"
+    )
+    _init_repo(root)
+
+    parsed = ParsedDiff(
+        files=[
+            ParsedChangedFile(filename="pkg/auth.py", status="modified"),
+            ParsedChangedFile(filename="pkg/api.py", status="modified"),
+            ParsedChangedFile(filename="tests/test_auth.py", status="modified"),
+        ]
+    )
+    retriever = HybridRetriever()
+    try:
+        related = retriever.related_files(root, parsed)
+    finally:
+        retriever.close()
+
+    assert "pkg/api.py" in related["pkg/auth.py"]
+    assert "tests/test_auth.py" in related["pkg/auth.py"]
+
+
 def test_repo_index_builds_symbols_imports_and_search(tmp_path: Path):
     root = tmp_path / "repo"
     root.mkdir()
@@ -138,6 +165,37 @@ def test_query_builder_extracts_symbols_modules_and_imports(tmp_path: Path):
         assert "pkg.api" in query.modules
         assert "pkg.auth" in query.imports
         assert "AuthService" in query.terms
+    finally:
+        index.close()
+
+
+def test_query_builder_derives_enclosing_symbols_from_ast(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_repo(root)
+    _init_repo(root)
+
+    index = RepoIndex.for_worktree(root, cache_dir=tmp_path / "idx")
+    try:
+        # 只改函数体、不改签名：diff 正则提取不到 changed_symbols。
+        parsed = DiffParser.parse_diff(
+            [
+                {
+                    "filename": "pkg/auth.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -5,2 +5,2 @@\n"
+                        "     def login(self, user: User):\n"
+                        "-        return None\n"
+                        "+        return make_token(user)\n"
+                    ),
+                }
+            ]
+        )
+        query = QueryBuilder().build(parsed, index=index)
+
+        assert "login" in query.symbols
+        assert "AuthService.login" in query.symbols
     finally:
         index.close()
 

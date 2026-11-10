@@ -36,6 +36,7 @@ from openreview.review.comment_builder import (
     build_review_comments,
 )
 from openreview.review.config import ReviewConfig
+from openreview.review.finding_validator import VALIDATOR_VERSION
 from openreview.review.report_writer import ReportWriter, ReviewResult
 from openreview.review.token_budget import (
     context_reserve_tokens_for,
@@ -347,6 +348,25 @@ class ReviewExecutor:
             )
             logger.info("Triage skipped LLM review: %s", decision.reason)
 
+    def _batch_dependencies(self, state: ReviewState) -> Dict[str, set[str]]:
+        """获取文件依赖关系，用于 dependency-aware batching。
+
+        retriever 不提供该能力时返回空映射，分批退化为原始 diff 顺序。
+        """
+        getter = getattr(self.retriever, "related_files", None)
+        if (
+            not callable(getter)
+            or state.parsed_diff is None
+            or state.local_repo_path is None
+        ):
+            return {}
+        try:
+            related = getter(state.local_repo_path, state.parsed_diff)
+        except Exception as exc:  # noqa: BLE001 - 依赖分析失败不应阻断 review
+            logger.debug("Dependency-aware batching disabled: %s", exc)
+            return {}
+        return dict(related or {})
+
     def _node_analyze(self, state: ReviewState) -> None:
         if (
             state.parsed_diff is None
@@ -363,6 +383,7 @@ class ReviewExecutor:
             context_reserve_tokens=context_reserve_tokens_for(
                 self.config.soft_prompt_tokens
             ),
+            dependencies=self._batch_dependencies(state),
         )
         state.batches = batches
         self._log(
@@ -437,7 +458,7 @@ class ReviewExecutor:
                             len(batches),
                         )
                         break
-                    aspects = aspects[:remaining_calls]
+                    aspects = self._narrow_aspects(aspects, remaining_calls)
                     state.selected_aspects = list(aspects)
                     calls_per_batch = self._reviewer_call_count(aspects)
                     state.add_note(
@@ -732,6 +753,18 @@ class ReviewExecutor:
             getattr(self.reviewer, "supports_aspect_narrowing", True)
         )
 
+    @staticmethod
+    def _narrow_aspects(aspects: Sequence[str], remaining_calls: int) -> List[str]:
+        """预算不足时优先保留 security。
+
+        ``aspects[:remaining_calls]`` 会按声明顺序把 security 放在最后，
+        导致预算紧张时恰好丢掉最不该丢的维度。这里显式按风险优先级排序。
+        """
+        priority = ["security", "bugs", "performance", "clean_code"]
+        ordered = [aspect for aspect in priority if aspect in aspects]
+        ordered.extend(aspect for aspect in aspects if aspect not in ordered)
+        return ordered[: max(0, remaining_calls)]
+
     def _cache_key(self, state: ReviewState) -> str:
         if state.pr_info is None:
             return ""
@@ -743,6 +776,7 @@ class ReviewExecutor:
             str(getattr(self.llm_client, "temperature", "")),
             str(getattr(self.llm_client, "seed", "")),
             PROMPT_VERSION,
+            VALIDATOR_VERSION,
             RETRIEVER_VERSION,
             *self.config.cache_key_parts(),
         )

@@ -237,17 +237,23 @@ class StaticAnalysisRunner:
 def _filter_to_changed_lines(
     findings: List[StaticFinding], parsed_diff: ParsedDiff
 ) -> List[StaticFinding]:
+    """只保留落在本次新增/修改行上的静态信号。
+
+    优先使用 ``changed_lines``（真正新增的行）；没有新增行信息时才退回
+    ``visible_lines``。旧实现使用 ``visible_lines``，会把同一文件上下文行
+    里的历史 lint 噪音也注入给模型。无法确认行号的 finding 直接丢弃。
+    """
     allowed: dict[str, set[int]] = {}
     for file_diff in parsed_diff.files:
-        lines = set(file_diff.visible_lines or file_diff.changed_lines or [])
+        lines = set(file_diff.changed_lines or file_diff.visible_lines or [])
         if lines:
             allowed[file_diff.filename] = lines
     if not allowed:
-        return findings
+        return []
     return [
         item
         for item in findings
-        if item.file not in allowed or item.line in allowed[item.file]
+        if item.file in allowed and item.line in allowed[item.file]
     ]
 
 

@@ -107,6 +107,27 @@ def test_changed_lines_and_removed_symbols():
     assert parsed.changed_lines == [11, 12]
 
 
+def test_deleted_and_old_visible_lines_are_extracted():
+    patch = """@@ -7,3 +7,3 @@
+ context
+-gone = 1
++kept = 1
+ tail
+"""
+    parsed = DiffParser.parse_file(
+        {
+            "filename": "src/utils.py",
+            "status": "modified",
+            "patch": patch,
+        }
+    )
+
+    assert parsed.deleted_lines == [8]
+    assert parsed.old_visible_lines == [7, 8, 9]
+    assert parsed.visible_lines == [7, 8, 9]
+    assert parsed.changed_lines == [8]
+
+
 def test_pure_deletion_hunk_falls_back_to_hunk_start():
     patch = """@@ -5,2 +5,0 @@
 -def gone():

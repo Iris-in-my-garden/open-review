@@ -91,3 +91,24 @@ def test_static_findings_are_filtered_to_diff_visible_lines():
 
     assert [item.line for item in filtered] == [11]
 
+
+def test_static_findings_outside_diff_files_are_dropped():
+    from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
+
+    parsed = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="a.py",
+                status="modified",
+                changed_lines=[11],
+                visible_lines=[10, 11, 12],
+            )
+        ]
+    )
+    findings = [
+        StaticFinding(tool="ruff", file="b.py", line=1, code="F401", message="old"),
+        StaticFinding(tool="ruff", file="a.py", line=10, code="F841", message="context"),
+    ]
+
+    assert _filter_to_changed_lines(findings, parsed) == []
+

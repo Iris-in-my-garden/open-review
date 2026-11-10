@@ -170,7 +170,7 @@ def test_validate_ungrounded_evidence_is_penalized_and_dropped():
     assert result.final_decision == "APPROVE"
 
 
-def test_validate_invalid_line_is_cleared_and_penalized():
+def test_validate_invalid_line_is_dropped_instead_of_becoming_file_level():
     issue = PotentialIssue(
         file="src/auth.py",
         severity="High",
@@ -181,11 +181,92 @@ def test_validate_invalid_line_is_cleared_and_penalized():
         line=99,
     )
 
-    result = FindingValidator().validate(_result([issue]), _diff_with_patch())
+    validator = FindingValidator()
+    result = validator.validate(_result([issue]), _diff_with_patch())
+
+    # 幻觉行号不能降级成文件级问题继续留在报告里，否则会把证据读取
+    # 退化成文件头部，削弱 grounding 的意义。
+    assert result.potential_issues == []
+    assert validator.last_stats["invalid_line"] == 1
+    assert result.risk_level == "LOW"
+
+
+def test_validate_drops_pre_existing_issues_by_default():
+    issue = PotentialIssue(
+        file="src/auth.py",
+        severity="High",
+        category="Security",
+        confidence=0.9,
+        reasoning="Legacy hardcoded password.",
+        suggestion="Use env vars.",
+        line=1,
+        evidence='password = "123"',
+        scope="pre_existing",
+    )
+
+    validator = FindingValidator()
+    result = validator.validate(_result([issue]), _diff_with_patch())
+
+    assert result.potential_issues == []
+    assert validator.last_stats["dropped_pre_existing"] == 1
+
+
+def _diff_with_deleted_line() -> ParsedDiff:
+    return ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="src/auth.py",
+                status="modified",
+                patch=(
+                    "@@ -7,2 +7,2 @@\n"
+                    '-    check_password(password)\n'
+                    "+    return password\n"
+                ),
+                visible_lines=[7, 8],
+                old_visible_lines=[7, 8],
+                deleted_lines=[7],
+            )
+        ]
+    )
+
+
+def test_validate_accepts_left_side_deleted_lines():
+    issue = PotentialIssue(
+        file="src/auth.py",
+        severity="High",
+        category="Security",
+        confidence=0.8,
+        reasoning="Deleted line removed a required validation.",
+        suggestion="Restore the check.",
+        line=7,
+        side="LEFT",
+        evidence="check_password(password)",
+    )
+
+    result = FindingValidator().validate(
+        _result([issue]), _diff_with_deleted_line()
+    )
 
     assert len(result.potential_issues) == 1
-    assert result.potential_issues[0].line is None
-    assert result.potential_issues[0].confidence == 0.7
+    assert result.potential_issues[0].side == "LEFT"
+
+
+def test_validate_rejects_left_side_line_on_right_side_only_patch():
+    issue = PotentialIssue(
+        file="src/auth.py",
+        severity="High",
+        category="Security",
+        confidence=0.9,
+        reasoning="Wrong-side line.",
+        suggestion="N/A.",
+        line=1,
+        side="LEFT",
+        evidence='password = "123"',
+    )
+
+    result = FindingValidator().validate(_result([issue]), _diff_with_patch())
+
+    assert result.potential_issues == []
 
 
 def test_validate_evidence_can_be_grounded_in_local_source(tmp_path):
@@ -250,14 +331,15 @@ def test_validate_records_counters_for_eval():
         _result([grounded, invalid_line, unknown_file]), _diff_with_patch()
     )
 
-    assert len(result.potential_issues) == 2
+    assert len(result.potential_issues) == 1
     assert validator.last_stats == {
         "candidates": 3,
-        "kept": 2,
+        "kept": 1,
         "dropped_unknown_file": 1,
+        "dropped_pre_existing": 0,
         "invalid_line": 1,
         "missing_line": 0,
-        "missing_evidence": 1,
+        "missing_evidence": 0,
         "ungrounded_evidence": 0,
         "grounded_evidence": 1,
         "evidence_exact": 1,

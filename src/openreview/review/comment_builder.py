@@ -49,15 +49,16 @@ def build_review_comments(result: ReviewResult) -> List[Dict]:
         if not issue.line or len(comments) >= MAX_INLINE_COMMENTS:
             continue
 
+        side = "LEFT" if issue.side == "LEFT" else "RIGHT"
         comment = {
             "path": issue.file,
             "line": issue.line,
-            "side": "RIGHT",
+            "side": side,
             "body": _issue_markdown(issue),
         }
         if issue.end_line and issue.end_line > issue.line:
             comment["start_line"] = issue.line
-            comment["start_side"] = "RIGHT"
+            comment["start_side"] = side
             comment["line"] = issue.end_line
         comments.append(comment)
     return comments

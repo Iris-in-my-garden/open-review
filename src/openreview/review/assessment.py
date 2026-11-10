@@ -4,8 +4,9 @@
 否则会出现“报告写着 HIGH / 8 个问题，但正文显示 No issues”的自相矛盾。
 """
 
+import re
 from collections import Counter
-from typing import TYPE_CHECKING, Iterable, Literal, Protocol, Tuple, cast
+from typing import TYPE_CHECKING, Iterable, Literal, Optional, Protocol, Tuple, cast
 
 if TYPE_CHECKING:
     from openreview.review.report_writer import ReviewResult
@@ -43,6 +44,16 @@ class IssueLike(Protocol):
     file: str
 
 
+_LEVEL_ORDER: list[Severity] = ["low", "medium", "high", "critical"]
+_REASONING_TOKENS = re.compile(r"[A-Za-z0-9_\u4e00-\u9fff]+")
+_STOP_TOKENS = {
+    "the", "a", "an", "is", "are", "was", "were", "to", "of", "in", "on",
+    "and", "or", "for", "with", "this", "that", "it", "be", "as", "at",
+    "by", "from", "should", "could", "would", "may", "might", "can",
+    "问题", "代码", "建议", "可能", "如果", "因为", "所以", "这个", "那个",
+}
+
+
 def normalize_severity(value: str) -> Severity:
     """把 LLM 输出的大小写/同义词统一成标准等级。"""
     normalized = (value or "").strip().lower()
@@ -52,16 +63,36 @@ def normalize_severity(value: str) -> Severity:
     return "medium"
 
 
+def _calibrated_severity(issue: IssueLike) -> Severity:
+    """按置信度校准严重级别。
+
+    validator 的阈值是 0.6，但 0.6 的 high 与 0.9 的 high 不应等价。
+    低于 0.6 视为低置信噪声；0.6–0.75 降一级；更高保持原级别。
+    """
+    severity = normalize_severity(issue.severity)
+    confidence = float(getattr(issue, "confidence", 1.0) or 0.0)
+    if confidence < 0.6:
+        return "low"
+    if confidence < 0.75:
+        index = max(0, _LEVEL_ORDER.index(severity) - 1)
+        return _LEVEL_ORDER[index]
+    return severity
+
+
 def assess_risk(issues: Iterable[IssueLike]) -> Tuple[str, str]:
-    """根据问题集合计算风险等级与可读的解释。"""
+    """根据问题集合计算风险等级与可读的解释。
+
+    严重级别按 confidence 校准，避免多个 0.6 的推测性 high 把 PR 直接
+    推到 HIGH / REQUEST_CHANGES；同时不再因为“low 问题数量多”升级风险。
+    """
     issues = list(issues)
-    counts = Counter(normalize_severity(issue.severity) for issue in issues)
+    counts = Counter(_calibrated_severity(issue) for issue in issues)
 
     if counts["critical"]:
         level = "CRITICAL"
     elif counts["high"]:
         level = "HIGH"
-    elif counts["medium"] or len(issues) > 3:
+    elif counts["medium"]:
         level = "MEDIUM"
     else:
         level = "LOW"
@@ -98,23 +129,93 @@ def unique_files(issues: Iterable[IssueLike]) -> list[str]:
     return files
 
 
-def _fingerprint(issue: IssueLike) -> tuple[str, ...]:
-    """用于跨维度去重的轻量指纹。
+def _issue_text(issue: IssueLike) -> str:
+    parts = [
+        getattr(issue, "reasoning", "") or "",
+        getattr(issue, "suggestion", "") or "",
+    ]
+    return " ".join(" ".join(parts).lower().split())
 
-    优先使用“文件 + 归一化 reasoning”，因为不同维度对同一问题的描述往往
-    高度相似；reasoning 为空时退回 category + suggestion。
+
+def _issue_tokens(issue: IssueLike) -> set[str]:
+    return {
+        token
+        for token in _REASONING_TOKENS.findall(_issue_text(issue))
+        if token not in _STOP_TOKENS and len(token) > 1
+    }
+
+
+def _text_similarity(left: IssueLike, right: IssueLike) -> float:
+    """token Jaccard / containment 的较大值。
+
+    纯 exact-string 去重无法合并“hardcoded secret in login”与
+    “hardcoded API key in login function”这类改写；containment 能覆盖
+    短描述被长描述包含的情况，Jaccard 则防止只共享一个通用词就合并。
     """
-    reasoning = " ".join((getattr(issue, "reasoning", "") or "").lower().split())
-    file_key = (issue.file or "").strip().lower()
-    line_key = str(getattr(issue, "line", None) or "")
-    if reasoning:
-        return (file_key, line_key, reasoning)
+    left_tokens = _issue_tokens(left)
+    right_tokens = _issue_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    intersection = len(left_tokens & right_tokens)
+    union = len(left_tokens | right_tokens)
+    jaccard = intersection / union if union else 0.0
+    containment = intersection / min(len(left_tokens), len(right_tokens))
+    return max(jaccard, containment)
 
-    category = (getattr(issue, "category", "") or "").strip().lower()
-    suggestion = " ".join(
-        (getattr(issue, "suggestion", "") or "").lower().split()
+
+def _reasoning_similarity(left: IssueLike, right: IssueLike) -> float:
+    left_text = " ".join((getattr(left, "reasoning", "") or "").lower().split())
+    right_text = " ".join((getattr(right, "reasoning", "") or "").lower().split())
+    if not left_text or not right_text:
+        return 0.0
+    if left_text == right_text:
+        return 1.0
+    left_tokens = set(_REASONING_TOKENS.findall(left_text)) - _STOP_TOKENS
+    right_tokens = set(_REASONING_TOKENS.findall(right_text)) - _STOP_TOKENS
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / min(
+        len(left_tokens), len(right_tokens)
     )
-    return (file_key, line_key, category, suggestion)
+
+
+def _line_distance(left: IssueLike, right: IssueLike) -> Optional[int]:
+    left_line = getattr(left, "line", None)
+    right_line = getattr(right, "line", None)
+    if left_line is None or right_line is None:
+        return None
+    try:
+        return abs(int(left_line) - int(right_line))
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_duplicate(left: IssueLike, right: IssueLike) -> bool:
+    if (left.file or "").strip().lower() != (right.file or "").strip().lower():
+        return False
+
+    similarity = _text_similarity(left, right)
+    distance = _line_distance(left, right)
+    left_category = (getattr(left, "category", "") or "").strip().lower()
+    right_category = (getattr(right, "category", "") or "").strip().lower()
+
+    if distance is None:
+        # 至少一侧没有行号：reasoning 几乎相同（不同维度对同一问题
+        # 常只改 suggestion）时合并；否则要求整段描述高度相似且类别一致，
+        # 避免把“同文件的两个不同文件级问题”误合并。
+        reasoning_similarity = _reasoning_similarity(left, right)
+        if reasoning_similarity >= 0.8:
+            return True
+        return (
+            similarity >= 0.75
+            and bool(left_category)
+            and left_category == right_category
+        )
+    if distance <= 2:
+        return similarity >= 0.5
+    if distance <= 8:
+        return similarity >= 0.7
+    return False
 
 
 def _merge_source_aspects(target: IssueLike, *others: IssueLike) -> None:
@@ -149,22 +250,27 @@ def _merge_context_refs(target: IssueLike, *others: IssueLike) -> None:
 
 
 def deduplicate_issues(issues: Iterable[IssueLike]) -> list:
-    """跨维度去重，保留严重级别更高（同级则置信度更高）的那一条。
+    """跨维度语义去重，保留严重级别更高（同级则置信度更高）的那一条。
 
+    不再使用精确字符串指纹：不同维度/不同批次对同一问题的措辞几乎不会
+    完全一致。这里改为“同文件 + 行号邻近 + token 相似度”聚类。
     返回的代表项会合并所有重复项的来源维度（source_aspects），供评测做
     维度贡献度统计。
     """
-    best: dict[tuple[str, ...], IssueLike] = {}
-    order: list[tuple[str, ...]] = []
+    representatives: list[IssueLike] = []
 
     for issue in issues:
-        key = _fingerprint(issue)
-        if key not in best:
-            best[key] = issue
-            order.append(key)
+        match_index: Optional[int] = None
+        for index, existing in enumerate(representatives):
+            if _is_duplicate(existing, issue):
+                match_index = index
+                break
+
+        if match_index is None:
+            representatives.append(issue)
             continue
 
-        existing = best[key]
+        existing = representatives[match_index]
         existing_rank = (
             SEVERITY_WEIGHTS.get(normalize_severity(existing.severity), 0),
             existing.confidence,
@@ -176,12 +282,12 @@ def deduplicate_issues(issues: Iterable[IssueLike]) -> list:
         if new_rank > existing_rank:
             _merge_source_aspects(issue, existing)
             _merge_context_refs(issue, existing)
-            best[key] = issue
+            representatives[match_index] = issue
         else:
             _merge_source_aspects(existing, issue)
             _merge_context_refs(existing, issue)
 
-    return [best[key] for key in order]
+    return representatives
 
 
 def _unique_strings(values: Iterable[str]) -> list[str]:

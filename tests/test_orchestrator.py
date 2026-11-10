@@ -137,6 +137,63 @@ def test_aggregate_merges_source_aspects_for_duplicate_findings():
     assert set(result.potential_issues[0].source_aspects) == {"bugs", "security"}
 
 
+def test_merge_review_results_merges_paraphrased_findings():
+    from openreview.review.assessment import deduplicate_issues
+
+    first = PotentialIssue(
+        file="src/auth.py",
+        severity="high",
+        category="security",
+        confidence=0.9,
+        reasoning="Hardcoded secret in login().",
+        suggestion="Use env vars.",
+        line=10,
+    )
+    paraphrase = PotentialIssue(
+        file="src/auth.py",
+        severity="critical",
+        category="bugs",
+        confidence=0.8,
+        reasoning="Hardcoded API key in the login function.",
+        suggestion="Use environment variables.",
+        line=11,
+    )
+    unrelated = PotentialIssue(
+        file="src/auth.py",
+        severity="high",
+        category="performance",
+        confidence=0.8,
+        reasoning="N+1 query in the dashboard loader.",
+        suggestion="Batch the queries.",
+        line=11,
+    )
+
+    deduped = deduplicate_issues([first, paraphrase, unrelated])
+
+    assert len(deduped) == 2
+    assert deduped[0].severity == "critical"
+    assert "login" in deduped[0].reasoning.lower()
+    assert any("N+1" in issue.reasoning for issue in deduped)
+
+
+def test_risk_is_calibrated_by_confidence():
+    from openreview.review.assessment import assess_risk
+
+    speculative = PotentialIssue(
+        file="src/a.py",
+        severity="high",
+        category="bugs",
+        confidence=0.61,
+        reasoning="Possibly null.",
+        suggestion="Add a guard.",
+        line=1,
+    )
+
+    level, _ = assess_risk([speculative])
+
+    assert level == "MEDIUM"
+
+
 def test_merge_review_results_deduplicates_and_recomputes():
     duplicate_high = PotentialIssue(
         file="src/a.py",

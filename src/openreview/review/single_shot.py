@@ -30,10 +30,12 @@ SINGLE_SHOT_INSTRUCTION = """### 【一次性审查任务】
 - clean_code：结构性可维护性问题（重复代码、职责过多、魔法数字、隐藏耦合）
 - test_gap：本次改动缺少必要的测试覆盖
 
-报告范围包括本次 diff 引入的问题，以及 Patch/Context 中可见的未改动代码里的历史问题
-（历史问题需在 reasoning 中标注「历史问题，非本次改动引入」）。
+只报告本次 diff 引入（或本次改动直接使其变得危险）的问题，scope 填 introduced。
+未改动代码里的历史问题默认不要报告；如果确实相关，必须把 scope 填为 pre_existing，
+系统默认会过滤这类 finding。
 只报告输入中有直接证据的问题；没有发现时 issues 返回空列表。
-行号必须来自 Patch 左侧标注的新文件行号；evidence 只填代码本身，不要带行号或 `|` 前缀。
+新增/上下文行使用 Patch 标注的新文件行号并设 side=RIGHT；删除行使用 `L` 标注的
+旧文件行号并设 side=LEFT。evidence 只填代码本身，不要带行号或 `|` 前缀。
 """
 
 

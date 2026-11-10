@@ -82,6 +82,10 @@ class ParsedChangedFile(BaseModel):
     changed_lines: List[int] = Field(default_factory=list)
     # 新增：Patch 中新文件侧可见的行号（新增行 + 上下文行，用于校验行号是否落在 diff 内）
     visible_lines: List[int] = Field(default_factory=list)
+    # 删除行在旧文件中的行号（用于 LEFT 侧行内评论和证据校验）
+    deleted_lines: List[int] = Field(default_factory=list)
+    # 旧文件侧可见的行号（删除行 + 上下文行）
+    old_visible_lines: List[int] = Field(default_factory=list)
 
 
 class ParsedDiff(BaseModel):
@@ -295,6 +299,18 @@ class DiffParser:
         return unique_lines
 
     @staticmethod
+    def extract_deleted_lines(patch: Optional[str]) -> List[int]:
+        """提取删除行在旧文件侧的行号。"""
+        deleted, _ = _extract_side_lines(patch)
+        return deleted
+
+    @staticmethod
+    def extract_old_visible_lines(patch: Optional[str]) -> List[int]:
+        """提取旧文件侧可见的行号（删除行 + 上下文行）。"""
+        _, visible = _extract_side_lines(patch)
+        return visible
+
+    @staticmethod
     def split_patch_into_hunks(patch: Optional[str]) -> List[str]:
         """把 patch 按 ``@@`` header 切成独立 hunk。
 
@@ -346,6 +362,8 @@ class DiffParser:
         )
         changed_lines = cls.extract_changed_lines(patch)
         visible_lines = cls.extract_visible_lines(patch)
+        deleted_lines = cls.extract_deleted_lines(patch)
+        old_visible_lines = cls.extract_old_visible_lines(patch)
         # 只统计 hunk 内的行；hunk 之前的 `---` / `+++` 是文件头，不是变更。
         # 不能用 `startswith("+++")` 判断，因为内容以 `++` 开头的真实新增行
         # 在 patch 里也会显示成 `+++...`。
@@ -372,6 +390,8 @@ class DiffParser:
                 "enclosing_contexts": contexts,
                 "changed_lines": changed_lines,
                 "visible_lines": visible_lines,
+                "deleted_lines": deleted_lines,
+                "old_visible_lines": old_visible_lines,
             }
         )
 
@@ -403,6 +423,8 @@ class DiffParser:
         )
         changed_lines = cls.extract_changed_lines(patch)
         visible_lines = cls.extract_visible_lines(patch)
+        deleted_lines = cls.extract_deleted_lines(patch)
+        old_visible_lines = cls.extract_old_visible_lines(patch)
 
         return ParsedChangedFile(
             filename=filename,
@@ -419,6 +441,8 @@ class DiffParser:
             enclosing_contexts=contexts,
             changed_lines=changed_lines,
             visible_lines=visible_lines,
+            deleted_lines=deleted_lines,
+            old_visible_lines=old_visible_lines,
         )
 
     @classmethod
@@ -429,3 +453,42 @@ class DiffParser:
         return ParsedDiff(
             files=parsed_files, total_additions=total_add, total_deletions=total_del
         )
+
+
+def _extract_side_lines(
+    patch: Optional[str],
+) -> tuple[List[int], List[int]]:
+    """返回 (删除行旧号, 旧文件侧可见行号)。"""
+    if not patch:
+        return [], []
+
+    old_line: Optional[int] = None
+    deleted: List[int] = []
+    visible: List[int] = []
+
+    for raw_line in patch.splitlines():
+        header = HUNK_RANGE_PATTERN.match(raw_line)
+        if header:
+            old_line = int(header.group(1))
+            continue
+        if old_line is None:
+            continue
+        if raw_line.startswith("-"):
+            deleted.append(old_line)
+            visible.append(old_line)
+            old_line += 1
+        elif raw_line.startswith(" "):
+            visible.append(old_line)
+            old_line += 1
+        # 新增行只增加新文件侧行号，不影响旧文件侧
+
+    def _unique(values: List[int]) -> List[int]:
+        seen: Set[int] = set()
+        result: List[int] = []
+        for value in values:
+            if value not in seen:
+                seen.add(value)
+                result.append(value)
+        return result
+
+    return _unique(deleted), _unique(visible)

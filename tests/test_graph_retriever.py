@@ -164,6 +164,40 @@ def test_caller_contexts_dedupe_multiple_call_sites(tmp_path: Path):
         index.close()
 
 
+def test_callee_definition_is_disambiguated_by_import(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "pkg").mkdir()
+    (root / "pkg" / "util.py").write_text(
+        "def helper():\n    return 1\n", encoding="utf-8"
+    )
+    (root / "pkg" / "other.py").write_text(
+        "def helper():\n    return 2\n", encoding="utf-8"
+    )
+    (root / "pkg" / "api.py").write_text(
+        "from pkg.other import helper\n"
+        "\n"
+        "def get_user():\n"
+        "    return helper()\n",
+        encoding="utf-8",
+    )
+    _init_repo(root)
+
+    index = RepoIndex.for_worktree(root, cache_dir=tmp_path / "idx")
+    try:
+        contexts = GraphRetriever().retrieve(
+            root,
+            index,
+            RetrievalQuery(symbols=["get_user"], files=["pkg/api.py"]),
+        )
+        callee = next(
+            context for context in contexts if context.kind == "callee"
+        )
+        assert callee.file_path == "pkg/other.py"
+    finally:
+        index.close()
+
+
 def test_callees_of_escapes_like_wildcards(tmp_path: Path):
     root = tmp_path / "repo"
     root.mkdir()

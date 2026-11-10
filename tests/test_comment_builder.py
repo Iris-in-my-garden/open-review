@@ -46,6 +46,24 @@ def test_inline_comments_are_built_for_line_level_issues():
     assert "password = '123'" in comment["body"]
 
 
+def test_deleted_line_issue_uses_left_side():
+    issue = PotentialIssue(
+        file="src/a.py",
+        severity="high",
+        category="security",
+        confidence=0.9,
+        reasoning="A required validation was deleted.",
+        suggestion="Restore it.",
+        line=8,
+        side="LEFT",
+    )
+
+    comments = build_review_comments(_result([issue]))
+
+    assert comments[0]["side"] == "LEFT"
+    assert comments[0]["line"] == 8
+
+
 def test_file_level_issues_go_to_review_body():
     issue = PotentialIssue(
         file="src/a.py",

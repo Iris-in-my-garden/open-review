@@ -1,0 +1,97 @@
+[
+  {
+    "name": "introduced_grounded_is_kept",
+    "patch": "@@ -1,2 +1,2 @@\n-password = \"123\"\n+password = os.environ[\"PASSWORD\"]\n",
+    "issues": [
+      {
+        "file": "src/auth.py",
+        "severity": "high",
+        "category": "security",
+        "confidence": 0.8,
+        "reasoning": "Secret is still hardcoded.",
+        "suggestion": "Use env vars.",
+        "line": 1,
+        "scope": "introduced",
+        "side": "RIGHT",
+        "evidence": "password = os.environ[\"PASSWORD\"]"
+      }
+    ],
+    "expected_kept": 1
+  },
+  {
+    "name": "pre_existing_is_dropped",
+    "patch": "@@ -1,2 +1,2 @@\n-password = \"123\"\n+password = os.environ[\"PASSWORD\"]\n",
+    "issues": [
+      {
+        "file": "src/auth.py",
+        "severity": "critical",
+        "category": "security",
+        "confidence": 0.9,
+        "reasoning": "Legacy issue in untouched code.",
+        "suggestion": "Refactor later.",
+        "line": 1,
+        "scope": "pre_existing",
+        "side": "RIGHT",
+        "evidence": "password = os.environ[\"PASSWORD\"]"
+      }
+    ],
+    "expected_kept": 0
+  },
+  {
+    "name": "hallucinated_line_is_dropped",
+    "patch": "@@ -1,2 +1,2 @@\n-password = \"123\"\n+password = os.environ[\"PASSWORD\"]\n",
+    "issues": [
+      {
+        "file": "src/auth.py",
+        "severity": "high",
+        "category": "security",
+        "confidence": 0.9,
+        "reasoning": "Line does not exist in the diff.",
+        "suggestion": "Check it.",
+        "line": 99,
+        "scope": "introduced",
+        "side": "RIGHT",
+        "evidence": "password = os.environ[\"PASSWORD\"]"
+      }
+    ],
+    "expected_kept": 0
+  },
+  {
+    "name": "deleted_line_evidence_is_valid_on_left",
+    "patch": "@@ -7,2 +7,2 @@\n-    check_password(password)\n+    return password\n",
+    "issues": [
+      {
+        "file": "src/auth.py",
+        "severity": "high",
+        "category": "security",
+        "confidence": 0.8,
+        "reasoning": "A required validation was removed.",
+        "suggestion": "Restore the check.",
+        "line": 7,
+        "scope": "introduced",
+        "side": "LEFT",
+        "evidence": "check_password(password)"
+      }
+    ],
+    "expected_kept": 1
+  },
+  {
+    "name": "ungrounded_evidence_is_dropped",
+    "patch": "@@ -1,2 +1,2 @@\n-password = \"123\"\n+password = os.environ[\"PASSWORD\"]\n",
+    "issues": [
+      {
+        "file": "src/auth.py",
+        "severity": "high",
+        "category": "security",
+        "confidence": 0.7,
+        "reasoning": "Evidence is invented.",
+        "suggestion": "N/A.",
+        "line": 1,
+        "scope": "introduced",
+        "side": "RIGHT",
+        "evidence": "api_key = definitely_not_in_the_patch"
+      }
+    ],
+    "expected_kept": 0
+  }
+]

@@ -14,7 +14,16 @@ from openreview.review.token_budget import (
     context_reserve_tokens_for,
 )
 from openreview.review.workflow import ReviewStatus
+from openreview.services.review_executor import ReviewExecutor
 from openreview.services.review_service import ReviewPipeline
+
+
+def test_narrow_aspects_keeps_security_when_budget_is_tight():
+    narrowed = ReviewExecutor._narrow_aspects(
+        ["clean_code", "bugs", "performance", "security"], 1
+    )
+
+    assert narrowed == ["security"]
 
 
 class FakeGitHubClient:

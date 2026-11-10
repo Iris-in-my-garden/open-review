@@ -181,6 +181,35 @@ def test_plan_review_batches_preserves_all_hunks():
     assert actual_headers == expected_headers
 
 
+def test_dependency_ordering_keeps_related_files_together():
+    diff = ParsedDiff(
+        files=[
+            _file("src/a.py", 10),
+            _file("src/b.py", 10),
+            _file("src/c.py", 10),
+            _file("src/d.py", 10),
+        ]
+    )
+    total = sum(file_patch_cost(file) for file in diff.files)
+
+    batches = plan_review_batches(
+        diff,
+        soft_prompt_tokens=total // 2,
+        hard_prompt_tokens=total // 2,
+        prompt_overhead_tokens=0,
+        context_reserve_tokens=0,
+        dependencies={"src/a.py": {"src/d.py"}},
+    )
+
+    groups = [{file.filename for file in batch.files} for batch in batches]
+    assert any({"src/a.py", "src/d.py"} <= group for group in groups)
+    # 所有文件仍然只出现一次。
+    flattened = [
+        file.filename for batch in batches for file in batch.files
+    ]
+    assert sorted(flattened) == ["src/a.py", "src/b.py", "src/c.py", "src/d.py"]
+
+
 def test_plan_review_batches_respects_legacy_max_batch_tokens():
     diff = ParsedDiff(
         files=[_file("src/a.py", 2), _file("src/b.py", 2)]

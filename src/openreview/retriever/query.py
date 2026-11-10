@@ -82,7 +82,7 @@ class QueryBuilder:
         index: Optional[RepoIndex] = None,
     ) -> RetrievalQuery:
         files = [file.filename for file in parsed_diff.files if file.filename]
-        symbols = self._collect_symbols(parsed_diff)
+        symbols = self._collect_symbols(parsed_diff, index)
         modules = self._module_variants(files)
         imports = self._collect_imports(index, files)
         added_identifiers, string_terms = self._collect_added_line_terms(parsed_diff)
@@ -104,9 +104,28 @@ class QueryBuilder:
             terms=terms,
         )
 
-    @staticmethod
-    def _collect_symbols(parsed_diff: ParsedDiff) -> List[str]:
+    @classmethod
+    def _collect_symbols(
+        cls, parsed_diff: ParsedDiff, index: Optional[RepoIndex] = None
+    ) -> List[str]:
         symbols: List[str] = []
+
+        def _add(value: str) -> None:
+            cleaned = value.strip()
+            if cleaned and len(cleaned) >= 3 and cleaned not in symbols:
+                symbols.append(cleaned)
+
+        # 只改函数体（没改签名）时，diff 正则提取不到 changed_symbols；
+        # 用 AST 索引反查 changed_lines 的包围定义，补上真正的审查对象。
+        if index is not None:
+            for file_diff in parsed_diff.files:
+                for line in (file_diff.changed_lines or [])[:40]:
+                    enclosing = index.enclosing_symbol(file_diff.filename, line)
+                    if enclosing is None:
+                        continue
+                    _add(enclosing.name)
+                    _add(enclosing.qualname)
+
         for file_diff in parsed_diff.files:
             candidates = [
                 *(file_diff.changed_symbols or []),
@@ -114,13 +133,7 @@ class QueryBuilder:
                 *(file_diff.enclosing_contexts or []),
             ]
             for symbol in candidates:
-                cleaned = symbol.strip()
-                if (
-                    cleaned
-                    and len(cleaned) >= 3
-                    and cleaned not in symbols
-                ):
-                    symbols.append(cleaned)
+                _add(symbol)
         return symbols[:MAX_QUERY_SYMBOLS]
 
     @staticmethod

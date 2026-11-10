@@ -1,6 +1,7 @@
-from typing import List, Literal, Optional, Type
+import re
+from typing import Any, List, Literal, Optional, Type
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
 from openreview.review.assessment import (
@@ -12,7 +13,14 @@ from openreview.review.assessment import (
     normalize_severity,
     unique_files,
 )
-from openreview.review.report_writer import PotentialIssue, ReviewResult
+from openreview.review.report_writer import (
+    IssueScope,
+    IssueSide,
+    PotentialIssue,
+    ReviewResult,
+    normalize_scope,
+    normalize_side,
+)
 
 IssueCategory = Literal[
     "bugs", "security", "performance", "clean_code", "test_gap"
@@ -38,6 +46,61 @@ _CATEGORY_ALIASES = {
     "test_coverage": "test_gap",
     "testing": "test_gap",
 }
+
+# 未知分类不能一律收敛到 clean_code：模型偶尔会把安全/性能问题写错类别，
+# 直接映射成 clean_code 会让这类 finding 看起来“只是可维护性问题”。
+# 英文关键词按单词边界匹配，避免 "auth" 命中 "author"、"test" 命中 "latest"。
+_CATEGORY_KEYWORDS = (
+    (
+        "security",
+        (
+            "security", "secret", "credential", "password", "injection", "xss",
+            "csrf", "ssrf", "authentication", "authorization", "permission",
+            "crypto", "certificate", "vulnerability", "密钥", "证书", "注入",
+            "鉴权", "权限", "安全",
+        ),
+    ),
+    (
+        "performance",
+        (
+            "performance", "latency", "memory", "cpu", "n+1", "complexity",
+            "slow", "cache", "throughput", "性能", "复杂度", "内存", "延迟",
+        ),
+    ),
+    (
+        "test_gap",
+        ("test", "tests", "coverage", "assert", "fixture", "mock", "测试", "覆盖"),
+    ),
+    (
+        "bugs",
+        (
+            "bug", "null", "none", "exception", "error", "crash", "race",
+            "overflow", "off-by-one", "undefined", "panic", "deadlock",
+            "空指针", "异常", "越界", "逻辑",
+        ),
+    ),
+)
+
+
+def _keyword_pattern(keyword: str) -> re.Pattern[str]:
+    escaped = re.escape(keyword)
+    if keyword.isascii():
+        return re.compile(rf"(?<![A-Za-z0-9_]){escaped}(?![A-Za-z0-9_])")
+    return re.compile(escaped)
+
+
+_CATEGORY_PATTERNS = tuple(
+    (category, tuple(_keyword_pattern(word) for word in words))
+    for category, words in _CATEGORY_KEYWORDS
+)
+
+
+def _infer_category(text: str) -> str:
+    lowered = text.lower()
+    for category, patterns in _CATEGORY_PATTERNS:
+        if any(pattern.search(lowered) for pattern in patterns):
+            return category
+    return "clean_code"
 
 
 class PotentialIssueSchema(BaseModel):
@@ -72,6 +135,20 @@ class PotentialIssueSchema(BaseModel):
     end_line: Optional[int] = Field(
         default=None,
         description="多行问题的结束行号（可选，需 >= line）",
+    )
+    scope: IssueScope = Field(
+        default="introduced",
+        description=(
+            "问题来源：introduced=本次 diff 新增/修改的代码引入；"
+            "pre_existing=未改动代码里的历史问题（默认会被系统过滤）"
+        ),
+    )
+    side: IssueSide = Field(
+        default="RIGHT",
+        description=(
+            "行号属于哪一侧：RIGHT=新文件侧（新增/上下文行）；"
+            "LEFT=删除行（使用旧文件行号）"
+        ),
     )
     evidence: Optional[str] = Field(
         default=None,
@@ -114,8 +191,39 @@ class PotentialIssueSchema(BaseModel):
             .replace(" ", "_")
         )
         text = _CATEGORY_ALIASES.get(text, text)
-        # 未知分类收敛到 clean_code，避免一个拼写错误让整条结构化响应解析失败。
-        return text if text in _CATEGORY_VALUES else "clean_code"
+        # 未知分类先按关键词推断，再退回 clean_code，避免把安全问题误标成可维护性。
+        return text if text in _CATEGORY_VALUES else _infer_category(text)
+
+    @field_validator("scope", mode="before")
+    @classmethod
+    def _normalize_scope(cls, value: object) -> IssueScope:
+        return normalize_scope(value)
+
+    @field_validator("side", mode="before")
+    @classmethod
+    def _normalize_side(cls, value: object) -> IssueSide:
+        return normalize_side(value)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _infer_unknown_category(cls, data: Any) -> Any:
+        """仅当模型给出未知 category 时，用 reasoning/suggestion 推断。
+
+        不能在所有 ``clean_code`` 上做推断：模型明确选择 clean_code 时，
+        描述里出现 "test" / "error" 等词并不代表分类错了。
+        """
+        if not isinstance(data, dict):
+            return data
+        raw = str(data.get("category") or "").strip().lower()
+        raw = raw.replace("-", "_").replace(" ", "_")
+        if not raw or raw in _CATEGORY_VALUES or raw in _CATEGORY_ALIASES:
+            return data
+        inferred = _infer_category(
+            f"{data.get('reasoning', '')} {data.get('suggestion', '')}"
+        )
+        if inferred == "clean_code":
+            return data
+        return {**data, "category": inferred}
 
 
 class AspectReviewOutputSchema(BaseModel):
@@ -226,6 +334,8 @@ class OutputParser:
                     suggestion=issue.suggestion,
                     line=issue.line,
                     end_line=issue.end_line,
+                    scope=issue.scope,
+                    side=issue.side,
                     evidence=issue.evidence,
                     suggested_patch=issue.suggested_patch,
                     context_refs=list(issue.context_refs),

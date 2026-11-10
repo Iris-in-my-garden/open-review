@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Sequence
 
 from openreview.retriever.ast_utils import read_line_range
 from openreview.retriever.code_context import CodeContext, make_context_id
-from openreview.retriever.index import RepoIndex
+from openreview.retriever.index import RepoIndex, module_name
 from openreview.retriever.query import RetrievalQuery
 
 logger = logging.getLogger(__name__)
@@ -178,6 +178,47 @@ class GraphRetriever:
                 break
         return contexts
 
+    @staticmethod
+    def _resolve_definition(
+        index: RepoIndex,
+        edge,
+        definitions: Sequence,
+    ):
+        """在同名定义中消歧。
+
+        ``search_symbols`` 只按名字召回；``login`` 可能同时存在于多个
+        Service 类里。优先选调用方同文件的定义，其次是调用方 import 的
+        模块里的定义，最后才退回索引评分。
+        """
+        if not definitions:
+            return None
+        if len(definitions) == 1:
+            return definitions[0]
+
+        imports_of = getattr(index, "imports_of", None)
+        imported_modules: set[str] = set()
+        imported_symbols: set[str] = set()
+        if callable(imports_of):
+            try:
+                for item in imports_of([edge.caller_file]):
+                    imported_modules.add(item.dst_module)
+                    if item.symbol:
+                        imported_symbols.add(item.symbol)
+            except Exception:  # noqa: BLE001 - import 图失败不应阻断 callee 检索
+                pass
+
+        def _rank(definition) -> float:
+            score = float(getattr(definition, "score", 0.0) or 0.0)
+            if definition.file_path == edge.caller_file:
+                score += 3.0
+            if module_name(definition.file_path) in imported_modules:
+                score += 2.0
+            if definition.name in imported_symbols:
+                score += 1.0
+            return score
+
+        return max(definitions, key=_rank)
+
     def _callee_contexts(
         self,
         repo_path: Path,
@@ -194,10 +235,12 @@ class GraphRetriever:
         ):
             if self.python_calls_only and not edge.caller_file.endswith(".py"):
                 continue
-            matches = index.search_symbols([edge.callee_name], limit=8)
-            definition = next(
-                (item for item in matches if item.name == edge.callee_name), None
-            )
+            definitions = [
+                item
+                for item in index.search_symbols([edge.callee_name], limit=16)
+                if item.name == edge.callee_name
+            ]
+            definition = self._resolve_definition(index, edge, definitions)
             if definition is None:
                 continue
             key = (definition.file_path, definition.start_line)

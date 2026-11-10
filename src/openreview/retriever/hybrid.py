@@ -14,14 +14,14 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Set
 
-from openreview.repo.diff_parser import ParsedDiff
+from openreview.repo.diff_parser import DiffParser, ParsedDiff
 from openreview.retriever.ast_utils import read_line_range
 from openreview.retriever.base import Retriever
 from openreview.retriever.code_context import CodeContext, make_context_id
 from openreview.retriever.graph import GraphRetriever
-from openreview.retriever.index import RepoIndex
+from openreview.retriever.index import RepoIndex, module_name
 from openreview.retriever.query import QueryBuilder, RetrievalQuery
 from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
 
@@ -104,6 +104,59 @@ class HybridRetriever:
 
         self.last_stats = stats
         return _rank_and_dedupe(contexts, self.max_contexts)
+
+    def related_files(
+        self,
+        repo_path: Path,
+        parsed_diff: ParsedDiff,
+        base_path: Optional[Path] = None,
+    ) -> Dict[str, Set[str]]:
+        """返回变更文件之间的轻量依赖关系。
+
+        仅用于 dependency-aware batching：把有 import 关系或测试-源码关系
+        的文件排进同一批次，让模型能看到跨文件交互。这不是完整 call graph，
+        失败时返回空关系，batching 退化为原始顺序。
+
+        ``base_path`` 仅为与 ``retrieve`` 接口对齐；import 关系取自 head
+        侧的仓库索引。
+        """
+        filenames = [f.filename for f in parsed_diff.files if f.filename]
+        related: Dict[str, Set[str]] = {name: set() for name in filenames}
+
+        def _link(left: str, right: str) -> None:
+            if left and right and left != right:
+                related.setdefault(left, set()).add(right)
+                related.setdefault(right, set()).add(left)
+
+        # 测试文件即使不 import 源码，也应与对应源码同批审查。
+        sources = [name for name in filenames if not DiffParser.is_test_path(name)]
+        tests = [name for name in filenames if DiffParser.is_test_path(name)]
+        for source in sources:
+            for test in tests:
+                if DiffParser.is_linked_test(source, test):
+                    _link(source, test)
+
+        if not self.enabled or not filenames:
+            return related
+
+        stats: Dict[str, float] = {}
+        index = self._get_index(Path(repo_path).resolve(), stats)
+        if index is None:
+            return related
+
+        by_module: Dict[str, str] = {}
+        for name in filenames:
+            by_module.setdefault(module_name(name), name)
+
+        try:
+            for edge in index.imports_of(filenames):
+                target = by_module.get(edge.dst_module)
+                if target is None:
+                    continue
+                _link(edge.src_file, target)
+        except Exception as exc:  # noqa: BLE001 - 依赖关系失败不应阻断 review
+            logger.debug("Dependency lookup failed: %s", exc)
+        return related
 
     def _get_index(
         self, repo_path: Path, stats: Dict[str, float]

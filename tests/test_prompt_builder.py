@@ -166,16 +166,29 @@ def test_context_ids_are_rendered_and_injected_next_to_matching_file():
 def test_output_constraints_cover_evidence_threshold_and_scope():
     prompt = PromptBuilder().build_user_prompt(_pr(), _diff(), [])
 
-    # evidence 不能带 Patch 左侧的行号/`|` 前缀，否则 validator 无法精确匹配。
-    assert "不要包含左侧行号" in prompt
+    # evidence 不能带行号/`|` 前缀，否则 validator 无法精确匹配。
+    assert "不要包含行号" in prompt
     # 模型必须知道系统真实的置信度阈值。
     assert "低于 0.6 会被直接丢弃" in prompt
-    # 范围同时覆盖本次改动和未改动代码中的历史问题，历史问题需显式标注。
+    # 默认只报本次 diff 引入的问题；历史问题需要显式 scope 且默认被过滤。
     assert "本次 diff 引入" in prompt
-    assert "未改动代码里的历史问题" in prompt
-    assert "历史问题，非本次改动引入" in prompt
+    assert "pre_existing" in prompt
+    assert "系统默认会过滤" in prompt
+    assert "`side" in prompt
     assert "最多报告 8 个问题" in prompt
     assert "`category` 必须是" in prompt
+
+
+def test_deleted_lines_are_annotated_with_old_file_line_numbers():
+    patch = "@@ -7,2 +7,2 @@\n check()\n-gone = 1\n+kept = 1\n"
+    diff = DiffParser.parse_diff(
+        [{"filename": "src/utils.py", "status": "modified", "patch": patch}]
+    )
+
+    prompt = PromptBuilder().build_user_prompt(_pr(), diff, [])
+
+    assert "    L8 | -gone = 1" in prompt
+    assert "     8 | +kept = 1" in prompt
 
 
 def test_task_instruction_is_placed_before_output_constraints():
