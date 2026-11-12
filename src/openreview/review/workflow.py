@@ -97,9 +97,11 @@ class ReviewBudget:
 
     max_llm_calls: int = 0
     max_input_tokens: int = 0
+    max_output_tokens: int = 0
     max_seconds: float = 0.0
     used_llm_calls: int = 0
     used_input_tokens: int = 0
+    used_output_tokens: int = 0
     started_at: float = field(default_factory=time.monotonic)
     # 四个 aspect 由线程池并发执行，预算检查 + 扣减必须是同一临界区，
     # 否则多个线程可能同时通过检查，把“硬预算”变成软预算。
@@ -123,6 +125,12 @@ class ReviewBudget:
                 return None
             return max(0, self.max_input_tokens - self.used_input_tokens)
 
+    def remaining_output_tokens(self) -> Optional[int]:
+        with self._lock:
+            if self.max_output_tokens <= 0:
+                return None
+            return max(0, self.max_output_tokens - self.used_output_tokens)
+
     def _allow_unlocked(self, calls: int, tokens: int) -> bool:
         if self.max_seconds > 0 and self.elapsed() >= self.max_seconds:
             return False
@@ -134,6 +142,11 @@ class ReviewBudget:
         if (
             self.max_input_tokens > 0
             and self.used_input_tokens + max(0, tokens) > self.max_input_tokens
+        ):
+            return False
+        if (
+            self.max_output_tokens > 0
+            and self.used_output_tokens >= self.max_output_tokens
         ):
             return False
         return True
@@ -160,6 +173,27 @@ class ReviewBudget:
         with self._lock:
             self.used_llm_calls = max(0, self.used_llm_calls - max(0, calls))
             self.used_input_tokens = max(0, self.used_input_tokens - max(0, tokens))
+
+    def settle(
+        self,
+        *,
+        reserved_input_tokens: int,
+        actual_input_tokens: int,
+        actual_output_tokens: int = 0,
+    ) -> None:
+        """用 provider 返回的真实 usage 修正预扣的 input 预算。
+
+        ``reserve`` 只能按字符估算预扣；真实 token 数在响应后才拿得到。
+        如果只记 usage 不回冲预算，估算偏差会让 ``--budget-tokens`` 失去
+        硬上限语义。这里把本次预扣替换成真实 input，并累计 output。
+        """
+        with self._lock:
+            reserved = max(0, int(reserved_input_tokens))
+            actual_input = max(0, int(actual_input_tokens))
+            self.used_input_tokens = max(
+                0, self.used_input_tokens - reserved + actual_input
+            )
+            self.used_output_tokens += max(0, int(actual_output_tokens))
 
     def reserve(self, calls: int = 1, tokens: int = 0) -> None:
         """原子地检查并扣减预算；不足时抛 ``BudgetExceeded``。
@@ -229,6 +263,7 @@ class ReviewState:
     # 每次 run 开始时的客户端累计计数。pipeline 会被评测复用，
     # 直接用客户端上的累计值会把上一次 run 的成本算进本次报告。
     usage_start: Dict[str, int] = field(default_factory=dict)
+    llm_call_start: int = 0
     cache_hits_start: int = 0
     cache_misses_start: int = 0
 
@@ -335,6 +370,8 @@ class ReviewState:
                 "used_llm_calls": self.budget.used_llm_calls,
                 "max_input_tokens": self.budget.max_input_tokens,
                 "used_input_tokens": self.budget.used_input_tokens,
+                "max_output_tokens": self.budget.max_output_tokens,
+                "used_output_tokens": self.budget.used_output_tokens,
                 "elapsed_seconds": round(self.budget.elapsed(), 3),
             },
             "selected_aspects": list(self.selected_aspects),

@@ -296,6 +296,33 @@ def cmd_metrics(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gate(args: argparse.Namespace) -> int:
+    from evaluation.gate import (
+        GateThresholds,
+        evaluate_gate,
+        load_metrics,
+        print_gate_result,
+    )
+
+    thresholds = GateThresholds(
+        min_results_ok_rate=args.min_results_ok_rate,
+        max_unknown_file_rate=args.max_unknown_file_rate,
+        max_invalid_line_rate=args.max_invalid_line_rate,
+        max_ungrounded_rate=args.max_ungrounded_rate,
+        min_evidence_coverage=args.min_evidence_coverage,
+        min_attribution_coverage=args.min_attribution_coverage,
+    )
+    try:
+        metrics = load_metrics(args.metrics)
+    except (OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+    result = evaluate_gate(metrics, thresholds)
+    print_gate_result(result, args.metrics)
+    return 0 if result.passed else 1
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     from evaluation.report import (
         RunSpec,
@@ -608,6 +635,24 @@ def build_parser() -> argparse.ArgumentParser:
     metrics.add_argument("--results-dir", type=Path, default=None)
     metrics.add_argument("--metrics-dir", type=Path, default=None)
     metrics.set_defaults(func=cmd_metrics)
+
+    gate = sub.add_parser(
+        "gate",
+        help="确定性指标硬阈值门禁（不调用 LLM，适合 CI）",
+    )
+    gate.add_argument(
+        "--metrics",
+        type=Path,
+        required=True,
+        help="metrics 命令产出的 deterministic_<run>.json",
+    )
+    gate.add_argument("--min-results-ok-rate", type=float, default=1.0)
+    gate.add_argument("--max-unknown-file-rate", type=float, default=0.0)
+    gate.add_argument("--max-invalid-line-rate", type=float, default=0.0)
+    gate.add_argument("--max-ungrounded-rate", type=float, default=0.0)
+    gate.add_argument("--min-evidence-coverage", type=float, default=0.8)
+    gate.add_argument("--min-attribution-coverage", type=float, default=0.9)
+    gate.set_defaults(func=cmd_gate)
 
     semantic = sub.add_parser(
         "semantic", parents=[common], help="可选的 AACR 官方语义 judge"

@@ -154,3 +154,64 @@ def test_budgeted_client_concurrent_calls_never_exceed_limit():
     assert results.count(True) == 2
     assert inner.calls == 2
     assert budget.used_llm_calls == 2
+
+
+def test_budgeted_client_settles_estimated_input_with_real_usage():
+    class UsageClient(FakeClient):
+        @property
+        def last_usage(self):
+            return {
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "total_tokens": 150,
+            }
+
+    inner = UsageClient()
+    budget = ReviewBudget(max_input_tokens=10_000, max_output_tokens=1_000)
+    client = BudgetedLLMClient(inner, budget)
+
+    client.generate_structured("sys", "user prompt", Output)
+
+    # 预扣的字符估算被 provider 真实 usage 替换，输出也计入预算。
+    assert budget.used_input_tokens == 120
+    assert budget.used_output_tokens == 30
+
+
+def test_budget_stops_when_output_cap_is_reached():
+    budget = ReviewBudget(max_output_tokens=50)
+    budget.settle(
+        reserved_input_tokens=0,
+        actual_input_tokens=0,
+        actual_output_tokens=50,
+    )
+
+    assert budget.remaining_output_tokens() == 0
+    assert not budget.allow(calls=1)
+
+
+def test_budgeted_client_charges_usage_even_when_parsing_fails():
+    """provider 已生成响应但解析失败时，成本已经发生，不能全额退款。"""
+
+    class ParseFailingClient(FakeClient):
+        @property
+        def last_usage(self):
+            return {
+                "prompt_tokens": 80,
+                "completion_tokens": 10,
+                "total_tokens": 90,
+            }
+
+        def generate_structured(self, system_prompt, user_prompt, response_schema):
+            self.calls += 1
+            raise RuntimeError("failed to parse structured output")
+
+    inner = ParseFailingClient()
+    budget = ReviewBudget(max_input_tokens=10_000)
+    client = BudgetedLLMClient(inner, budget)
+
+    with pytest.raises(RuntimeError, match="parse"):
+        client.generate_structured("sys", "user prompt", Output)
+
+    assert budget.used_llm_calls == 1
+    assert budget.used_input_tokens == 80
+    assert budget.used_output_tokens == 10

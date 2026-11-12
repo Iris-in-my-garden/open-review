@@ -142,6 +142,7 @@ class MetricsCollector:
             "reviewer_mode": config.reviewer_mode,
             "aspects": len(state.selected_aspects),
             "llm_calls": state.budget.used_llm_calls,
+            "llm_calls_detail": self._call_details(state, llm_client),
             "estimated_patch_tokens": patch_tokens,
             "estimated_context_tokens": context_tokens,
             "triage": {
@@ -166,6 +167,8 @@ class MetricsCollector:
                 "used_llm_calls": state.budget.used_llm_calls,
                 "max_input_tokens": state.budget.max_input_tokens,
                 "used_input_tokens": state.budget.used_input_tokens,
+                "max_output_tokens": state.budget.max_output_tokens,
+                "used_output_tokens": state.budget.used_output_tokens,
                 "max_seconds": state.budget.max_seconds,
                 "elapsed_seconds": round(state.budget.elapsed(), 3),
             },
@@ -206,6 +209,16 @@ class MetricsCollector:
         metrics["versions"] = ARTIFACT_VERSIONS.as_dict()
         metrics.update(self.outcome_metrics(state, outcome))
         return metrics  # type: ignore[return-value]
+
+    @staticmethod
+    def _call_details(state: ReviewState, llm_client: Any) -> list[Dict[str, Any]]:
+        """Per-call model/latency/token details for this run only."""
+        log = getattr(llm_client, "call_log", []) or []
+        start = max(0, int(getattr(state, "llm_call_start", 0) or 0))
+        details = [dict(item) for item in log[start:]]
+        for item in details:
+            item.setdefault("run_id", state.run_id)
+        return details
 
     def _cache_metrics(self, state: ReviewState, llm_client: Any) -> CacheMetrics:
         return {

@@ -53,6 +53,15 @@ def test_estimate_tokens_is_monotonic():
     assert estimate_tokens("a" * 300) > estimate_tokens("a" * 30)
 
 
+def test_estimate_tokens_does_not_underestimate_cjk():
+    """CJK 约 1-1.5 字符/token，旧的 len/3 会低估 2-3 倍并突破硬预算。"""
+    chinese = "这是一个用于测试中文 token 估算的句子" * 10
+    ascii_text = "a" * len(chinese)
+
+    assert estimate_tokens(chinese) > estimate_tokens(ascii_text) * 1.5
+
+
+
 def test_truncate_to_tokens_adds_marker():
     truncated, changed = truncate_to_tokens("x\n" * 1000, 20)
 

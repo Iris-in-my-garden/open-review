@@ -35,6 +35,7 @@ from openreview.review.cache import ReviewCache
 from openreview.review.comment_builder import (
     build_review_body,
     build_review_comments,
+    select_inline_issues,
 )
 from openreview.review.config import ReviewConfig
 from openreview.review.report_writer import ReportWriter
@@ -219,6 +220,7 @@ class ReviewExecutor:
             budget=ReviewBudget(
                 max_llm_calls=config.budget_calls,
                 max_input_tokens=config.budget_tokens,
+                max_output_tokens=config.budget_output_tokens,
                 max_seconds=config.budget_seconds,
             ),
             local_mode=local_mode,
@@ -232,6 +234,9 @@ class ReviewExecutor:
             bind_budget(state.budget)
         # 记录 run 开始时的累计值，后续用 delta 计算本次真实成本。
         state.usage_start = self._usage_snapshot()
+        state.llm_call_start = int(
+            len(getattr(self.llm_client, "call_log", []) or [])
+        )
         state.cache_hits_start = int(getattr(self.llm_client, "hits", 0) or 0)
         state.cache_misses_start = int(getattr(self.llm_client, "misses", 0) or 0)
         return state
@@ -663,14 +668,37 @@ class ReviewExecutor:
             return
         self._log(state, "post_comments", "Posting review comments to GitHub...")
         with self._timed(state, "post_comments"):
-            comments = build_review_comments(state.review_result)
-            self.gh_client.create_review(
-                state.pr_ref,
-                body=build_review_body(state.review_result),
-                comments=comments,
-                event="COMMENT",
-                commit_id=state.pr_info.head_sha,
+            inline_issues = select_inline_issues(state.review_result)
+            comments = build_review_comments(
+                state.review_result, inline_issues=inline_issues
             )
+            body = build_review_body(
+                state.review_result, inline_issues=inline_issues
+            )
+            upsert = getattr(self.gh_client, "upsert_review", None)
+            if callable(upsert):
+                result = upsert(
+                    state.pr_ref,
+                    body=body,
+                    comments=comments,
+                    event="COMMENT",
+                    commit_id=state.pr_info.head_sha,
+                )
+                deleted = int((result or {}).get("deleted", 0))
+                if deleted:
+                    state.add_note(
+                        f"[comments] 已替换 {deleted} 条旧 review，"
+                        f"发布 {len(comments)} 条行内评论。"
+                    )
+            else:
+                # Backward-compatible fallback for tests / custom clients.
+                self.gh_client.create_review(
+                    state.pr_ref,
+                    body=body,
+                    comments=comments,
+                    event="COMMENT",
+                    commit_id=state.pr_info.head_sha,
+                )
         logger.info("Posted %d inline comments", len(comments))
 
     def _node_finalize(self, state: ReviewState) -> None:

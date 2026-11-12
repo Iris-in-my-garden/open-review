@@ -65,3 +65,48 @@ def test_mock_client_usage_increment_is_thread_safe():
         sys.setswitchinterval(old_interval)
 
     assert client.usage["calls"] == workers * calls_per_worker
+
+
+def test_llm_client_records_per_call_log_and_output_cap(monkeypatch):
+    from types import SimpleNamespace
+
+    from pydantic import BaseModel
+
+    class Output(BaseModel):
+        value: int
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    with patch("openreview.review.llm_client.OpenAI") as mock_openai:
+        client = LLMClient(max_completion_tokens=256)
+        parse = mock_openai.return_value.beta.chat.completions.parse
+        parse.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        refusal=None, parsed=Output(value=1)
+                    )
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=100,
+                completion_tokens=20,
+                total_tokens=120,
+            ),
+        )
+
+        result = client.generate_structured("sys", "user", Output)
+
+    assert result.value == 1
+    assert parse.call_args.kwargs["max_completion_tokens"] == 256
+    assert client.last_usage == {
+        "prompt_tokens": 100,
+        "completion_tokens": 20,
+        "total_tokens": 120,
+    }
+    assert len(client.call_log) == 1
+    detail = client.call_log[0]
+    assert detail["model"] == client.model
+    assert detail["prompt_tokens"] == 100
+    assert detail["completion_tokens"] == 20
+    assert detail["total_tokens"] == 120
+    assert detail["latency_ms"] >= 0

@@ -80,6 +80,7 @@ class ReviewPipeline:
         aspect_timeout: float = 90.0,
         llm_timeout: float = 60.0,
         llm_max_retries: int = 0,
+        max_completion_tokens: int = 2048,
         temperature: float = 0.0,
         seed: Optional[int] = None,
         hybrid_retrieval_enabled: bool = True,
@@ -93,6 +94,7 @@ class ReviewPipeline:
         verify_severities: Sequence[str] = ("critical", "high"),
         budget_calls: int = 0,
         budget_tokens: int = 0,
+        budget_output_tokens: int = 0,
         budget_seconds: float = 0.0,
         review_cache_enabled: bool = False,
         review_cache_dir: Optional[str] = None,
@@ -122,6 +124,7 @@ class ReviewPipeline:
             aspect_timeout=aspect_timeout,
             llm_timeout=llm_timeout,
             llm_max_retries=llm_max_retries,
+            max_completion_tokens=max_completion_tokens,
             temperature=temperature,
             seed=seed,
             hybrid_retrieval_enabled=hybrid_retrieval_enabled,
@@ -135,6 +138,7 @@ class ReviewPipeline:
             verify_severities=verify_severities,
             budget_calls=budget_calls,
             budget_tokens=budget_tokens,
+            budget_output_tokens=budget_output_tokens,
             budget_seconds=budget_seconds,
             review_cache_enabled=review_cache_enabled,
             review_cache_dir=review_cache_dir,
@@ -176,6 +180,7 @@ class ReviewPipeline:
                 max_retries=llm_max_retries,
                 temperature=temperature,
                 seed=seed,
+                max_completion_tokens=max_completion_tokens,
             )
         )
         # 预算包在真实客户端外面：aspect / verifier / retry 的每次调用都扣账。

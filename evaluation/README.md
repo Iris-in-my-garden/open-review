@@ -98,6 +98,19 @@ uv run python -m evaluation.cli metrics \
 `deterministic_*.json` 覆盖行号合法性、证据可定位性、维度归因与 token 用量；
 `retrieval_*.json` 是 Phase 1/2 的检索质量指标，完全不调用 LLM：
 
+### 3. CI 门禁
+
+`gate` 只读取 `deterministic_*.json`，不调用模型，适合作为 CI 的必需检查：
+
+```bash
+uv run python -m evaluation.cli gate \
+  --metrics evaluation/metrics/aacr-pygo-v1/dev-mock/deterministic_dev-mock.json
+```
+
+默认硬阈值：结果不能有 error/missing，未知文件率、非法行号率、未 grounding
+的 evidence 率必须为 0，evidence/归因覆盖率有下限。阈值可通过 `--min-*` /
+`--max-*` 覆盖，但 `results_error` / `results_missing` 不允许放宽。
+
 - `file_recall` / `index_file_recall`：reference comment 指向的文件是否被上下文覆盖
 - `symbol_coverage`：diff 里的 changed symbols 有多少被检索回来
 - `citation_rate`：finding 是否真的引用了注入的 `context_refs`
@@ -110,7 +123,7 @@ uv run python -m evaluation.cli metrics \
 - `--no-hybrid-retrieval`：只保留 tree-sitter AST 检索
 - `--no-graph-retrieval`：保留 FTS5 符号索引，关闭 import/call graph
 
-### 3. 真实模型（按需，消耗 token）
+### 4. 真实模型（按需，消耗 token）
 
 ```bash
 export OPENAI_API_KEY=...
@@ -140,7 +153,7 @@ uv run python -m evaluation.cli review \
 input + output token，超过上限就在任何 LLM 调用前退出。实际 diff 大小和重试次数
 仍会影响最终用量；没有设置 token 预算时不要直接跑 `--split all`。
 
-### 4. 可选：AACR 官方语义评测
+### 5. 可选：AACR 官方语义评测
 
 ```bash
 # 1) clone AACR（只需一次）
@@ -165,7 +178,7 @@ AACR OCR 兼容字段（`review.comments[].content`、`review.summary.input_toke
 
 如果 AACR 目录不存在，跳过这一步即可；确定性指标仍然可用。
 
-### 5. 汇总多次 run
+### 6. 汇总多次 run
 
 `report` 子命令会把 `deterministic_*.json`、`retrieval_*.json` 和可选的
 `metrics_openreview_*.json` 合成 Markdown 表格，方便贴到 README / PR / 面试材料：

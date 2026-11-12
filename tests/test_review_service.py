@@ -937,3 +937,83 @@ def test_last_result_is_thread_local(tmp_path: Path):
         assert pipeline.last_result is sentinel
     finally:
         pipeline.close()
+
+
+def test_pipeline_uses_idempotent_upsert_when_client_supports_it(tmp_path: Path):
+    class UpsertGitHubClient(FakeGitHubClient):
+        def __init__(self):
+            super().__init__()
+            self.upserts = []
+
+        def upsert_review(
+            self, ref, body, comments, event="COMMENT", commit_id=None
+        ):
+            self.upserts.append(
+                {
+                    "ref": ref,
+                    "body": body,
+                    "comments": comments,
+                    "event": event,
+                    "commit_id": commit_id,
+                }
+            )
+            return {"review": {"id": 1}, "deleted": 2}
+
+    pipeline = ReviewPipeline(
+        mock_llm=True, max_batch_tokens=10_000, verifier_enabled=False
+    )
+    client = UpsertGitHubClient()
+    pipeline.gh_client = client
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+    pipeline.reviewer = FakeReviewer()
+
+    pipeline.run(
+        "https://github.com/org/repo/pull/1",
+        tmp_path / "reports",
+        post_comments=True,
+    )
+
+    assert len(client.upserts) == 1
+    # 不能同时走 create_review，否则会重复发评论。
+    assert client.reviews == []
+    assert client.upserts[0]["event"] == "COMMENT"
+    assert client.upserts[0]["commit_id"] == "head-sha"
+    assert pipeline.last_state is not None
+    assert any(
+        "已替换 2 条旧 review" in note for note in pipeline.last_state.notes
+    )
+
+    pipeline.close()
+
+
+def test_pipeline_wires_output_token_budget_into_state_and_metrics(tmp_path: Path):
+    pipeline = ReviewPipeline(
+        mock_llm=True,
+        max_batch_tokens=10_000,
+        budget_output_tokens=1234,
+        verifier_enabled=False,
+    )
+    pipeline.gh_client = FakeGitHubClient(
+        files=[
+            ChangedFile(
+                filename="src/file_0.py",
+                status="modified",
+                additions=1,
+                deletions=0,
+                changes=1,
+                patch="@@ -0,0 +1,1 @@\n+x = 1\n",
+            )
+        ]
+    )
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+
+    pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+
+    assert pipeline.last_state is not None
+    assert pipeline.last_state.budget.max_output_tokens == 1234
+    assert pipeline.last_result is not None
+    assert pipeline.last_result.metrics["budget"]["max_output_tokens"] == 1234
+
+    pipeline.close()

@@ -21,6 +21,7 @@ from openreview.review.assessment import (
     normalize_severity,
     unique_files,
 )
+from openreview.review.redaction import redact_text
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +161,7 @@ class FindingValidator:
                 "side": issue.side,
                 "confidence_before": original_confidence,
                 "confidence_after": original_confidence,
-                "evidence": issue.evidence,
+                "evidence": redact_text(issue.evidence)[0],
                 "context_refs": list(issue.context_refs),
                 "status": "kept",
                 "drop_reason": None,
@@ -278,6 +279,7 @@ class FindingValidator:
 
             issue.severity = normalize_severity(issue.severity)
             record["severity"] = issue.severity
+            self._redact_issue(issue)
             filtered_issues.append(issue)
 
         # 规则过滤会改变问题集合，风险等级 / 决策 / 证据必须同步重算，
@@ -307,6 +309,22 @@ class FindingValidator:
         )
         return result
 
+    @staticmethod
+    def _redact_issue(issue: PotentialIssue) -> None:
+        """Never persist or publish a credential the model quoted back."""
+
+        def redact_optional(value: str | None) -> str | None:
+            # 保持 None 语义：report/JSON 里“没有 evidence”和“空字符串”
+            # 不应因为脱敏而被混为一谈。
+            if value is None:
+                return None
+            return redact_text(value)[0]
+
+        issue.reasoning = redact_text(issue.reasoning)[0]
+        issue.suggestion = redact_text(issue.suggestion)[0]
+        issue.evidence = redact_optional(issue.evidence)
+        issue.suggested_patch = redact_optional(issue.suggested_patch)
+
     def _check_evidence(
         self,
         issue: PotentialIssue,
@@ -326,6 +344,9 @@ class FindingValidator:
         evidence = (issue.evidence or "").strip()
         if len(evidence) < 6:
             return None, None
+        # 模型看到的是脱敏后的代码；证据匹配也必须使用同一视图，否则
+        # “正确引用了被 mask 的密钥行”会被误判为 ungrounded。
+        evidence = redact_text(evidence)[0]
 
         # 1) 行级窗口优先：证据必须能定位到报告行附近，而不是文件任意角落。
         window_parts: List[str] = []
@@ -343,6 +364,7 @@ class FindingValidator:
                 if source:
                     window_parts.append(source)
         window = "\n".join(window_parts)
+        window = redact_text(window)[0]
         if window and _evidence_matches(evidence, window, strict=False):
             method = _evidence_method(evidence, window)
             return True, method or "evidence_line_match"
@@ -359,6 +381,7 @@ class FindingValidator:
                 haystack_parts.append(source)
 
         haystack = "\n".join(part for part in haystack_parts if part)
+        haystack = redact_text(haystack)[0]
         if not haystack:
             return None, None
         if _evidence_matches(evidence, haystack, strict=True):

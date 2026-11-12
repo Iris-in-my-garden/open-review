@@ -1,7 +1,8 @@
 import os
 import re
 import threading
-from typing import Any, Dict, Optional, Protocol, Type, TypeVar
+import time
+from typing import Any, Dict, List, Optional, Protocol, Type, TypeVar
 
 from openai import OpenAI
 from pydantic import BaseModel
@@ -78,17 +79,45 @@ class BudgetedLLMClient:
             # 检查与扣减在同一临界区完成：4 个 aspect 并发时不会同时越过上限。
             self._budget.reserve(calls=1, tokens=estimated)
         try:
-            return self.inner.generate_structured(
+            result = self.inner.generate_structured(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 response_schema=response_schema,
             )
         except Exception:
-            # 调用失败（超时、限流、解析失败）不应消耗预算，否则重试会
+            # 调用失败不一定免费：provider 可能已经生成响应（随后解析/拒答
+            # 失败），此时 last_usage 已有真实用量，必须结算而不是退款。
+            # 只有完全没拿到响应的失败（超时、连接错误）才退款，否则重试会
             # 被“预算不足”提前终止，掩盖真正的失败原因。
             if self._budget is not None:
-                self._budget.refund(calls=1, tokens=estimated)
+                actual = getattr(self.inner, "last_usage", None)
+                if isinstance(actual, dict) and actual:
+                    self._budget.settle(
+                        reserved_input_tokens=estimated,
+                        actual_input_tokens=int(
+                            actual.get("prompt_tokens", 0) or 0
+                        ),
+                        actual_output_tokens=int(
+                            actual.get("completion_tokens", 0) or 0
+                        ),
+                    )
+                else:
+                    self._budget.refund(calls=1, tokens=estimated)
             raise
+
+        # 用 provider 返回的真实 usage 修正预扣值。last_usage 由真实客户端
+        # 写在 thread-local 上，避免多线程并发调用时累计值互相污染。
+        if self._budget is not None:
+            actual = getattr(self.inner, "last_usage", None)
+            if isinstance(actual, dict) and actual:
+                self._budget.settle(
+                    reserved_input_tokens=estimated,
+                    actual_input_tokens=int(actual.get("prompt_tokens", 0) or 0),
+                    actual_output_tokens=int(
+                        actual.get("completion_tokens", 0) or 0
+                    ),
+                )
+        return result
 
     def __getattr__(self, name: str) -> Any:
         # 透传 cache wrapper 的 hits/misses 等统计字段。
@@ -112,6 +141,7 @@ class LLMClient:
         max_retries: int = 2,
         temperature: float = 0.0,
         seed: Optional[int] = None,
+        max_completion_tokens: Optional[int] = None,
     ):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
@@ -126,6 +156,12 @@ class LLMClient:
         # 固定采样参数，保证同一 prompt 的结果可复现；评测/回放需要这一点。
         self.temperature = temperature
         self.seed = seed
+        # 固定输出上限，避免模型长篇大论把成本打穿；具体值由 config 控制。
+        self.max_completion_tokens = (
+            int(max_completion_tokens)
+            if max_completion_tokens and max_completion_tokens > 0
+            else None
+        )
 
         client_kwargs: dict[str, Any] = {
             "api_key": self.api_key,
@@ -144,10 +180,20 @@ class LLMClient:
             "completion_tokens": 0,
             "total_tokens": 0,
         }
+        # Per-run observability: one record per real provider call. Metrics
+        # collector takes a slice, so reusing a pipeline does not mix runs.
+        self.call_log: List[Dict[str, Any]] = []
+        self._call_log_lock = threading.Lock()
+        self._thread_local = threading.local()
 
-    def _record_usage(self, usage: Any) -> None:
+    @property
+    def last_usage(self) -> Optional[Dict[str, int]]:
+        """Usage of the most recent call on the current thread."""
+        return getattr(self._thread_local, "last_usage", None)
+
+    def _record_usage(self, usage: Any) -> Dict[str, int]:
         if usage is None:
-            return
+            return {}
         prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
         completion = int(getattr(usage, "completion_tokens", 0) or 0)
         total = int(getattr(usage, "total_tokens", 0) or 0) or prompt + completion
@@ -156,6 +202,13 @@ class LLMClient:
             self.usage["prompt_tokens"] += prompt
             self.usage["completion_tokens"] += completion
             self.usage["total_tokens"] += total
+        actual = {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+        }
+        self._thread_local.last_usage = actual
+        return actual
 
     def generate_structured(
         self,
@@ -177,10 +230,25 @@ class LLMClient:
             request["temperature"] = self.temperature
         if self.seed is not None:
             request["seed"] = self.seed
+        if self.max_completion_tokens is not None:
+            request["max_completion_tokens"] = self.max_completion_tokens
+        self._thread_local.last_usage = {}
+        started = time.perf_counter()
         response = self._client.beta.chat.completions.parse(**request)
 
         message = response.choices[0].message
-        self._record_usage(getattr(response, "usage", None))
+        actual = self._record_usage(getattr(response, "usage", None))
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        with self._call_log_lock:
+            self.call_log.append(
+                {
+                    "model": self.model,
+                    "latency_ms": elapsed_ms,
+                    "prompt_tokens": int(actual.get("prompt_tokens", 0)),
+                    "completion_tokens": int(actual.get("completion_tokens", 0)),
+                    "total_tokens": int(actual.get("total_tokens", 0)),
+                }
+            )
 
         # 检查模型是否拒绝了请求
         if message.refusal:

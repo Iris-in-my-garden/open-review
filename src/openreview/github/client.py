@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 
 import httpx
 
+from openreview.domain.markers import REVIEW_MARKER
 from openreview.domain.models import ChangedFile, PullRequestInfo
 from openreview.github.pr_url import GitHubPRRef
 
@@ -70,26 +71,35 @@ class GitHubClient:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-    def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        """带指数退避与限流处理的请求封装。"""
-        for attempt in range(self.max_retries + 1):
+    def _request(
+        self, method: str, url: str, *, retry: bool = True, **kwargs
+    ) -> httpx.Response:
+        """带指数退避与限流处理的请求封装。
+
+        ``retry=False`` is used for non-idempotent writes (creating a review).
+        Retrying a POST after a 5xx can create duplicate comments when the
+        server committed the request but the response was lost. The caller
+        can safely rerun because ``upsert_review`` replaces its old review.
+        """
+        attempts = self.max_retries + 1 if retry else 1
+        for attempt in range(attempts):
             try:
                 response = self.client.request(method, url, **kwargs)
             except httpx.RequestError as exc:
-                if attempt >= self.max_retries:
+                if attempt >= attempts - 1:
                     raise GitHubAPIError(f"GitHub request failed: {exc}") from exc
                 delay = min(MAX_BACKOFF_SECONDS, self.backoff_factor * (2 ** attempt))
                 logger.warning(
                     "GitHub request error (attempt %d/%d), retry in %.1fs: %s",
                     attempt + 1,
-                    self.max_retries + 1,
+                    attempts,
                     delay,
                     exc,
                 )
                 time.sleep(delay)
                 continue
 
-            if attempt < self.max_retries and (
+            if attempt < attempts - 1 and (
                 response.status_code in RETRYABLE_STATUS
                 or (
                     response.status_code == 403
@@ -101,7 +111,7 @@ class GitHubClient:
                     "GitHub API %d (attempt %d/%d), retry in %.1fs",
                     response.status_code,
                     attempt + 1,
-                    self.max_retries + 1,
+                    attempts,
                     delay,
                 )
                 time.sleep(delay)
@@ -203,9 +213,86 @@ class GitHubClient:
         if commit_id:
             payload["commit_id"] = commit_id
 
-        response = self._request("POST", url, json=payload)
+        response = self._request("POST", url, retry=False, json=payload)
         if response.status_code not in (200, 201):
             raise GitHubAPIError(
                 f"GitHub API error [{response.status_code}]: {response.text}"
             )
         return response.json()
+
+    def list_reviews(self, ref: GitHubPRRef, per_page: int = 100) -> List[Dict]:
+        """List reviews for a PR, paginated.
+
+        Used to find the previous managed review before creating a new one.
+        """
+        reviews: List[Dict] = []
+        page = 1
+        while True:
+            url = f"/repos/{ref.owner}/{ref.repo}/pulls/{ref.pr_number}/reviews"
+            response = self._request(
+                "GET", url, params={"page": page, "per_page": per_page}
+            )
+            if response.status_code != 200:
+                raise GitHubAPIError(
+                    f"GitHub API error [{response.status_code}]: {response.text}"
+                )
+            data = response.json()
+            if not data:
+                break
+            reviews.extend(data)
+            if len(data) < per_page:
+                break
+            page += 1
+        return reviews
+
+    def delete_review(self, ref: GitHubPRRef, review_id: int) -> None:
+        """Delete one review and its inline comments.
+
+        A 404 is treated as success: because deletion is idempotent, this makes
+        retries and concurrent runs converge instead of failing repeatedly.
+        """
+        url = (
+            f"/repos/{ref.owner}/{ref.repo}/pulls/{ref.pr_number}"
+            f"/reviews/{review_id}"
+        )
+        response = self._request("DELETE", url)
+        if response.status_code not in (200, 204, 404):
+            raise GitHubAPIError(
+                f"GitHub API error [{response.status_code}]: {response.text}"
+            )
+
+    def upsert_review(
+        self,
+        ref: GitHubPRRef,
+        body: str,
+        comments: List[Dict],
+        event: str = "COMMENT",
+        commit_id: Optional[str] = None,
+    ) -> Dict:
+        """Replace the previous managed review, then create a fresh one.
+
+        This is the idempotent path used by the pipeline. It deliberately
+        deletes all managed reviews (identified by ``REVIEW_MARKER``), including
+        reviews on older commits, so a force-push does not leave stale comments
+        pointing at lines that no longer exist.
+        """
+        managed = [
+            review
+            for review in self.list_reviews(ref)
+            if REVIEW_MARKER in str(review.get("body") or "")
+        ]
+        deleted = 0
+        for review in managed:
+            review_id = review.get("id")
+            if isinstance(review_id, int):
+                self.delete_review(ref, review_id)
+                deleted += 1
+
+        created = self.create_review(
+            ref,
+            body=body,
+            comments=comments,
+            event=event,
+            commit_id=commit_id,
+        )
+        return {"review": created, "deleted": deleted}

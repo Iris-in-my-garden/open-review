@@ -57,6 +57,8 @@ class BudgetMetrics(TypedDict):
     used_llm_calls: int
     max_input_tokens: int
     used_input_tokens: int
+    max_output_tokens: int
+    used_output_tokens: int
     max_seconds: float
     elapsed_seconds: float
 
@@ -92,6 +94,7 @@ class RunMetrics(TypedDict, total=False):
     reviewer_mode: str
     aspects: int
     llm_calls: int
+    llm_calls_detail: List[Dict[str, object]]
     estimated_patch_tokens: int
     estimated_context_tokens: int
     triage: Dict[str, object]

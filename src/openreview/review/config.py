@@ -45,6 +45,9 @@ class ReviewConfig:
     llm_max_retries: int = 0
     temperature: float = 0.0
     seed: Optional[int] = None
+    # Per-call output cap. Prevents a malformed/chatty response from turning a
+    # bounded review into an unbounded bill.
+    max_completion_tokens: int = 2048
 
     # batching 与 prompt 预算
     max_batch_tokens: int = 60000
@@ -74,6 +77,7 @@ class ReviewConfig:
     # 预算
     budget_calls: int = 0
     budget_tokens: int = 0
+    budget_output_tokens: int = 0
     budget_seconds: float = 0.0
 
     # 缓存
@@ -159,5 +163,6 @@ class ReviewConfig:
             f"aspect_timeout={self.aspect_timeout}",
             f"llm_timeout={self.llm_timeout}",
             f"llm_max_retries={self.llm_max_retries}",
+            f"max_completion_tokens={self.max_completion_tokens}",
             f"mock={int(self.mock_llm)}",
         ]

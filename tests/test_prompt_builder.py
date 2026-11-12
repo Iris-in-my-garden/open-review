@@ -202,3 +202,27 @@ def test_task_instruction_is_placed_before_output_constraints():
     assert prompt.index("### 【任务】") < prompt.index("### 【输出约束】")
     # 输出约束仍然是 prompt 的最后一段，模型最后读到的是格式要求。
     assert prompt.rstrip().endswith("禁止编造不存在的 ID。")
+
+
+def test_prompt_redacts_credentials_before_leaving_process():
+    """reviewer 负责找密钥，但不能把密钥发给第三方模型。"""
+    diff = DiffParser.parse_diff(
+        [
+            {
+                "filename": "src/config.py",
+                "status": "modified",
+                "patch": (
+                    "@@ -0,0 +1,2 @@\n"
+                    "+AWS_KEY = 'AKIAIOSFODNN7EXAMPLE'\n"
+                    "+DB = 'postgres://user:secret@10.1.2.3/db'\n"
+                ),
+            }
+        ]
+    )
+
+    prompt = PromptBuilder().build_user_prompt(_pr(), diff, [])
+
+    assert "AKIAIOSFODNN7EXAMPLE" not in prompt
+    assert "user:secret@" not in prompt
+    assert "10.1.2.3" not in prompt
+    assert "<REDACTED:AWS_ACCESS_KEY>" in prompt

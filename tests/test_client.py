@@ -188,3 +188,72 @@ def test_retries_on_rate_limit_exhausted():
 
     assert pr_info.title == "ok"
     assert len(calls) == 2
+
+
+def test_create_review_does_not_retry_post_on_transient_error():
+    """POST review 非幂等：5xx 后重试可能产生重复行内评论。"""
+    ref = GitHubPRRef(owner="octocat", repo="Hello-World", pr_number=1)
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(500, json={"message": "temporary"})
+
+    with GitHubClient(
+        transport=httpx.MockTransport(handler),
+        max_retries=3,
+        backoff_factor=0,
+    ) as client:
+        with pytest.raises(GitHubAPIError, match="500"):
+            client.create_review(ref, body="body", comments=[])
+
+    assert len(calls) == 1
+
+
+def test_upsert_review_deletes_only_managed_reviews_then_creates():
+    from openreview.domain.markers import REVIEW_MARKER
+
+    ref = GitHubPRRef(owner="octocat", repo="Hello-World", pr_number=1)
+    deleted = []
+    posts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path.endswith("/reviews"):
+            return httpx.Response(
+                200,
+                json=[
+                    {"id": 1, "body": f"old managed\n{REVIEW_MARKER}"},
+                    {"id": 2, "body": "human review"},
+                    {"id": 3, "body": f"older managed\n{REVIEW_MARKER}"},
+                ],
+            )
+        if request.method == "DELETE" and "/reviews/" in path:
+            deleted.append(path.rsplit("/", 1)[-1])
+            return httpx.Response(204)
+        if request.method == "POST" and path.endswith("/reviews"):
+            posts.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": 99})
+        raise AssertionError(f"unexpected {request.method} {path}")
+
+    with GitHubClient(transport=httpx.MockTransport(handler)) as client:
+        result = client.upsert_review(
+            ref, body="new body", comments=[], commit_id="head-sha"
+        )
+
+    assert result == {"review": {"id": 99}, "deleted": 2}
+    assert deleted == ["1", "3"]
+    assert posts[0]["body"] == "new body"
+    assert posts[0]["commit_id"] == "head-sha"
+
+
+def test_delete_review_treats_missing_review_as_success():
+    """并发/重跑时另一进程可能已删除；404 应视为已收敛。"""
+    ref = GitHubPRRef(owner="octocat", repo="Hello-World", pr_number=1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "DELETE"
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    with GitHubClient(transport=httpx.MockTransport(handler)) as client:
+        client.delete_review(ref, 123)

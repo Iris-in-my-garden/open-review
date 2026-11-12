@@ -128,6 +128,11 @@ def review(
         "--budget-tokens",
         help="Hard cap on estimated input tokens per review (0 = unlimited)",
     ),
+    budget_output_tokens: int = typer.Option(
+        0,
+        "--budget-output-tokens",
+        help="Hard cap on provider-reported output tokens (0 = unlimited)",
+    ),
     budget_seconds: float = typer.Option(
         0.0,
         "--budget-seconds",
@@ -157,6 +162,14 @@ def review(
         0,
         "--llm-max-retries",
         help="Retries for transient LLM API failures (default: 0)",
+    ),
+    max_completion_tokens: int = typer.Option(
+        2048,
+        "--max-completion-tokens",
+        help=(
+            "Per-call output token cap. Prevents a chatty/malformed response "
+            "from blowing up cost (0 disables the cap)."
+        ),
     ),
     dump_intermediates: Optional[Path] = typer.Option(
         None,
@@ -207,12 +220,14 @@ def review(
             graph_retrieval_enabled=graph_retrieval_enabled,
             budget_calls=budget_calls,
             budget_tokens=budget_tokens,
+            budget_output_tokens=budget_output_tokens,
             budget_seconds=budget_seconds,
             review_cache_enabled=cache_review,
             review_cache_dir=cache_dir,
             llm_cache_dir=llm_cache_dir,
             llm_cache_mode=llm_cache_mode,
             llm_max_retries=llm_max_retries,
+            max_completion_tokens=max_completion_tokens,
             debug_dir=str(dump_intermediates) if dump_intermediates else None,
         )
         report_path = pipeline.run(

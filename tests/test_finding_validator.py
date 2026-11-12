@@ -420,3 +420,70 @@ def test_validate_checks_suggested_patch_with_git_apply(tmp_path: Path):
     assert validator.last_stats["patch_checked"] == 2
     assert validator.last_stats["patch_valid"] == 1
     assert validator.last_stats["patch_invalid"] == 1
+
+
+def test_validate_redacts_secrets_but_still_grounds_evidence():
+    """模型引用被 mask 的密钥行时，证据匹配必须使用同一脱敏视图。"""
+    from openreview.repo.diff_parser import DiffParser
+
+    diff = DiffParser.parse_diff(
+        [
+            {
+                "filename": "src/config.py",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 0,
+                "patch": (
+                    "@@ -0,0 +1,1 @@\n"
+                    "+AWS_KEY = 'AKIAIOSFODNN7EXAMPLE'\n"
+                ),
+            }
+        ]
+    )
+    issue = PotentialIssue(
+        file="src/config.py",
+        severity="critical",
+        category="security",
+        confidence=0.9,
+        reasoning="Leaked key AKIAIOSFODNN7EXAMPLE",
+        suggestion="Revoke AKIAIOSFODNN7EXAMPLE",
+        line=1,
+        evidence="AWS_KEY = 'AKIAIOSFODNN7EXAMPLE'",
+    )
+
+    validator = FindingValidator()
+    result = validator.validate(_result([issue]), diff)
+
+    assert len(result.potential_issues) == 1
+    kept = result.potential_issues[0]
+    assert "AKIAIOSFODNN7EXAMPLE" not in kept.reasoning
+    assert "AKIAIOSFODNN7EXAMPLE" not in kept.suggestion
+    assert "AKIAIOSFODNN7EXAMPLE" not in kept.evidence
+    assert validator.last_stats["grounded_evidence"] == 1
+
+
+def test_validate_redaction_preserves_missing_optional_fields():
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="src/auth.py",
+                status="modified",
+                visible_lines=[1],
+            )
+        ]
+    )
+    issue = PotentialIssue(
+        file="src/auth.py",
+        severity="medium",
+        category="clean_code",
+        confidence=0.9,
+        reasoning="Naming issue.",
+        suggestion="Rename.",
+        line=1,
+    )
+
+    result = FindingValidator().validate(_result([issue]), diff)
+
+    assert len(result.potential_issues) == 1
+    assert result.potential_issues[0].evidence is None
+    assert result.potential_issues[0].suggested_patch is None

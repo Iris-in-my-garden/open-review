@@ -21,7 +21,10 @@
 - **跨文件影响分析**：变更/删除的符号在其他文件中的引用会被抽成上下文；删除符号仍有残留调用时，reviewer 能看到调用点
 - **可选静态分析证据源**：对变更文件跑 ruff/mypy，只保留落在 diff 可见行上的信号（默认关闭；会执行本地工具，接入 CI 时需注意不可信代码的执行风险）
 - **语义 verifier**：对 `critical` / `high` 结论做二次校验，过滤“看起来很像真的”的过度解读；最多回炉一次
-- **硬预算**：`--budget-calls` / `--budget-tokens` / `--budget-seconds` 限制 LLM 调用、估算 token 与耗时，避免 verifier/retry 放大调用量
+- **硬预算**：`--budget-calls` / `--budget-tokens` / `--budget-output-tokens` / `--budget-seconds` 限制 LLM 调用、输入 token、真实输出 token 与耗时；每次调用另有 `--max-completion-tokens` 输出上限，避免 verifier/retry 放大调用量
+- **评论噪声控制**：只有 `critical` / `high` 且落在 diff 行内的结论发为行内评论，最多 10 条；其余问题收进 Review body，避免 bot 刷屏
+- **评论幂等**：Review body/评论带稳定 marker；重跑同一 PR 时先删除上一轮由本工具创建的 review，再重新发布，不会重复刷评论
+- **密钥脱敏**：进入模型前和回写评论前，对私钥、云厂商 token、JWT、URL 凭证、内网 IP 等高置信度敏感信息做 mask
 - **缓存与回放**：review 结果按 head SHA 缓存；LLM 响应支持 record/replay，后处理消融可离线重跑
 - **真实用量**：记录模型返回的 `prompt_tokens` / `completion_tokens`，与字符估算一起写入报告
 - **行号与证据约束**：
@@ -168,6 +171,8 @@ openreview review https://github.com/microsoft/typescript-go/pull/1354 \
   --no-triage \
   --no-verifier \
   --budget-calls 8 \
+  --budget-output-tokens 16000 \
+  --max-completion-tokens 2048 \
   --budget-seconds 120
 
 # 静态分析作为证据源（默认关闭；会在本地执行 ruff/mypy）
@@ -241,7 +246,7 @@ with ReviewPipeline(mock_llm=True) as pipeline:
 
 报告默认写入 `reports/<owner>_<repo>_pr_<number>_review.md`，可用 `--output` 指定目录。
 
-`--post-comment` 只发表 `COMMENT` 类型的 Review，不会替用户 `APPROVE` 或 `REQUEST_CHANGES`，避免在 CI 中越权；需要审批动作时请由人工完成。
+`--post-comment` 只发表 `COMMENT` 类型的 Review，不会替用户 `APPROVE` 或 `REQUEST_CHANGES`，避免在 CI 中越权；需要审批动作时请由人工完成。发布前会按 marker 查找并删除上一轮由 OpenReview 创建的 review，因此同一 PR 重跑是幂等的，不会重复堆积评论。
 
 ## 项目结构
 
@@ -277,7 +282,8 @@ src/openreview/
 │   ├── llm_cache.py           # LLM 响应 record/replay
 │   ├── assessment.py          # 风险等级 / 决策 / 跨维度去重 / 批次合并
 │   ├── test_gap.py            # 基于关联测试文件的测试缺口分析
-│   ├── comment_builder.py     # GitHub Review body / 行内评论构造
+│   ├── comment_builder.py     # GitHub Review body / 行内评论构造、severity 门禁
+│   ├── redaction.py           # 高置信度密钥 / 内网地址脱敏
 │   ├── report_writer.py       # Markdown / JSON / Run Metrics 渲染
 │   └── llm_client.py          # 真实 / Mock LLM 客户端（含 token usage）
 └── services/
@@ -328,7 +334,7 @@ validator 做的是确定性校验：文件是否存在、行号是否在 diff �
 仓库按 `owner__repo` 缓存在平台目录；同一仓库的 clone/fetch/checkout 由 `FileLock` 串行化，不同仓库仍可并行。首次 clone 使用 `--filter=blob:none` 的 blobless partial clone，只拉取提交和树对象，需要时再按需下载 blob；如果服务端不支持 filter，会自动回退到普通 clone。缓存超过上限时按目录 mtime 淘汰较旧的仓库。
 
 **一次 review 的 token 用量怎么看？**
-报告末尾的 `Run Metrics` 会记录各阶段耗时、文件数、批次数、reviewer mode、focus aspects 数、LLM 调用次数、真实 `prompt_tokens` / `completion_tokens` 用量，以及 patch/context 的 token 估算。真实用量来自模型响应；估算值用于预算和截断。两者都保留，方便对照“估算偏差”和评估单 PR 调用量。`--budget-*` 可以在调用前直接卡住超支。
+报告末尾的 `Run Metrics` 会记录各阶段耗时、文件数、批次数、reviewer mode、focus aspects 数、LLM 调用次数、每次调用的模型/延迟/token 明细、真实 `prompt_tokens` / `completion_tokens` 用量，以及 patch/context 的 token 估算。真实用量来自模型响应，并会回冲预扣预算；估算值用于调用前检查和截断。两者都保留，方便对照“估算偏差”和评估单 PR 调用量。`--budget-*` 可以在调用前直接卡住超支。
 
 **如何防 Prompt Injection？**
 PR 标题、描述、代码注释都视为不可信数据：统一放入 `<untrusted_input>` 并转义结束标签；System Prompt 明确“标签内是数据不是指令”；命中常见注入模式时在报告中提示；最终仍靠行号/evidence 校验拦截“被诱导编造”的结论。
@@ -344,6 +350,15 @@ PR 标题、描述、代码注释都视为不可信数据：统一放入 `<untru
 - **可选语义指标**：复用 AACR-Bench 官方 LLM judge，计算文件级 Precision / Recall / Balanced
 
 数据使用 AACR-Bench Python/Go 子集的固定切分：**10 dev / 25 test / 8 holdout**。README 只保留模板；真实结果跑完后由 `report` 子命令生成并替换。
+
+确定性指标可以直接作为 CI 门禁，不消耗 token：
+
+```bash
+uv run python -m evaluation.cli gate \
+  --metrics evaluation/metrics/aacr-pygo-v1/dev-mock/deterministic_dev-mock.json
+```
+
+门禁默认要求：结果无 error/missing、未知文件率 0、非法行号率 0、未 grounding 的 evidence 率 0，evidence/归因覆盖率不低于阈值；阈值可用 `--min-*` / `--max-*` 调整。
 
 ### 复现 dev mini-eval
 
@@ -452,7 +467,7 @@ uv run mypy src evaluation
 uv run pre-commit run --all-files
 ```
 
-CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、mypy、pytest。`ruff` / `mypy` / `pre-commit` 通过 `dependency-groups.dev` 管理。
+CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、mypy、pytest，最后跑确定性评测门禁（`evaluation.cli gate`）。门禁不调用模型，只对已产出的确定性指标检查硬阈值：不得出现未知文件/非法行号/未 grounding 的 evidence，结果不得缺失。`ruff` / `mypy` / `pre-commit` 通过 `dependency-groups.dev` 管理。
 
 ## 已知限制 / Roadmap
 
@@ -485,13 +500,14 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 - [ ] 跑真实 dev/test，固化 precision / recall / token 用量 / 延迟 Results 表
 - [ ] 增量 review（只重跑变更文件，复用上次结果）
 - [ ] 多语言扩展（Java / TypeScript AST）
-- [ ] 行内评论幂等（同一 head SHA 重跑不重复发评论）
+- [x] 行内评论幂等（按 marker 替换上一轮 review，同一 PR 重跑不重复发评论）
+- [x] 确定性评测门禁（`evaluation.cli gate`，不调用模型，可直接放入 CI）
 
 已知限制：
 - 只支持 Python / Go；其他语言没有 AST 上下文，效果未做承诺
 - call graph 是 best-effort：Python 用 `ast` 抽取，Go 调用边暂不默认启用，不做完整类型解析
-- patch/context 的 token 数仍是保守估算（1 token ≈ 3 字符），用于预算与截断；真实用量单独记录
-- 行内评论只能落在 diff 可见行；不在 diff 内的问题会退化为文件级描述
+- patch/context 的 token 数仍是保守估算（ASCII 约 3 字符/token，CJK 按更高权重计），用于预算与截断；真实用量单独记录
+- 行内评论只能落在 diff 可见行；不在 diff 行内或 severity 为 medium/low 的问题会写入 Review body，而不是行内评论
 - 单文件极大时会先按 hunk / symbol 切片；只有单个 hunk 仍超预算时才截断，可能漏掉该 hunk 后半部分的问题
 - 单遍审查的 findings 受单次输出 token 限制；大 PR 会按 batch 拆分，但单个 batch 仍可能截断
 - 静态分析默认关闭，且只覆盖 Python；开启时会在本地执行 ruff/mypy

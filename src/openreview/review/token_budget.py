@@ -5,6 +5,7 @@
 """
 
 import math
+import re
 from typing import Dict, Iterable, List, Mapping, Optional
 
 from openreview.repo.diff_parser import (
@@ -15,6 +16,11 @@ from openreview.repo.diff_parser import (
 )
 
 CHARS_PER_TOKEN = 3.0
+CJK_TOKEN_WEIGHT = 2.2
+_CJK_PATTERN = re.compile(
+    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+    r"\u3040-\u30ff\uac00-\ud7af]"
+)
 TRUNCATION_MARKER = "\n... [内容因 token 预算被截断] ...\n"
 
 # prompt 预算的内部策略：不暴露给 CLI，用户只控制成本护栏。
@@ -26,9 +32,24 @@ PROMPT_OVERHEAD_TOKENS = 2_000
 
 
 def estimate_tokens(text: str) -> int:
+    """Conservative token estimate without a model-specific tokenizer.
+
+    A flat ``len/3`` underestimates CJK text badly: Chinese is closer to 1.0-
+    1.5 characters per token, not 3. Since PR descriptions and comments are
+    often Chinese, the old heuristic could under-count by 2-3x and silently
+    blow the hard budget. ASCII/code keeps the historical 3 chars/token, so
+    existing prompt sizing stays stable.
+    """
     if not text:
         return 0
-    return max(1, math.ceil(len(text) / CHARS_PER_TOKEN))
+    cjk = len(_CJK_PATTERN.findall(text))
+    if cjk == 0:
+        return max(1, math.ceil(len(text) / CHARS_PER_TOKEN))
+    non_cjk = max(0, len(text) - cjk)
+    # CJK characters carry roughly 2.2x the token weight of ASCII on modern
+    # tokenizers; this is intentionally pessimistic for budget safety.
+    effective_chars = non_cjk + cjk * CJK_TOKEN_WEIGHT
+    return max(1, math.ceil(effective_chars / CHARS_PER_TOKEN))
 
 
 def truncate_to_tokens(text: str, max_tokens: int) -> tuple[str, bool]:

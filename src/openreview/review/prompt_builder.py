@@ -1,11 +1,15 @@
 # openreview/prompt_builder.py
+import logging
 import re
 from typing import Dict, List, Optional, Tuple
 
 from openreview.domain.models import PullRequestInfo
 from openreview.repo.diff_parser import HUNK_RANGE_PATTERN, ParsedDiff
 from openreview.retriever.code_context import CodeContext
+from openreview.review.redaction import redact_text
 from openreview.review.token_budget import estimate_tokens, truncate_to_tokens
+
+logger = logging.getLogger(__name__)
 
 UNTRUSTED_START = "<untrusted_input>"
 UNTRUSTED_END = "</untrusted_input>"
@@ -368,9 +372,12 @@ class PromptBuilder:
         if note_lines:
             patch_str = "\n".join(note_lines) + "\n\n" + patch_str
 
-        # 所有来自 PR 的内容都放进不可信数据区，并转义可能提前闭合标签的文本
-        untrusted_payload = self.sanitize_untrusted(
-            f"""1. PR Title: {pr_info.title}
+        # 所有来自 PR 的内容都放进不可信数据区，并转义可能提前闭合标签的文本。
+        # 在进入模型之前先脱敏高置信度凭证：reviewer 的职责恰恰是找密钥，
+        # 不能把这个过程变成把密钥发给第三方模型的通道。
+        untrusted_payload, redacted_count = redact_text(
+            self.sanitize_untrusted(
+                f"""1. PR Title: {pr_info.title}
 2. PR Description: {pr_info.body}
 3. Changed Files Summary:
 {files_summary_str}
@@ -379,7 +386,13 @@ class PromptBuilder:
 5. Retrieved Context Snippets:
 {context_str}
 """
+            )
         )
+        if redacted_count:
+            logger.warning(
+                "Redacted %d high-confidence secret(s) before sending prompt",
+                redacted_count,
+            )
 
         # 任务指令放在输出约束之前：模型最后读到的是“必须遵守”的格式约束，
         # 而不是任务描述，减少格式漂移。
