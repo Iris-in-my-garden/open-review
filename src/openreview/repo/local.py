@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from openreview.github.client import ChangedFile
+from openreview.domain.models import ChangedFile
 from openreview.repo.manager import RepoCommandError
 
 logger = logging.getLogger(__name__)

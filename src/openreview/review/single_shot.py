@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from openreview.github.client import PullRequestInfo
+from openreview.domain.models import PullRequestInfo, ReviewResult
 from openreview.repo.diff_parser import ParsedDiff
 from openreview.retriever.code_context import CodeContext
 from openreview.review.aspect_reviewer import ReviewOrchestrator, finalize_review_result
@@ -19,7 +19,6 @@ from openreview.review.output_parser import (
     AspectReviewOutputSchema,
     AspectReviewTaskResult,
 )
-from openreview.review.report_writer import ReviewResult
 
 SINGLE_SHOT_INSTRUCTION = """### 【一次性审查任务】
 请在一次输出中覆盖以下五类风险，并在每个 issue 的 category 中标明类别：

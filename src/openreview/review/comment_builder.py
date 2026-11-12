@@ -2,7 +2,7 @@
 
 from typing import Dict, List
 
-from openreview.review.report_writer import PotentialIssue, ReviewResult
+from openreview.domain.models import PotentialIssue, ReviewResult
 
 MAX_INLINE_COMMENTS = 30
 

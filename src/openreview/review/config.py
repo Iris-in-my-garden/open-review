@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
+from openreview.domain.versions import REVIEW_CACHE_SCHEMA_VERSION
 from openreview.review.token_budget import (
     DEFAULT_HARD_PROMPT_TOKENS,
     DEFAULT_SOFT_PROMPT_TOKENS,
@@ -20,7 +21,13 @@ from openreview.review.token_budget import (
 
 REVIEWER_MODES = frozenset({"single", "multi_aspect"})
 LLM_CACHE_MODES = frozenset({"auto", "record", "replay"})
-REVIEW_CACHE_SCHEMA_VERSION = 2
+
+__all__ = [
+    "LLM_CACHE_MODES",
+    "REVIEWER_MODES",
+    "REVIEW_CACHE_SCHEMA_VERSION",
+    "ReviewConfig",
+]
 
 
 @dataclass(frozen=True)

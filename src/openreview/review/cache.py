@@ -12,13 +12,22 @@ from typing import Optional
 
 from filelock import FileLock
 
+from openreview.domain.models import ReviewResult
+from openreview.domain.versions import (
+    PROMPT_VERSION,
+    REVIEW_CACHE_SCHEMA_VERSION,
+)
 from openreview.repo.manager import default_cache_dir
-from openreview.review.config import REVIEW_CACHE_SCHEMA_VERSION
-from openreview.review.report_writer import ReviewResult
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "review-v6"
+__all__ = [
+    "PROMPT_VERSION",
+    "REVIEW_CACHE_SCHEMA_VERSION",
+    "ReviewCache",
+    "default_review_cache_dir",
+    "fingerprint",
+]
 
 
 def default_review_cache_dir() -> Path:

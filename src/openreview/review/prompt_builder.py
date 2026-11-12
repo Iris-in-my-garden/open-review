@@ -2,7 +2,7 @@
 import re
 from typing import Dict, List, Optional, Tuple
 
-from openreview.github.client import PullRequestInfo
+from openreview.domain.models import PullRequestInfo
 from openreview.repo.diff_parser import HUNK_RANGE_PATTERN, ParsedDiff
 from openreview.retriever.code_context import CodeContext
 from openreview.review.token_budget import estimate_tokens, truncate_to_tokens

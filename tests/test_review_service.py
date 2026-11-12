@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from openreview.domain.versions import METRICS_SCHEMA_VERSION
 from openreview.github.client import ChangedFile, PullRequestInfo
 from openreview.retriever.code_context import CodeContext
 from openreview.review.aspect_reviewer import ReviewOrchestrator
@@ -834,5 +835,105 @@ def test_pipeline_dumps_prompts_responses_and_finding_decisions(tmp_path: Path):
         assert len(state["batches"]) == 2
         assert state["stats"]["validation"]["candidates"] >= 1
         assert (debug_dir / "metrics.json").exists()
+    finally:
+        pipeline.close()
+
+
+def test_budget_is_recreated_for_each_run(tmp_path: Path):
+    """Reusing a pipeline must not carry the previous run's spent budget."""
+    pipeline = ReviewPipeline(
+        mock_llm=True,
+        max_batch_tokens=1,
+        budget_calls=1,
+        verifier_enabled=False,
+    )
+    pipeline.gh_client = FakeGitHubClient()
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+    pipeline.reviewer = FakeReviewer()
+
+    try:
+        pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+        first_calls = len(pipeline.reviewer.calls)
+        pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+        second_calls = len(pipeline.reviewer.calls)
+
+        # 每次 run 只有 1 次调用预算；第二次 run 必须拿到一本新账。
+        assert first_calls == 1
+        assert second_calls == 2
+    finally:
+        pipeline.close()
+
+
+def test_metrics_carry_run_identity_versions_and_error_taxonomy(tmp_path: Path):
+    pipeline = ReviewPipeline(
+        mock_llm=True,
+        max_batch_tokens=1,
+        verifier_enabled=False,
+    )
+    pipeline.gh_client = FakeGitHubClient()
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+    pipeline.reviewer = FlakyReviewer()
+
+    try:
+        pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+        assert pipeline.last_state is not None
+        assert pipeline.last_result is not None
+        metrics = pipeline.last_result.metrics
+
+        assert metrics["schema_version"] == METRICS_SCHEMA_VERSION
+        assert metrics["run_id"] == pipeline.last_state.run_id
+        assert {"prompt", "validator", "retriever"} <= set(metrics["versions"])
+        assert metrics["errors"][0]["category"] == "internal"
+        assert metrics["errors"][0]["batch"] == 1
+    finally:
+        pipeline.close()
+
+
+def test_new_session_isolates_budget_and_run_identity(tmp_path: Path):
+    pipeline = ReviewPipeline(mock_llm=True, verifier_enabled=False)
+    try:
+        first = pipeline._new_session()
+        second = pipeline._new_session()
+
+        assert first.run_id != second.run_id
+        assert first.executor is not second.executor
+        assert first.budgeted_client is not second.budgeted_client
+
+        first_state = first.new_state(
+            "https://github.com/org/repo/pull/1", tmp_path
+        )
+        second_state = second.new_state(
+            "https://github.com/org/repo/pull/1", tmp_path
+        )
+        assert first_state.run_id != second_state.run_id
+        assert first_state.budget is not second_state.budget
+
+        first_state.budget.consume(calls=1)
+        assert first_state.budget.used_llm_calls == 1
+        assert second_state.budget.used_llm_calls == 0
+    finally:
+        pipeline.close()
+
+
+def test_last_result_is_thread_local(tmp_path: Path):
+    import threading
+
+    pipeline = ReviewPipeline(mock_llm=True, verifier_enabled=False)
+    sentinel = object()
+    pipeline.last_result = sentinel  # type: ignore[assignment]
+    observed = {}
+
+    def worker() -> None:
+        observed["result"] = pipeline.last_result
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+
+    try:
+        assert observed["result"] is None
+        assert pipeline.last_result is sentinel
     finally:
         pipeline.close()

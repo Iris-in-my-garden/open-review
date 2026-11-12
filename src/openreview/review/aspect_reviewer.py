@@ -4,14 +4,13 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from openreview.github.client import PullRequestInfo
+from openreview.domain.models import PullRequestInfo, ReviewResult
 from openreview.repo.diff_parser import ParsedDiff
 from openreview.retriever.code_context import CodeContext
 from openreview.review.finding_validator import FindingValidator
 from openreview.review.llm_client import AbstractLLMClient, LLMClient
 from openreview.review.output_parser import AspectReviewTaskResult, OutputParser
 from openreview.review.prompt_builder import PromptBuilder
-from openreview.review.report_writer import ReviewResult
 from openreview.review.test_gap import analyze_test_gaps
 from openreview.review.workflow import BudgetExceeded
 

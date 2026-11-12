@@ -123,6 +123,7 @@ class DebugSink:
         result = getattr(state, "review_result", None)
         batches = getattr(state, "batches", None) or []
         payload = {
+            "run_id": getattr(state, "run_id", ""),
             "pr_url": getattr(state, "pr_url", ""),
             "pr": getattr(state, "pr_info", None),
             "parsed_diff": getattr(state, "parsed_diff", None),

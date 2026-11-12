@@ -4,6 +4,14 @@ from typing import Any, List, Literal, Optional, Type
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
+from openreview.domain.models import (
+    IssueScope,
+    IssueSide,
+    PotentialIssue,
+    ReviewResult,
+    normalize_scope,
+    normalize_side,
+)
 from openreview.review.assessment import (
     SEVERITY_WEIGHTS,
     Severity,
@@ -12,14 +20,6 @@ from openreview.review.assessment import (
     deduplicate_issues,
     normalize_severity,
     unique_files,
-)
-from openreview.review.report_writer import (
-    IssueScope,
-    IssueSide,
-    PotentialIssue,
-    ReviewResult,
-    normalize_scope,
-    normalize_side,
 )
 
 IssueCategory = Literal[

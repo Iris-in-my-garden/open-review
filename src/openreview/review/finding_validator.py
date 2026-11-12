@@ -5,6 +5,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from openreview.domain.models import PotentialIssue, ReviewResult
+from openreview.domain.versions import VALIDATOR_VERSION as VALIDATOR_VERSION
 from openreview.repo.diff_parser import (
     HUNK_RANGE_PATTERN,
     ParsedChangedFile,
@@ -19,13 +21,11 @@ from openreview.review.assessment import (
     normalize_severity,
     unique_files,
 )
-from openreview.review.report_writer import PotentialIssue, ReviewResult
 
 logger = logging.getLogger(__name__)
 
 # 校验器行为版本；写入 review cache key，避免换了过滤规则后仍复用旧结果。
-VALIDATOR_VERSION = "validator-v2"
-
+# 常量本体在 openreview.domain.versions，这里保留别名以兼容旧导入。
 MAX_GROUNDING_FILE_SIZE = 500 * 1024
 MAX_SUGGESTED_PATCH_SIZE = 100_000
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+")

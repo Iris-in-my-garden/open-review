@@ -28,13 +28,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from filelock import FileLock
 
+from openreview.domain.versions import RETRIEVER_VERSION as RETRIEVER_VERSION
 from openreview.repo.manager import default_cache_dir
 from openreview.retriever import ast_utils
 
 logger = logging.getLogger(__name__)
 
 INDEX_SCHEMA_VERSION = "1"
-RETRIEVER_VERSION = "hybrid-v2"
 MAX_INDEXED_FILE_SIZE = 500 * 1024
 MAX_INDEXED_FILES = 20000
 EXCLUDED_DIRS = {

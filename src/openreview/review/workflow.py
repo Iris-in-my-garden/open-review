@@ -10,23 +10,36 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-from openreview.github.client import ChangedFile, PullRequestInfo
+from openreview.domain.errors import BudgetExceeded, classify_error
+from openreview.domain.models import ChangedFile, PullRequestInfo, ReviewResult
+from openreview.domain.versions import METRICS_SCHEMA_VERSION
 from openreview.github.pr_url import GitHubPRRef
 from openreview.repo.diff_parser import ParsedDiff
 from openreview.retriever.code_context import CodeContext
-from openreview.review.report_writer import ReviewResult
 
 if TYPE_CHECKING:
     from openreview.repo.local import LocalReviewInput, LocalWorkspace
 
+__all__ = [
+    "BoundedWorkflow",
+    "BudgetExceeded",
+    "ReviewBudget",
+    "ReviewOutcome",
+    "ReviewState",
+    "ReviewStatus",
+    "TraceEvent",
+    "WORKFLOW_NODE_COUNT",
+    "WorkflowNode",
+]
 
-class BudgetExceeded(RuntimeError):
-    """LLM 调用或 token 预算不足时抛出。"""
+# Keep in sync with ReviewExecutor._build_workflow (13 nodes).
+WORKFLOW_NODE_COUNT = 13
 
 
 class ReviewStatus(str, Enum):
@@ -204,6 +217,9 @@ class ReviewState:
     post_comments: bool = False
     budget: ReviewBudget = field(default_factory=ReviewBudget)
     progress_cb: Optional[Callable[[int, str], None]] = None
+    run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    progress_step: int = 0
+    progress_total: int = 0
 
     # local_mode=True 时跳过 GitHub API，改用 repo_path + base/head SHA。
     local_mode: bool = False
@@ -223,6 +239,9 @@ class ReviewState:
     local_repo_path: Optional[Path] = None
     base_path: Optional[Path] = None
     base_error: Optional[str] = None
+    # 由 RepoManager 创建的 per-run worktree；executor 在 run 结束时释放。
+    pr_worktree: Optional[Path] = None
+    base_worktree: Optional[Path] = None
     batches: List[ParsedDiff] = field(default_factory=list)
     batch_results: List[ReviewResult] = field(default_factory=list)
     all_contexts: List[CodeContext] = field(default_factory=list)
@@ -244,6 +263,8 @@ class ReviewState:
     validation_stats: Dict[str, int] = field(default_factory=dict)
     retrieval_stats: Dict[str, float] = field(default_factory=dict)
     verifier_stats: Dict[str, int] = field(default_factory=dict)
+    # 结构化错误记录：节点、异常类型、稳定分类、批次。
+    errors: List[Dict[str, Any]] = field(default_factory=list)
     cache_hits: int = 0
     cache_misses: int = 0
     cache_hit: bool = False
@@ -266,6 +287,30 @@ class ReviewState:
         if reason and reason not in self.degraded_reasons:
             self.degraded_reasons.append(reason)
 
+    def record_error(
+        self,
+        node: str,
+        exc: BaseException,
+        *,
+        batch: Optional[int] = None,
+        degrade: bool = True,
+    ) -> Dict[str, Any]:
+        """记录结构化错误，并返回写入 metrics 的记录。"""
+        record = {
+            "category": classify_error(exc),
+            "node": node,
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+            "batch": batch,
+        }
+        self.errors.append(record)
+        if degrade:
+            self.degrade(
+                f"[error] {node} 失败（{record['category']}/"
+                f"{record['error_type']}）：{record['message']}"
+            )
+        return record
+
     def trace_node(self, node: str, elapsed_ms: float, status: str = "ok", detail: str = "") -> None:
         self.trace.append(
             TraceEvent(node=node, elapsed_ms=elapsed_ms, status=status, detail=detail)
@@ -273,6 +318,8 @@ class ReviewState:
 
     def metrics(self) -> Dict[str, Any]:
         return {
+            "schema_version": METRICS_SCHEMA_VERSION,
+            "run_id": self.run_id,
             "stages_seconds": dict(self.stages),
             "trace": [
                 {
@@ -297,6 +344,7 @@ class ReviewState:
             "validation_stats": dict(self.validation_stats),
             "retrieval_stats": dict(self.retrieval_stats),
             "verifier_stats": dict(self.verifier_stats),
+            "errors": list(self.errors),
         }
 
 

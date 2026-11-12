@@ -16,6 +16,7 @@ from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, Field, field_validator
 
+from openreview.domain.models import PotentialIssue, ReviewResult
 from openreview.repo.diff_parser import ParsedDiff
 from openreview.retriever.code_context import CodeContext
 from openreview.review.assessment import (
@@ -24,7 +25,6 @@ from openreview.review.assessment import (
     unique_files,
 )
 from openreview.review.llm_client import AbstractLLMClient
-from openreview.review.report_writer import PotentialIssue, ReviewResult
 from openreview.review.token_budget import estimate_tokens
 from openreview.review.workflow import BudgetExceeded, ReviewBudget
 

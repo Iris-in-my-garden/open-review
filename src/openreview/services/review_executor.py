@@ -13,13 +13,16 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
-from openreview.github.client import PullRequestInfo
+from openreview.domain.models import PullRequestInfo, ReviewResult
+from openreview.domain.policies import merge_review_results
 from openreview.github.pr_url import parse_pr_url
 from openreview.repo.local import (
     LocalReviewInput,
@@ -28,21 +31,14 @@ from openreview.repo.local import (
 )
 from openreview.repo.manager import RepoCommandError
 from openreview.retriever.code_context import CodeContext
-from openreview.retriever.index import RETRIEVER_VERSION
-from openreview.review.assessment import merge_review_results
-from openreview.review.cache import PROMPT_VERSION, ReviewCache, fingerprint
+from openreview.review.cache import ReviewCache
 from openreview.review.comment_builder import (
     build_review_body,
     build_review_comments,
 )
 from openreview.review.config import ReviewConfig
-from openreview.review.finding_validator import VALIDATOR_VERSION
-from openreview.review.report_writer import ReportWriter, ReviewResult
-from openreview.review.token_budget import (
-    context_reserve_tokens_for,
-    estimate_tokens,
-    plan_review_batches,
-)
+from openreview.review.report_writer import ReportWriter
+from openreview.review.token_budget import estimate_tokens
 from openreview.review.triage import (
     ALL_ASPECTS,
     TriageDecision,
@@ -55,11 +51,33 @@ from openreview.review.workflow import (
     ReviewBudget,
     ReviewOutcome,
     ReviewState,
-    ReviewStatus,
     WorkflowNode,
 )
+from openreview.services.batch_planner import BatchPlanner
+from openreview.services.cache_key import CacheKeyBuilder
+from openreview.services.evidence_pipeline import EvidencePipeline
+from openreview.services.metrics_collector import MetricsCollector
+from openreview.services.outcome_resolver import OutcomeResolver
 
 logger = logging.getLogger(__name__)
+
+# 与 ``ReviewExecutor._build_workflow`` 的节点顺序保持一致，避免 CLI
+# 显示固定的 ``[step/8]`` 而实际工作流有 13 个节点。
+_PROGRESS_STEPS = {
+    "parse_url": 1,
+    "fetch_pr": 2,
+    "load_local": 3,
+    "cache_lookup": 4,
+    "prepare_repo": 5,
+    "prepare_local": 6,
+    "parse_diff": 7,
+    "triage": 8,
+    "analyze": 9,
+    "verify": 10,
+    "write_report": 11,
+    "post_comments": 12,
+    "finalize": 13,
+}
 
 
 class ReviewExecutor:
@@ -79,6 +97,7 @@ class ReviewExecutor:
         llm_client,
         budgeted_client,
         debug_sink=None,
+        run_id: Optional[str] = None,
     ):
         self.config = config
         self.gh_client = gh_client
@@ -91,6 +110,13 @@ class ReviewExecutor:
         self.llm_client = llm_client
         self.budgeted_client = budgeted_client
         self.debug_sink = debug_sink
+        self.run_id = run_id
+
+        self.cache_key_builder = CacheKeyBuilder(config)
+        self.metrics_collector = MetricsCollector(config)
+        self.evidence_pipeline = EvidencePipeline(config)
+        self.batch_planner = BatchPlanner(config)
+        self.outcome_resolver = OutcomeResolver()
 
         self.last_state: Optional[ReviewState] = None
         self.last_result: Optional[ReviewResult] = None
@@ -182,6 +208,7 @@ class ReviewExecutor:
         *,
         local_mode: bool = False,
         local_input: Optional[LocalReviewInput] = None,
+        run_id: Optional[str] = None,
     ) -> ReviewState:
         config = self.config
         state = ReviewState(
@@ -196,11 +223,13 @@ class ReviewExecutor:
             ),
             local_mode=local_mode,
             local_input=local_input,
+            run_id=run_id or self.run_id or uuid.uuid4().hex,
+            progress_total=len(self._build_workflow().nodes),
         )
-        # 每次 run 使用独立预算；客户端在本次 run 内共享同一本账。
-        # ReviewOrchestrator 返回前会等待所有 worker 结束，因此复用客户端
-        # 不会出现“上一次 run 的超时线程扣本次预算”的竞态。
-        self.budgeted_client.bind_budget(state.budget)
+        # 每次 run 使用独立预算；executor 持有本次 run 专属的 budgeted client。
+        bind_budget = getattr(self.budgeted_client, "bind_budget", None)
+        if callable(bind_budget):
+            bind_budget(state.budget)
         # 记录 run 开始时的累计值，后续用 delta 计算本次真实成本。
         state.usage_start = self._usage_snapshot()
         state.cache_hits_start = int(getattr(self.llm_client, "hits", 0) or 0)
@@ -211,37 +240,54 @@ class ReviewExecutor:
         try:
             state = self._build_workflow().run(state)
         except Exception:
-            outcome = self._compute_outcome(state, failed=True)
+            outcome = self.outcome_resolver.resolve(state, failed=True)
             state.outcome = outcome
             self.last_state = state
             self.last_result = state.review_result
             self.last_outcome = outcome
             raise
+        finally:
+            self._release_worktrees(state)
 
         self.last_state = state
         self.last_result = state.review_result
         if state.report_path is None:
-            outcome = self._compute_outcome(state, failed=True)
+            outcome = self.outcome_resolver.resolve(state, failed=True)
             state.outcome = outcome
             self.last_outcome = outcome
             raise RuntimeError("Review workflow finished without a report path.")
 
-        self.last_outcome = state.outcome or self._compute_outcome(state)
+        self.last_outcome = state.outcome or self.outcome_resolver.resolve(state)
         logger.info("Stage timings: %s", state.stages)
         return state.report_path
+
+    def _release_worktrees(self, state: ReviewState) -> None:
+        """Release per-run git worktrees; shared checkouts are left alone."""
+        if state.local_mode or state.pr_ref is None:
+            return
+        release = getattr(self.repo_mgr, "release_worktree", None)
+        if not callable(release):
+            return
+        for path in (state.base_worktree, state.pr_worktree):
+            if path is None:
+                continue
+            try:
+                release(state.pr_ref.owner, state.pr_ref.repo, path)
+            except Exception as exc:  # noqa: BLE001 - cleanup must not mask result
+                logger.warning("Failed to release worktree %s: %s", path, exc)
 
     # ------------------------------------------------------------------
     # 节点实现
     # ------------------------------------------------------------------
     def _node_parse_url(self, state: ReviewState) -> None:
-        self._log(state, 1, "Parsing PR URL...")
+        self._log(state, "parse_url", "Parsing PR URL...")
         with self._timed(state, "parse_url"):
             state.pr_ref = parse_pr_url(state.pr_url)
 
     def _node_fetch_pr(self, state: ReviewState) -> None:
         if state.pr_ref is None:
             raise RuntimeError("PR ref is missing; parse_url must run first.")
-        self._log(state, 2, "Fetching PR metadata & changed files...")
+        self._log(state, "fetch_pr", "Fetching PR metadata & changed files...")
         with self._timed(state, "fetch_pr"):
             state.pr_info = self.gh_client.get_pull_request(state.pr_ref)
             state.raw_files = self.gh_client.list_changed_files(state.pr_ref)
@@ -270,7 +316,7 @@ class ReviewExecutor:
         if state.local_input is None:
             raise RuntimeError("local_mode requires local_input.")
         local = state.local_input
-        self._log(state, 3, "Preparing local base/head worktrees...")
+        self._log(state, "prepare_local", "Preparing local base/head worktrees...")
         with self._timed(state, "prepare_local"):
             workspace = prepare_local_workspace(
                 local.repo_path,
@@ -303,23 +349,58 @@ class ReviewExecutor:
     def _node_prepare_repo(self, state: ReviewState) -> None:
         if state.pr_ref is None or state.pr_info is None:
             raise RuntimeError("PR metadata is missing.")
-        self._log(state, 3, "Preparing local repository cache...")
+        self._log(state, "prepare_repo", "Preparing local repository cache...")
         with self._timed(state, "prepare_repo"):
-            state.local_repo_path = self.repo_mgr.prepare_pr_repo(
-                state.pr_ref.owner, state.pr_ref.repo, state.pr_ref.pr_number
-            )
+            prepare_worktree = getattr(self.repo_mgr, "prepare_pr_worktree", None)
+            if callable(prepare_worktree):
+                state.pr_worktree = prepare_worktree(
+                    state.pr_ref.owner,
+                    state.pr_ref.repo,
+                    state.pr_ref.pr_number,
+                    head_sha=state.pr_info.head_sha,
+                    run_id=state.run_id,
+                )
+                state.local_repo_path = state.pr_worktree
+            else:
+                state.local_repo_path = self.repo_mgr.prepare_pr_repo(
+                    state.pr_ref.owner, state.pr_ref.repo, state.pr_ref.pr_number
+                )
 
             try:
-                state.base_path = self.repo_mgr.prepare_base_worktree(
-                    state.pr_ref.owner, state.pr_ref.repo, state.pr_info.base_sha
-                )
+                state.base_path = self._prepare_base_worktree(state)
             except RepoCommandError as exc:
                 # base 侧只是增强上下文，失败不应阻断主流程
                 state.base_error = exc.stderr
                 logger.warning("Failed to prepare base worktree: %s", exc)
 
+    def _prepare_base_worktree(self, state: ReviewState) -> Path:
+        assert state.pr_ref is not None and state.pr_info is not None
+        prepare_base = self.repo_mgr.prepare_base_worktree
+        worktree_name = f"base_{state.pr_info.base_sha[:8]}_{state.run_id[:8]}"
+        try:
+            supports_name = "worktree_name" in inspect.signature(
+                prepare_base
+            ).parameters
+        except (TypeError, ValueError):
+            supports_name = False
+        if not supports_name:
+            # 兼容旧 RepoManager / 测试替身：使用共享 base worktree。
+            return prepare_base(
+                state.pr_ref.owner,
+                state.pr_ref.repo,
+                state.pr_info.base_sha,
+            )
+        path = prepare_base(
+            state.pr_ref.owner,
+            state.pr_ref.repo,
+            state.pr_info.base_sha,
+            worktree_name=worktree_name,
+        )
+        state.base_worktree = path
+        return path
+
     def _node_parse_diff(self, state: ReviewState) -> None:
-        self._log(state, 4, "Parsing diffs and extracting symbols...")
+        self._log(state, "parse_diff", "Parsing diffs and extracting symbols...")
         with self._timed(state, "parse_diff"):
             state.parsed_diff = self.diff_parser.parse_diff(
                 [file.model_dump() for file in state.raw_files]
@@ -348,25 +429,6 @@ class ReviewExecutor:
             )
             logger.info("Triage skipped LLM review: %s", decision.reason)
 
-    def _batch_dependencies(self, state: ReviewState) -> Dict[str, set[str]]:
-        """获取文件依赖关系，用于 dependency-aware batching。
-
-        retriever 不提供该能力时返回空映射，分批退化为原始 diff 顺序。
-        """
-        getter = getattr(self.retriever, "related_files", None)
-        if (
-            not callable(getter)
-            or state.parsed_diff is None
-            or state.local_repo_path is None
-        ):
-            return {}
-        try:
-            related = getter(state.local_repo_path, state.parsed_diff)
-        except Exception as exc:  # noqa: BLE001 - 依赖分析失败不应阻断 review
-            logger.debug("Dependency-aware batching disabled: %s", exc)
-            return {}
-        return dict(related or {})
-
     def _node_analyze(self, state: ReviewState) -> None:
         if (
             state.parsed_diff is None
@@ -375,33 +437,23 @@ class ReviewExecutor:
         ):
             raise RuntimeError("Repository or parsed diff is missing.")
 
-        batches = plan_review_batches(
-            state.parsed_diff,
-            soft_prompt_tokens=self.config.soft_prompt_tokens,
-            hard_prompt_tokens=self.config.hard_prompt_tokens,
-            max_batch_tokens=self.config.max_batch_tokens,
-            context_reserve_tokens=context_reserve_tokens_for(
-                self.config.soft_prompt_tokens
-            ),
-            dependencies=self._batch_dependencies(state),
-        )
+        batches = self.batch_planner.plan(state, self.retriever)
         state.batches = batches
         self._log(
             state,
-            5,
+            "analyze",
             f"Retrieving code context and reviewing "
             f"{len(state.parsed_diff.files)} files in {len(batches)} batch(es)...",
         )
 
-        impact_contexts = self._collect_impact_contexts(state)
-        static_contexts = self._collect_static_contexts(state)
+        impact_contexts, static_contexts = self.evidence_pipeline.collect(state)
 
         batch_results: List[ReviewResult] = []
         with self._timed(state, "retrieve_and_review"):
             for index, batch in enumerate(batches, start=1):
                 self._log(
                     state,
-                    6,
+                    "analyze",
                     f"Running AI Code Reviewer "
                     f"(batch {index}/{len(batches)}, {len(batch.files)} files)...",
                 )
@@ -417,7 +469,9 @@ class ReviewExecutor:
                                 state.retrieval_stats.get(key, 0) + value
                             )
                 contexts.extend(
-                    self._extra_contexts(batch, impact_contexts, static_contexts)
+                    self.evidence_pipeline.extra_contexts(
+                        batch, impact_contexts, static_contexts
+                    )
                 )
                 contexts = _dedupe_contexts(contexts)
                 state.all_contexts.extend(contexts)
@@ -503,6 +557,9 @@ class ReviewExecutor:
                     break
                 except Exception as exc:  # noqa: BLE001 - 单批失败不应丢掉已完成的批次
                     state.failed_batches += 1
+                    state.record_error(
+                        "analyze.batch", exc, batch=index, degrade=False
+                    )
                     state.degrade(
                         f"[error] 批次 {index}/{len(batches)} 审查失败"
                         f"（{type(exc).__name__}），已跳过。"
@@ -591,7 +648,7 @@ class ReviewExecutor:
     def _node_write_report(self, state: ReviewState) -> None:
         if state.review_result is None:
             raise RuntimeError("Review result is missing; cannot write report.")
-        self._log(state, 7, "Writing markdown report...")
+        self._log(state, "write_report", "Writing markdown report...")
         with self._timed(state, "write_report"):
             state.report_path = ReportWriter.write(
                 state.review_result, state.output_dir
@@ -604,7 +661,7 @@ class ReviewExecutor:
             or state.pr_info is None
         ):
             return
-        self._log(state, 8, "Posting review comments to GitHub...")
+        self._log(state, "post_comments", "Posting review comments to GitHub...")
         with self._timed(state, "post_comments"):
             comments = build_review_comments(state.review_result)
             self.gh_client.create_review(
@@ -620,32 +677,22 @@ class ReviewExecutor:
         if state.review_result is None:
             raise RuntimeError("Review result is missing; cannot finalize.")
         result = state.review_result
-        outcome = self._compute_outcome(state)
+        outcome = self.outcome_resolver.resolve(state)
         state.outcome = outcome
 
         if state.cache_hit and result.metrics:
             # 缓存命中时 analyze/verify 节点都被跳过，state 里没有文件、批次、
-            # 检索和 token 信息。直接重算会把上一次 run 的指标覆盖成 0，
-            # 所以保留缓存里的原始 metrics，只补充本次 cache 命中信息。
-            metrics = dict(result.metrics)
-            cache = dict(metrics.get("cache") or {})
-            cache.update(
-                {
-                    "review_hit": True,
-                    "key": state.cache_key[:16] if state.cache_key else "",
-                    "served_from_cache": True,
-                    "cache_lookup_seconds": round(
-                        float(state.stages.get("cache_lookup", 0.0)), 3
-                    ),
-                    "current_run_seconds": round(sum(state.stages.values()), 3),
-                }
+            # 检索和 token 信息。保留缓存里的原始 metrics，只补充本次 run
+            # 的 cache 命中信息与 run identity。
+            result.metrics = dict(
+                self.metrics_collector.cache_hit_metrics(
+                    state, result.metrics, outcome
+                )
             )
-            metrics["cache"] = cache
-            metrics["metrics_source"] = "review_cache"
-            metrics.update(self._outcome_metrics(state, outcome))
-            result.metrics = metrics
         else:
-            result.metrics = self._build_metrics(state)
+            result.metrics = dict(
+                self.metrics_collector.build(state, self.llm_client, outcome)
+            )
         logger.info("Review metrics: %s", result.metrics)
 
         # 报告首次写入时 metrics 还没补齐；这里补齐后重新落盘，
@@ -667,71 +714,6 @@ class ReviewExecutor:
 
         if self.debug_sink is not None:
             self.debug_sink.record_state(state)
-
-    # ------------------------------------------------------------------
-    # 证据增强
-    # ------------------------------------------------------------------
-    def _collect_impact_contexts(self, state: ReviewState) -> List[CodeContext]:
-        if not self.config.impact_enabled or state.parsed_diff is None:
-            return []
-        if state.local_repo_path is None:
-            return []
-
-        # 延迟 import：impact analyzer 会加载 tree-sitter，仅需要时才付成本。
-        from openreview.review.impact import ImpactAnalyzer
-
-        with self._timed(state, "impact_analysis"):
-            report = ImpactAnalyzer().analyze(
-                state.parsed_diff, state.local_repo_path
-            )
-        state.impact_findings = report.to_notes()
-        state.impact_count = len(report.findings)
-        if report.findings:
-            state.add_note(
-                f"[impact] 发现 {len(report.findings)} 处跨文件引用，"
-                "已作为上下文注入。"
-            )
-        return report.to_contexts(state.local_repo_path)
-
-    def _collect_static_contexts(self, state: ReviewState) -> List[CodeContext]:
-        if not self.config.static_analysis_enabled or state.parsed_diff is None:
-            return []
-        if state.local_repo_path is None:
-            return []
-
-        from openreview.review.static_analysis import StaticAnalysisRunner
-
-        with self._timed(state, "static_analysis"):
-            report = StaticAnalysisRunner(tools=self.config.static_tools).run(
-                state.local_repo_path, state.parsed_diff
-            )
-        state.static_findings = report.to_notes()
-        state.static_count = len(report.findings)
-        for error in report.errors:
-            state.add_note(f"[static] {error}")
-        if report.findings:
-            state.add_note(
-                f"[static] 发现 {len(report.findings)} 个静态分析信号，"
-                "已作为上下文注入。"
-            )
-        return report.to_contexts(state.local_repo_path)
-
-    @staticmethod
-    def _extra_contexts(
-        batch,
-        impact_contexts: List[CodeContext],
-        static_contexts: List[CodeContext],
-    ) -> List[CodeContext]:
-        batch_files = {file.filename for file in batch.files}
-        # impact 指向的是“变更文件之外”的引用，全部保留；
-        # static 信号只取当前批次涉及的文件，避免重复注入。
-        extras = list(impact_contexts)
-        extras.extend(
-            context
-            for context in static_contexts
-            if context.file_path in batch_files
-        )
-        return extras
 
     # ------------------------------------------------------------------
     # 工具方法
@@ -766,234 +748,21 @@ class ReviewExecutor:
         return ordered[: max(0, remaining_calls)]
 
     def _cache_key(self, state: ReviewState) -> str:
-        if state.pr_info is None:
-            return ""
-        return fingerprint(
-            state.pr_url,
-            state.pr_info.base_sha,
-            state.pr_info.head_sha,
-            str(getattr(self.llm_client, "model", "unknown")),
-            str(getattr(self.llm_client, "temperature", "")),
-            str(getattr(self.llm_client, "seed", "")),
-            PROMPT_VERSION,
-            VALIDATOR_VERSION,
-            RETRIEVER_VERSION,
-            *self.config.cache_key_parts(),
+        return self.cache_key_builder.build(
+            state.pr_url, state.pr_info, self.llm_client
         )
 
     def _usage_snapshot(self) -> Dict[str, int]:
         """读取客户端当前的累计 usage，作为一次 run 的起点。"""
-        usage = getattr(self.llm_client, "usage", {}) or {}
-        return {
-            str(key): int(value)
-            for key, value in usage.items()
-            if isinstance(value, (int, float))
-        }
+        return self.metrics_collector.usage_snapshot(self.llm_client)
 
     @staticmethod
-    def _usage_delta(
-        before: Dict[str, int], after: Dict[str, int]
-    ) -> Dict[str, int]:
-        """计算本次 run 的 usage 增量，避免评测复用 pipeline 时累计污染。"""
-        keys = sorted(set(before) | set(after))
-        return {
-            key: int(after.get(key, 0)) - int(before.get(key, 0))
-            for key in keys
-        }
-
-    def _build_metrics(self, state: ReviewState) -> Dict[str, object]:
-        config = self.config
-        parsed_diff = state.parsed_diff
-        patch_tokens = sum(
-            estimate_tokens(file.patch or "")
-            for file in (parsed_diff.files if parsed_diff else [])
-        )
-        context_tokens = sum(
-            estimate_tokens(context.snippet) for context in state.all_contexts
-        )
-        diff_files = parsed_diff.files if parsed_diff else []
-        changed_files = {file.filename for file in diff_files}
-        context_files = {context.file_path for context in state.all_contexts}
-        covered_files = changed_files & context_files
-        context_ids = {context.ensure_context_id() for context in state.all_contexts}
-        context_kinds: Dict[str, int] = {}
-        for context in state.all_contexts:
-            context_kinds[context.kind] = context_kinds.get(context.kind, 0) + 1
-        changed_symbols = {
-            symbol
-            for file in diff_files
-            for symbol in (file.changed_symbols or [])
-            if symbol
-        }
-        retrieved_symbols = {
-            context.symbol for context in state.all_contexts if context.symbol
-        }
-        # 只有“符号/定义/import/依赖/引用”这类结构化上下文才算索引召回；
-        # test/impact/static 不是 FTS 索引的直接产物。
-        index_kinds = {
-            "symbol",
-            "definition",
-            "import",
-            "dependency",
-            "caller",
-            "callee",
-            "reference",
-        }
-        index_context_files = {
-            context.file_path
-            for context in state.all_contexts
-            if context.kind in index_kinds
-        }
-        graph_kinds = {"caller", "callee", "import", "dependency"}
-        graph_context_kinds = {
-            kind: context_kinds[kind]
-            for kind in sorted(graph_kinds)
-            if context_kinds.get(kind)
-        }
-        graph_contexts = sum(graph_context_kinds.values())
-        graph_context_files = {
-            context.file_path
-            for context in state.all_contexts
-            if context.kind in graph_kinds
-        }
-        metrics: Dict[str, object] = {
-            "stages_seconds": dict(state.stages),
-            "total_seconds": round(sum(state.stages.values()), 3),
-            "files": len(diff_files),
-            "diff": {
-                "files": len(diff_files),
-                "additions": sum(file.additions for file in diff_files),
-                "deletions": sum(file.deletions for file in diff_files),
-                "languages": sorted(
-                    {file.language for file in diff_files if file.language}
-                ),
-            },
-            "retrieval": {
-                "contexts": len(state.all_contexts),
-                "context_files": len(context_files),
-                "changed_files": len(changed_files),
-                "covered_changed_files": len(covered_files),
-                "changed_file_coverage": (
-                    round(len(covered_files) / len(changed_files), 3)
-                    if changed_files
-                    else 0.0
-                ),
-                "context_tokens": context_tokens,
-                "unique_contexts": len(context_ids),
-                "duplicate_contexts": len(state.all_contexts) - len(context_ids),
-                "context_kinds": context_kinds,
-                "changed_symbols": len(changed_symbols),
-                "retrieved_symbols": len(retrieved_symbols),
-                "symbol_coverage": (
-                    round(
-                        len(changed_symbols & retrieved_symbols)
-                        / len(changed_symbols),
-                        3,
-                    )
-                    if changed_symbols
-                    else 0.0
-                ),
-                "index_context_files": len(index_context_files),
-                "context_file_list": sorted(context_files)[:100],
-                "index_context_file_list": sorted(index_context_files)[:100],
-                "hybrid_enabled": config.hybrid_retrieval_enabled,
-                "graph_enabled": config.graph_retrieval_enabled,
-                "graph_contexts": graph_contexts,
-                "graph_context_kinds": graph_context_kinds,
-                "graph_context_files": len(graph_context_files),
-                "graph_error": int(state.retrieval_stats.get("graph_error", 0)),
-                "stats": dict(state.retrieval_stats),
-            },
-            "batches": len(state.batches),
-            "reviewer_mode": config.reviewer_mode,
-            "aspects": len(state.selected_aspects),
-            "llm_calls": state.budget.used_llm_calls,
-            "estimated_patch_tokens": patch_tokens,
-            "estimated_context_tokens": context_tokens,
-            "triage": {
-                "enabled": config.triage_enabled,
-                "skipped_llm": state.skipped_llm,
-                "reason": state.triage_reason,
-                "aspects": list(state.selected_aspects),
-            },
-            "impact": {
-                "enabled": config.impact_enabled,
-                "findings": state.impact_count,
-            },
-            "static_analysis": {
-                "enabled": config.static_analysis_enabled,
-                "findings": state.static_count,
-            },
-            "validation": dict(state.validation_stats),
-            "verifier": dict(state.verifier_stats),
-            "cache": {
-                "review_hit": state.cache_hit,
-                "key": state.cache_key[:16] if state.cache_key else "",
-                "llm_hits": max(
-                    0,
-                    int(getattr(self.llm_client, "hits", 0) or 0)
-                    - state.cache_hits_start,
-                ),
-                "llm_misses": max(
-                    0,
-                    int(getattr(self.llm_client, "misses", 0) or 0)
-                    - state.cache_misses_start,
-                ),
-            },
-            "budget": {
-                "max_llm_calls": state.budget.max_llm_calls,
-                "used_llm_calls": state.budget.used_llm_calls,
-                "max_input_tokens": state.budget.max_input_tokens,
-                "used_input_tokens": state.budget.used_input_tokens,
-                "max_seconds": state.budget.max_seconds,
-                "elapsed_seconds": round(state.budget.elapsed(), 3),
-            },
-            "llm_usage": self._usage_delta(
-                state.usage_start, self._usage_snapshot()
-            ),
-        }
-        metrics.update(
-            self._outcome_metrics(
-                state, state.outcome or self._compute_outcome(state)
-            )
-        )
-        return metrics
-
-    @staticmethod
-    def _outcome_metrics(
-        state: ReviewState, outcome: ReviewOutcome
-    ) -> Dict[str, object]:
-        return {
-            "outcome": outcome.as_dict(),
-            "failed_batches": state.failed_batches,
-            "budget_exhausted": state.budget_exhausted,
-            "degraded_reasons": list(state.degraded_reasons),
-        }
-
-    def _compute_outcome(
-        self, state: ReviewState, *, failed: bool = False
-    ) -> ReviewOutcome:
-        if failed:
-            status = ReviewStatus.FAILED
-        elif state.skipped_llm:
-            status = ReviewStatus.SKIPPED
-        elif state.failed_batches or state.budget_exhausted:
-            status = ReviewStatus.PARTIAL
-        else:
-            status = ReviewStatus.COMPLETED
-        return ReviewOutcome(
-            status=status,
-            report_path=state.report_path,
-            failed_batches=state.failed_batches,
-            total_batches=len(state.batches),
-            budget_exhausted=state.budget_exhausted,
-            degraded_reasons=list(state.degraded_reasons),
-        )
-
-    @staticmethod
-    def _log(state: ReviewState, step: int, message: str) -> None:
+    def _log(state: ReviewState, node: str, message: str) -> None:
+        step = _PROGRESS_STEPS.get(node)
+        if step is not None:
+            state.progress_step = step
         if state.progress_cb:
-            state.progress_cb(step, message)
+            state.progress_cb(state.progress_step, message)
 
     @staticmethod
     @contextmanager

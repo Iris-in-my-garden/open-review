@@ -11,9 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
 
-from openreview.github.client import PullRequestInfo
+from openreview.domain.models import PullRequestInfo, ReviewResult
 from openreview.repo.diff_parser import ParsedDiff
-from openreview.review.report_writer import ReviewResult
 
 ALL_ASPECTS = ["clean_code", "bugs", "performance", "security"]
 TEST_ONLY_ASPECTS = ["clean_code", "bugs"]

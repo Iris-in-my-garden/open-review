@@ -7,7 +7,7 @@ import typer
 
 from openreview.repo.manager import RepoCommandError
 from openreview.review.report_writer import ReportWriter
-from openreview.review.workflow import ReviewStatus
+from openreview.review.workflow import WORKFLOW_NODE_COUNT, ReviewStatus
 from openreview.services.review_service import ReviewPipeline
 
 # 创建应用对象
@@ -182,7 +182,9 @@ def review(
     )
 
     def print_progress(step: int, msg: str):
-        typer.secho(f"--> [{step}/8] {msg}", fg=typer.colors.CYAN)
+        typer.secho(
+            f"--> [{step}/{WORKFLOW_NODE_COUNT}] {msg}", fg=typer.colors.CYAN
+        )
 
     pipeline = None
     try:

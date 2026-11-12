@@ -5,11 +5,18 @@ import time
 from typing import Dict, List, Optional
 
 import httpx
-from pydantic import BaseModel
 
+from openreview.domain.models import ChangedFile, PullRequestInfo
 from openreview.github.pr_url import GitHubPRRef
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "ChangedFile",
+    "GitHubAPIError",
+    "GitHubClient",
+    "PullRequestInfo",
+]
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 MAX_BACKOFF_SECONDS = 8.0
@@ -18,28 +25,6 @@ MAX_RATE_LIMIT_WAIT_SECONDS = 30.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
 
-
-class PullRequestInfo(BaseModel):
-    """ 基本元数据信息"""
-    owner: str
-    repo: str
-    pr_number: int
-    title: str
-    body: Optional[str] = None
-    base_branch: str
-    head_branch: str
-    base_sha: str
-    head_sha: str
-    html_url: str
-
-class ChangedFile(BaseModel):
-    """ pr 相关的文件信息"""
-    filename: str
-    status: str
-    additions: int
-    deletions: int
-    changes: int
-    patch: Optional[str] = None
 
 class GitHubAPIError(Exception):
     """Custom exception raised for GitHub API errors."""

@@ -14,14 +14,16 @@ object，测试也可以单独构造 executor。
 """
 
 import logging
+import threading
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
+from openreview.domain.models import ReviewResult
 from openreview.github.client import GitHubClient
 from openreview.repo.diff_parser import DiffParser
 from openreview.repo.local import LocalReviewInput
 from openreview.repo.manager import RepoManager
-from openreview.retriever.base import Retriever
+from openreview.retriever.base import Retriever, ScopedRetriever
 from openreview.retriever.hybrid import HybridRetriever
 from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
 from openreview.review.aspect_reviewer import ReviewOrchestrator
@@ -38,7 +40,6 @@ from openreview.review.llm_client import (
 )
 from openreview.review.output_parser import OutputParser
 from openreview.review.prompt_builder import PromptBuilder
-from openreview.review.report_writer import ReviewResult
 from openreview.review.single_shot import SingleShotReviewer
 from openreview.review.token_budget import (
     DEFAULT_HARD_PROMPT_TOKENS,
@@ -48,6 +49,7 @@ from openreview.review.token_budget import (
 from openreview.review.verifier import FindingVerifier
 from openreview.review.workflow import ReviewOutcome, ReviewState
 from openreview.services.review_executor import ReviewExecutor
+from openreview.services.review_session import ReviewSession
 
 logger = logging.getLogger(__name__)
 
@@ -153,13 +155,17 @@ class ReviewPipeline:
             )
         else:
             self.retriever = TreeSitterLocalRetriever()
+        self._default_retriever = self.retriever
+        # 多个 run 共享 retriever 的索引缓存，但 last_stats 是可变状态；
+        # ScopedRetriever 用同一把锁串行化 retrieve 并快照 stats。
+        self._retriever_lock = threading.Lock()
 
         # 根据标志直接切换实例，不需要用 MagicMock 动态拼装。
         # 注意：GitHub Token 与 LLM API Key 是两套完全独立的凭证。
         effective_llm_timeout = (
             min(llm_timeout, aspect_timeout) if aspect_timeout > 0 else llm_timeout
         )
-        base_client: AbstractLLMClient = (
+        self._base_client: AbstractLLMClient = (
             MockLLMClient()
             if mock_llm
             else LLMClient(
@@ -173,60 +179,152 @@ class ReviewPipeline:
             )
         )
         # 预算包在真实客户端外面：aspect / verifier / retry 的每次调用都扣账。
-        self._budgeted_client = BudgetedLLMClient(base_client)
-        client: AbstractLLMClient = self._budgeted_client
-        # record/replay 放在预算外层：cache hit 不消耗真实调用预算。
-        if llm_cache_dir:
-            client = FileLLMCacheClient(
-                self._budgeted_client, llm_cache_dir, llm_cache_mode  # type: ignore[arg-type]
-            )
-        self.llm_client = client
+        # 这组客户端是“原型”，供兼容属性/测试观察；每次 run 会新建
+        # run-scoped BudgetedLLMClient，避免并发 run 共用同一本预算账。
+        self._budgeted_client = BudgetedLLMClient(self._base_client)
+        self.llm_client = self._wrap_llm_client(self._budgeted_client)
 
         self.debug_sink = DebugSink(debug_dir) if debug_dir else None
-        prompt_builder = PromptBuilder(
-            max_patch_tokens=effective_patch_tokens,
-            max_context_tokens=effective_context_tokens,
-        )
-        output_parser = OutputParser()
-        validator = FindingValidator(debug_sink=self.debug_sink)
-        self.reviewer: ReviewOrchestrator
-        if self.config.reviewer_mode == "single":
-            self.reviewer = SingleShotReviewer(
-                prompt_builder=prompt_builder,
-                llm_client=self.llm_client,
-                output_parser=output_parser,
-                validator=validator,
-                max_workers=max_workers,
-                aspect_timeout=aspect_timeout,
-                debug_sink=self.debug_sink,
-            )
-        else:
-            self.reviewer = ReviewOrchestrator(
-                prompt_builder=prompt_builder,
-                llm_client=self.llm_client,
-                output_parser=output_parser,
-                validator=validator,
-                max_workers=max_workers,
-                aspect_timeout=aspect_timeout,
-                debug_sink=self.debug_sink,
-            )
-        self.verifier = (
-            FindingVerifier(
-                self.llm_client,
-                verify_severities=self.config.verify_severities,
-                debug_sink=self.debug_sink,
-            )
-            if verifier_enabled
-            else None
-        )
+        self.reviewer: ReviewOrchestrator = self._build_reviewer(self.llm_client)
+        self._default_reviewer = self.reviewer
+        self.verifier = self._build_verifier(self.llm_client)
+        self._default_verifier = self.verifier
         self.review_cache = ReviewCache(
             review_cache_dir, enabled=review_cache_enabled
         )
 
         # run()/run_local() 结束后保留最后一次结果，供 CLI 导出 JSON 或评测读取。
+        # thread-local：并发 run 不会互相覆盖 last_*。
+        self._last_local = threading.local()
         self.last_result: Optional[ReviewResult] = None
         self.last_state: Optional[ReviewState] = None
         self.last_outcome: Optional[ReviewOutcome] = None
+
+    # ------------------------------------------------------------------
+    # run-scoped 组件构造
+    # ------------------------------------------------------------------
+    def _wrap_llm_client(self, client: AbstractLLMClient):
+        # record/replay 放在预算外层：cache hit 不消耗真实调用预算。
+        if self.config.llm_cache_dir:
+            return FileLLMCacheClient(
+                client,
+                self.config.llm_cache_dir,
+                self.config.llm_cache_mode,  # type: ignore[arg-type]
+            )
+        return client
+
+    def _build_reviewer(self, llm_client) -> ReviewOrchestrator:
+        prompt_builder = PromptBuilder(
+            max_patch_tokens=self.config.max_patch_tokens,
+            max_context_tokens=self.config.max_context_tokens,
+        )
+        output_parser = OutputParser()
+        validator = FindingValidator(debug_sink=self.debug_sink)
+        if self.config.reviewer_mode == "single":
+            return SingleShotReviewer(
+                prompt_builder=prompt_builder,
+                llm_client=llm_client,
+                output_parser=output_parser,
+                validator=validator,
+                max_workers=self.config.max_workers,
+                aspect_timeout=self.config.aspect_timeout,
+                debug_sink=self.debug_sink,
+            )
+        return ReviewOrchestrator(
+            prompt_builder=prompt_builder,
+            llm_client=llm_client,
+            output_parser=output_parser,
+            validator=validator,
+            max_workers=self.config.max_workers,
+            aspect_timeout=self.config.aspect_timeout,
+            debug_sink=self.debug_sink,
+        )
+
+    def _build_verifier(self, llm_client):
+        if not self.config.verifier_enabled:
+            return None
+        return FindingVerifier(
+            llm_client,
+            verify_severities=self.config.verify_severities,
+            debug_sink=self.debug_sink,
+        )
+
+    def _new_session(self) -> ReviewSession:
+        """Build all mutable per-run components.
+
+        Shared resources (GitHub client, repo manager, retriever index cache,
+        file review cache) stay on the pipeline. Budget, reviewer, verifier
+        and retrieval stats are recreated for each run.
+        """
+        run_id = ReviewSession.new_run_id()
+        budgeted_client = BudgetedLLMClient(self._base_client)
+        llm_client = self._wrap_llm_client(budgeted_client)
+
+        # 测试/调用方可能在构造后替换组件；只有仍指向默认原型时才重建，
+        # 否则必须尊重替换（例如 FakeReviewer / FakeRetriever）。
+        reviewer = (
+            self.reviewer
+            if self.reviewer is not self._default_reviewer
+            else self._build_reviewer(llm_client)
+        )
+        verifier = (
+            self.verifier
+            if self.verifier is not self._default_verifier
+            else self._build_verifier(llm_client)
+        )
+        retriever = (
+            self.retriever
+            if self.retriever is not self._default_retriever
+            else ScopedRetriever(self.retriever, self._retriever_lock)
+        )
+
+        executor = ReviewExecutor(
+            config=self.config,
+            gh_client=self.gh_client,
+            repo_mgr=self.repo_mgr,
+            diff_parser=self.diff_parser,
+            retriever=retriever,
+            reviewer=reviewer,
+            verifier=verifier,
+            review_cache=self.review_cache,
+            llm_client=llm_client,
+            budgeted_client=budgeted_client,
+            debug_sink=self.debug_sink,
+            run_id=run_id,
+        )
+        return ReviewSession(
+            run_id=run_id,
+            executor=executor,
+            budgeted_client=budgeted_client,
+            llm_client=llm_client,
+            reviewer=reviewer,
+            verifier=verifier,
+            retriever=retriever,
+        )
+
+    @property
+    def last_result(self) -> Optional[ReviewResult]:
+        return getattr(self._last_local, "result", None)
+
+    @last_result.setter
+    def last_result(self, value: Optional[ReviewResult]) -> None:
+        self._last_local.result = value
+
+    @property
+    def last_state(self) -> Optional[ReviewState]:
+        return getattr(self._last_local, "state", None)
+
+    @last_state.setter
+    def last_state(self, value: Optional[ReviewState]) -> None:
+        self._last_local.state = value
+
+    @property
+    def last_outcome(self) -> Optional[ReviewOutcome]:
+        return getattr(self._last_local, "outcome", None)
+
+    @last_outcome.setter
+    def last_outcome(self, value: Optional[ReviewOutcome]) -> None:
+        self._last_local.outcome = value
 
     # ------------------------------------------------------------------
     # 兼容属性：调用方仍然可以读取 pipeline.max_batch_tokens 等旧字段。
@@ -299,28 +397,16 @@ class ReviewPipeline:
     # 执行入口
     # ------------------------------------------------------------------
     def _executor(self) -> ReviewExecutor:
-        """每次 run 新建 executor，捕获调用方当前替换过的组件。"""
-        return ReviewExecutor(
-            config=self.config,
-            gh_client=self.gh_client,
-            repo_mgr=self.repo_mgr,
-            diff_parser=self.diff_parser,
-            retriever=self.retriever,
-            reviewer=self.reviewer,
-            verifier=self.verifier,
-            review_cache=self.review_cache,
-            llm_client=self.llm_client,
-            budgeted_client=self._budgeted_client,
-            debug_sink=self.debug_sink,
-        )
+        """每次 run 新建 executor；保留该方法供测试/高级调用方使用。"""
+        return self._new_session().executor
 
-    def _execute(self, executor: ReviewExecutor, state: ReviewState) -> Path:
+    def _execute(self, session: ReviewSession, state: ReviewState) -> Path:
         try:
-            return executor.execute(state)
+            return session.execute(state)
         finally:
-            self.last_state = executor.last_state
-            self.last_result = executor.last_result
-            self.last_outcome = executor.last_outcome
+            self.last_state = session.executor.last_state
+            self.last_result = session.executor.last_result
+            self.last_outcome = session.executor.last_outcome
 
     def run(
         self,
@@ -335,14 +421,14 @@ class ReviewPipeline:
         message)
         :param post_comments: 是否通过 GitHub Review API 发表行内评论
         """
-        executor = self._executor()
-        state = executor.new_state(
+        session = self._new_session()
+        state = session.new_state(
             pr_url=pr_url,
             output_dir=output_dir,
             progress_cb=progress_cb,
             post_comments=post_comments,
         )
-        return self._execute(executor, state)
+        return self._execute(session, state)
 
     def run_local(
         self,
@@ -389,8 +475,8 @@ class ReviewPipeline:
             pr_url=pr_url,
             keep_worktrees=keep_worktrees,
         )
-        executor = self._executor()
-        state = executor.new_state(
+        session = self._new_session()
+        state = session.new_state(
             pr_url=synthetic_url,
             output_dir=output_dir or Path("reports"),
             progress_cb=progress_cb,
@@ -398,7 +484,7 @@ class ReviewPipeline:
             local_input=local_input,
         )
         try:
-            return self._execute(executor, state)
+            return self._execute(session, state)
         finally:
             if state.local_workspace is not None:
                 state.local_workspace.cleanup()

@@ -187,3 +187,48 @@ def test_clone_falls_back_to_full_clone(mock_run, tmp_path: Path):
     second = mock_run.call_args_list[1].args[0]
     assert "--filter=blob:none" in first
     assert "--filter=blob:none" not in second
+
+
+@patch.object(RepoManager, "_run_git_cmd")
+def test_prepare_pr_worktree_is_run_scoped(mock_run, tmp_path: Path):
+    """PR head should be checked out into a per-run worktree, not the shared clone."""
+    manager = RepoManager(cache_dir=tmp_path, max_cache_size_gb=0)
+    mock_run.return_value = MagicMock(returncode=0, stdout="abc123\n", stderr="")
+
+    def fake_clone(url: str, target: Path) -> None:
+        target.mkdir(parents=True)
+
+    manager._clone_repo = fake_clone  # type: ignore[method-assign]
+
+    path = manager.prepare_pr_worktree(
+        "org", "repo", 7, head_sha=None, run_id="deadbeef"
+    )
+
+    assert path.name == "org__repo__pr_7_deadbeef"
+    commands = [call.args[0] for call in mock_run.call_args_list]
+    assert ["fetch", "origin", "pull/7/head"] in commands
+    assert any(command[:3] == ["worktree", "add", "--detach"] for command in commands)
+
+
+def test_active_worktree_and_backing_repo_survive_cache_pruning(tmp_path: Path):
+    """Pruning must not evict a worktree or the clone its .git points into."""
+    manager = RepoManager(cache_dir=tmp_path, max_cache_size_gb=0)
+    # Enable pruning with a tiny cap so every candidate would normally go.
+    manager.max_cache_size_bytes = 1
+
+    repo_dir = tmp_path / "org__repo"
+    worktree = tmp_path / "org__repo__pr_1_run"
+    stale = tmp_path / "old__repo"
+    for directory in (repo_dir, worktree, stale):
+        directory.mkdir()
+        (directory / "payload.bin").write_bytes(b"x" * 16)
+
+    manager._hold_worktree(worktree, repo_dir)
+    manager._prune_cache()
+
+    assert repo_dir.exists()
+    assert worktree.exists()
+    assert not stale.exists()
+
+    manager._release_worktree_lease(worktree)
+    assert manager._active_paths == {}
