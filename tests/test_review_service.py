@@ -160,6 +160,48 @@ class FakeContextRetriever:
         ]
 
 
+class FakeRepeatedContextRetriever:
+    """每个 batch 都返回同一段上下文，用于验证跨批去重与统计。"""
+
+    def __init__(self):
+        self.last_stats = {"index_symbol_hits": 1}
+
+    def retrieve(self, repo_path, parsed_diff, base_path=None):
+        return [
+            CodeContext(
+                file_path="src/shared.py",
+                reason="shared definition",
+                snippet="def shared(): ...",
+                score=0.9,
+                kind="definition",
+                symbol="shared",
+                start_line=1,
+                end_line=1,
+            )
+        ]
+
+
+class HugeContextRetriever:
+    """返回一段远超 prompt 上下文预算的片段，用于验证省略统计。"""
+
+    def __init__(self):
+        self.last_stats = {"index_symbol_hits": 1}
+
+    def retrieve(self, repo_path, parsed_diff, base_path=None):
+        return [
+            CodeContext(
+                file_path="src/huge.py",
+                reason="huge definition",
+                snippet="x = 1\n" * 5000,
+                score=0.9,
+                kind="definition",
+                symbol="huge",
+                start_line=1,
+                end_line=5000,
+            )
+        ]
+
+
 class FakeGraphContextRetriever(FakeContextRetriever):
     """模拟 call graph / import graph 实际注入的上下文。"""
 
@@ -440,6 +482,64 @@ def test_pipeline_surfaces_retrieval_metrics_and_context_refs(tmp_path: Path):
 
     # context_refs 从 prompt 上下文 -> finding -> validator -> result 全链路保留。
     assert all(issue.context_refs for issue in result.potential_issues)
+
+    pipeline.close()
+
+
+def test_pipeline_dedupes_contexts_across_batches_without_changing_prompts(
+    tmp_path: Path,
+):
+    files = [
+        ChangedFile(
+            filename=f"src/file_{index}.py",
+            status="modified",
+            additions=1,
+            deletions=0,
+            changes=1,
+            patch="@@ -0,0 +1,1 @@\n+def x():\n",
+        )
+        for index in range(2)
+    ]
+    pipeline = ReviewPipeline(mock_llm=True, max_batch_tokens=1)
+    pipeline.gh_client = FakeGitHubClient(files=files)
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRepeatedContextRetriever()
+    pipeline.reviewer = FakeContextReviewer()
+
+    pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+
+    assert pipeline.last_state is not None
+    # 两个 batch 都注入了同一段上下文，但本次 run 只记录一份。
+    assert len(pipeline.last_state.all_contexts) == 1
+    assert pipeline.last_state.context_stats["batch_context_occurrences"] == 2
+    assert (
+        pipeline.last_state.context_stats["cross_batch_duplicate_contexts"] == 1
+    )
+    result = pipeline.last_state.review_result
+    assert result is not None
+    gap = result.metrics["retrieval"]["context_gap"]
+    assert gap["batch_context_occurrences"] == 2
+    assert gap["cross_batch_duplicates"] == 1
+
+    pipeline.close()
+
+
+def test_pipeline_surfaces_prompt_context_omissions(tmp_path: Path):
+    pipeline = ReviewPipeline(mock_llm=True)
+    pipeline.gh_client = FakeGitHubClient()
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = HugeContextRetriever()
+
+    pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+
+    assert pipeline.last_state is not None
+    assert pipeline.last_state.context_stats["prompt_contexts_omitted"] >= 1
+    result = pipeline.last_state.review_result
+    assert result is not None
+    gap = result.metrics["retrieval"]["context_gap"]
+    assert gap["prompt_contexts_omitted"] >= 1
+    assert gap["prompt_context_omitted_tokens"] > 0
+    assert any("因 prompt 预算被省略" in note for note in result.review_notes)
 
     pipeline.close()
 

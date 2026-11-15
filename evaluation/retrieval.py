@@ -73,6 +73,11 @@ def compute_retrieval_metrics(
     retrieval_stats: Dict[str, float] = {}
     symbol_coverages: List[float] = []
     graph_contexts_total = 0
+    prompt_context_coverages: List[float] = []
+    prompt_contexts_used_total = 0
+    prompt_contexts_omitted_total = 0
+    retrieval_truncated_total = 0
+    cross_batch_duplicates_total = 0
 
     for instance in instances:
         instance_id = str(instance.get("instance_id") or "")
@@ -153,6 +158,23 @@ def compute_retrieval_metrics(
                 for kind in ("caller", "callee", "import", "dependency")
             )
 
+        gap = metrics.get("context_gap") or {}
+        prompt_used = int(gap.get("prompt_contexts_used") or 0)
+        prompt_omitted = int(gap.get("prompt_contexts_omitted") or 0)
+        prompt_context_coverage = _rate(
+            prompt_used, prompt_used + prompt_omitted
+        )
+        if prompt_context_coverage is not None:
+            prompt_context_coverages.append(prompt_context_coverage)
+        prompt_contexts_used_total += prompt_used
+        prompt_contexts_omitted_total += prompt_omitted
+        retrieval_truncated_total += int(
+            gap.get("retrieval_truncated") or 0
+        )
+        cross_batch_duplicates_total += int(
+            gap.get("cross_batch_duplicates") or 0
+        )
+
         rows.append(
             {
                 "instance_id": instance_id,
@@ -167,6 +189,9 @@ def compute_retrieval_metrics(
                 "contexts": contexts,
                 "duplicate_contexts": duplicates,
                 "symbol_coverage": symbol_coverage,
+                "prompt_context_coverage": prompt_context_coverage,
+                "prompt_contexts_omitted": prompt_omitted,
+                "retrieval_truncated": int(gap.get("retrieval_truncated") or 0),
                 "graph_contexts": graph_contexts,
                 "patch_checked": len(checkable_patches),
                 "patch_valid": valid_patches,
@@ -204,6 +229,13 @@ def compute_retrieval_metrics(
             ),
             "graph_contexts_total": graph_contexts_total,
             "graph_contexts_avg": _rate(graph_contexts_total, len(rows)),
+            # “检索到了但 prompt 装不下 / 被 cap 截断”的可见信号。
+            # 它不是 ground-truth recall，但能区分“没召回”和“召回后被丢弃”。
+            "prompt_context_coverage": _mean(prompt_context_coverages),
+            "prompt_contexts_used_total": prompt_contexts_used_total,
+            "prompt_contexts_omitted_total": prompt_contexts_omitted_total,
+            "retrieval_truncated_total": retrieval_truncated_total,
+            "cross_batch_duplicates_total": cross_batch_duplicates_total,
             "graph_context_kinds": {
                 kind: context_kinds[kind]
                 for kind in ("caller", "callee", "import", "dependency")
@@ -256,6 +288,11 @@ def print_retrieval_summary(metrics: Dict[str, Any]) -> None:
         f"- duplicate contexts: {_fmt(retrieval.get('duplicate_context_rate'))}"
     )
     print(f"- graph contexts:     {_fmt(retrieval.get('graph_contexts_avg'))}")
+    print(
+        f"- prompt ctx cover:   {_fmt(retrieval.get('prompt_context_coverage'))} "
+        f"(omitted={retrieval.get('prompt_contexts_omitted_total', 0)}, "
+        f"truncated={retrieval.get('retrieval_truncated_total', 0)})"
+    )
     print(
         f"- patch valid:        {_fmt(patch.get('valid_rate'))} "
         f"({patch.get('valid', 0)}/{patch.get('checked', 0)})"

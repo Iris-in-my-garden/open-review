@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from openreview.retriever.code_context import CodeContext, dedupe_contexts
 from openreview.retriever.graph import GraphRetriever
 from openreview.retriever.index import ImportEdge, RepoIndex
 from openreview.retriever.query import RetrievalQuery
@@ -293,3 +294,42 @@ def test_graph_retriever_ignores_non_python_callers_when_configured(tmp_path: Pa
         assert "pkg/main.go" not in caller_files
     finally:
         index.close()
+
+
+def test_context_dedupe_uses_range_identity_across_kinds():
+    """同一段代码由 AST / FTS / graph 以不同 kind 找到时只保留一条。"""
+    contexts = [
+        CodeContext(
+            file_path="pkg/auth.py",
+            reason="enclosing",
+            snippet="def login():\n    pass",
+            score=0.95,
+            kind="enclosing",
+            start_line=10,
+            end_line=11,
+        ),
+        CodeContext(
+            file_path="pkg/auth.py",
+            reason="definition",
+            snippet="def login():\n    pass",
+            score=0.90,
+            kind="definition",
+            start_line=10,
+            end_line=11,
+        ),
+        CodeContext(
+            file_path="pkg/api.py",
+            reason="reference",
+            snippet="login()",
+            score=0.60,
+            kind="reference",
+            start_line=3,
+            end_line=3,
+        ),
+    ]
+
+    deduped = dedupe_contexts(contexts)
+
+    assert len(deduped) == 2
+    assert deduped[0].kind == "enclosing"
+    assert deduped[0].score == 0.95

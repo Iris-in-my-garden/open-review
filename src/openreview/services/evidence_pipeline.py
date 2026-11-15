@@ -9,6 +9,12 @@ from openreview.retriever.code_context import CodeContext
 from openreview.review.config import ReviewConfig
 from openreview.review.workflow import ReviewState
 
+# 一个 batch 最多注入多少条跨文件影响证据；超过这个量只会挤占真正相关
+# 的 diff 上下文。
+MAX_IMPACT_PER_BATCH = 6
+# 无法按符号归属时的保守回退：只让一个 batch 带少量全局 impact。
+MAX_GLOBAL_IMPACT_FALLBACK = 3
+
 
 class EvidencePipeline:
     def __init__(self, config: ReviewConfig):
@@ -77,11 +83,37 @@ class EvidencePipeline:
         batch,
         impact_contexts: List[CodeContext],
         static_contexts: List[CodeContext],
+        *,
+        include_global_impact: bool = False,
+        max_impact_per_batch: int = MAX_IMPACT_PER_BATCH,
     ) -> List[CodeContext]:
+        """只注入与当前 batch 有关的额外证据。
+
+        impact 上下文指向变更文件之外的引用，以前会被原样注入每个 batch。
+        多 batch 时同一段引用会重复占用每个 prompt 的上下文预算，实测一个
+        PR 内跨 batch 重复 339 段、413 段被预算省略。现在按“batch 变更符号”
+        过滤；只有在没有命中（符号抽取失败等）时才由第一个 batch 带上少量
+        全局 impact，避免跨文件证据彻底消失。
+        """
         batch_files = {file.filename for file in batch.files}
-        # impact 指向的是“变更文件之外”的引用，全部保留；
+        batch_symbols: set[str] = set()
+        for file in batch.files:
+            batch_symbols.update(file.changed_symbols or [])
+            batch_symbols.update(getattr(file, "removed_symbols", []) or [])
+            batch_symbols.update(file.enclosing_contexts or [])
+
+        relevant = [
+            context
+            for context in impact_contexts
+            if context.symbol in batch_symbols or context.file_path in batch_files
+        ]
+        if not relevant and include_global_impact:
+            relevant = sorted(
+                impact_contexts, key=lambda item: item.score, reverse=True
+            )[:MAX_GLOBAL_IMPACT_FALLBACK]
+
+        extras = relevant[:max_impact_per_batch]
         # static 信号只取当前批次涉及的文件，避免重复注入。
-        extras = list(impact_contexts)
         extras.extend(
             context
             for context in static_contexts

@@ -27,6 +27,20 @@ class DiffMetrics(TypedDict):
     languages: List[str]
 
 
+class ContextGapMetrics(TypedDict, total=False):
+    batch_context_occurrences: int
+    cross_batch_duplicates: int
+    retrieval_candidates: int
+    retrieval_deduped: int
+    retrieval_truncated: int
+    ast_truncated: int
+    search_targets_truncated: int
+    prompt_contexts_used: int
+    prompt_contexts_omitted: int
+    prompt_context_used_tokens: int
+    prompt_context_omitted_tokens: int
+
+
 class RetrievalMetrics(TypedDict, total=False):
     contexts: int
     context_files: int
@@ -50,6 +64,7 @@ class RetrievalMetrics(TypedDict, total=False):
     graph_context_files: int
     graph_error: int
     stats: Dict[str, float]
+    context_gap: ContextGapMetrics
 
 
 class BudgetMetrics(TypedDict):

@@ -87,6 +87,7 @@ class MetricsCollector:
             for context in state.all_contexts
             if context.kind in graph_kinds
         }
+        context_stats = getattr(state, "context_stats", {})
         metrics: RunMetrics = {
             "schema_version": metric_schema_version(),
             "run_id": state.run_id,
@@ -137,6 +138,46 @@ class MetricsCollector:
                 "graph_context_files": len(graph_context_files),
                 "graph_error": int(state.retrieval_stats.get("graph_error", 0)),
                 "stats": dict(state.retrieval_stats),
+                # 区分“没检索到”和“检索到但被 caps / prompt 预算丢掉”。
+                "context_gap": {
+                    "batch_context_occurrences": int(
+                        context_stats.get("batch_context_occurrences", 0)
+                    ),
+                    "cross_batch_duplicates": int(
+                        context_stats.get(
+                            "cross_batch_duplicate_contexts", 0
+                        )
+                    ),
+                    "retrieval_candidates": int(
+                        state.retrieval_stats.get("contexts_candidates", 0)
+                    ),
+                    "retrieval_deduped": int(
+                        state.retrieval_stats.get("contexts_deduped", 0)
+                    ),
+                    "retrieval_truncated": int(
+                        state.retrieval_stats.get("contexts_truncated", 0)
+                    ),
+                    "ast_truncated": int(
+                        state.retrieval_stats.get("ast_contexts_truncated", 0)
+                    ),
+                    "search_targets_truncated": int(
+                        state.retrieval_stats.get("search_targets_truncated", 0)
+                    ),
+                    "prompt_contexts_used": int(
+                        context_stats.get("prompt_contexts_used", 0)
+                    ),
+                    "prompt_contexts_omitted": int(
+                        context_stats.get("prompt_contexts_omitted", 0)
+                    ),
+                    "prompt_context_used_tokens": int(
+                        context_stats.get("prompt_context_used_tokens", 0)
+                    ),
+                    "prompt_context_omitted_tokens": int(
+                        context_stats.get(
+                            "prompt_context_omitted_tokens", 0
+                        )
+                    ),
+                },
             },
             "batches": len(state.batches),
             "reviewer_mode": config.reviewer_mode,

@@ -18,7 +18,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from openreview.retriever.ast_utils import read_line_range
-from openreview.retriever.code_context import CodeContext, make_context_id
+from openreview.retriever.code_context import (
+    CodeContext,
+    dedupe_contexts,
+    make_context_id,
+)
 from openreview.retriever.index import RepoIndex, module_name
 from openreview.retriever.query import RetrievalQuery
 
@@ -93,7 +97,7 @@ class GraphRetriever:
                 stats,
             )
         )
-        return _dedupe(contexts)
+        return dedupe_contexts(contexts)
 
     @staticmethod
     def _collect(
@@ -373,18 +377,3 @@ class GraphRetriever:
             if len(contexts) >= self.max_dependencies:
                 break
         return contexts
-
-
-def _dedupe(contexts: Sequence[CodeContext]) -> List[CodeContext]:
-    best: Dict[tuple, CodeContext] = {}
-    for context in contexts:
-        key = (
-            context.file_path,
-            context.start_line,
-            context.end_line,
-            context.kind,
-        )
-        existing = best.get(key)
-        if existing is None or context.score > existing.score:
-            best[key] = context
-    return list(best.values())

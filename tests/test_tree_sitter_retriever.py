@@ -176,13 +176,44 @@ def test_base_revision_context_is_used_for_removed_symbols(tmp_path: Path):
     )
 
 
-def test_git_grep_timeout_is_bounded(monkeypatch, tmp_path: Path):
+def test_reference_search_timeout_is_bounded(monkeypatch, tmp_path: Path):
+    """检索超时只能降级，不能让 review 挂住，且要留下可见计数。"""
+
     def _timeout(*args, **kwargs):
         raise subprocess.TimeoutExpired(cmd=args[0], timeout=1)
 
     monkeypatch.setattr(subprocess, "run", _timeout)
-    contexts = TreeSitterLocalRetriever()._search_with_git_grep(
-        tmp_path, {"target"}, set(), {}
-    )
+    retriever = TreeSitterLocalRetriever()
+    contexts = retriever._search_references(tmp_path, {"target"}, set(), {})
 
     assert contexts == []
+    assert retriever.last_stats["grep_timeouts"] == 1
+
+
+def test_reference_contexts_are_capped(tmp_path: Path):
+    """高频符号不能把一次检索放大成上万条候选。"""
+    from openreview.retriever.tree_sitter_retriever import (
+        MAX_REFERENCE_CONTEXTS,
+    )
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "mod.py").write_text(
+        "def target(x):\n    return x + 1\n", encoding="utf-8"
+    )
+    for index in range(MAX_REFERENCE_CONTEXTS + 40):
+        (pkg / f"use_{index}.py").write_text(
+            "from pkg.mod import target\n"
+            "\n"
+            f"def use_{index}():\n"
+            "    return target(1)\n",
+            encoding="utf-8",
+        )
+    _init_repo(tmp_path)
+
+    retriever = TreeSitterLocalRetriever()
+    contexts = retriever._search_references(tmp_path, {"target"}, set(), {})
+
+    assert len(contexts) <= MAX_REFERENCE_CONTEXTS
+    assert retriever.last_stats["reference_contexts_truncated"] > 0
+    assert retriever.last_stats["grep_timeouts"] == 0

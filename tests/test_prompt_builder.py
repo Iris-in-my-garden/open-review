@@ -226,3 +226,32 @@ def test_prompt_redacts_credentials_before_leaving_process():
     assert "user:secret@" not in prompt
     assert "10.1.2.3" not in prompt
     assert "<REDACTED:AWS_ACCESS_KEY>" in prompt
+
+
+def test_prompt_builder_records_used_and_omitted_context_stats():
+    """“检索到了但 prompt 装不下”必须能被 Run Metrics 看到。"""
+    contexts = [
+        CodeContext(
+            file_path="src/small.py",
+            reason="small",
+            snippet="x = 1",
+            score=0.9,
+        ),
+        CodeContext(
+            file_path="src/large.py",
+            reason="large",
+            snippet="y = 2\n" * 500,
+            score=0.8,
+        ),
+    ]
+    builder = PromptBuilder(max_context_tokens=80)
+
+    builder.build_user_prompt(_pr(), _diff(), contexts)
+
+    assert builder.context_stats["used_contexts"] == 1
+    assert builder.context_stats["omitted_contexts"] == 1
+    assert builder.context_stats["used_context_tokens"] > 0
+    assert builder.context_stats["omitted_context_tokens"] > 0
+
+    builder.reset_context_stats()
+    assert builder.context_stats["omitted_contexts"] == 0

@@ -8,16 +8,19 @@ from tree_sitter import Language, Node, Parser, Tree
 
 from openreview.repo.diff_parser import DiffParser, ParsedDiff
 from openreview.retriever.code_context import CodeContext, make_context_id
+from openreview.retriever.grep import search_symbols
+from openreview.retriever.pathing import is_source_file
 
 logger = logging.getLogger(__name__)
 
 MAX_CONTEXT_COUNT = 20
 MAX_FILE_SIZE = 500 * 1024  # 500 KB 限制
-# 大 PR（尤其是包含生成代码的 PR）可能有几百个符号。git grep 的耗时随
-# `-e` 数量快速增长，200 个目标在真实仓库上能跑几分钟。50 个目标已经足够
-# 覆盖主要变更，同时把单次检索压到秒级。
+# 大 PR（尤其是包含生成代码的 PR）可能有几百个符号。参考检索的耗时随
+# 目标数量增长，50 个目标已经足够覆盖主要变更，同时把单次检索压到秒级。
 MAX_SEARCH_TARGETS = 50
-GIT_GREP_TIMEOUT_SECONDS = 15.0
+# 匹配行再多也只会留下少量高分上下文；限制 AST 解析量，避免 `context` /
+# `New` 这类高频符号把一次检索放大到上万条候选。
+MAX_REFERENCE_CONTEXTS = 200
 MAX_TEST_CONTEXT_COUNT = 8
 MAX_TEST_SNIPPET_LINES = 120
 
@@ -45,6 +48,8 @@ class TreeSitterLocalRetriever:
 
     def __init__(self):
         self.parsers = {}
+        # 供 HybridRetriever 汇总：AST 层自己的截断/目标裁剪也应该可见。
+        self.last_stats: Dict[str, float] = {}
 
         # 1. 初始化 Python Parser
         try:
@@ -69,6 +74,7 @@ class TreeSitterLocalRetriever:
         base_path: Optional[Path] = None,
     ) -> List[CodeContext]:
         repo_path = Path(repo_path).resolve()
+        self.last_stats = {}
         if not repo_path.exists() or not repo_path.is_dir():
             return []
 
@@ -87,7 +93,7 @@ class TreeSitterLocalRetriever:
         search_targets = self._extract_search_targets(parsed_diff) | enclosing_names
         logger.debug("Search targets: %s", sorted(search_targets))
 
-        contexts = enclosing_contexts + self._search_with_git_grep(
+        contexts = enclosing_contexts + self._search_references(
             repo_path, search_targets, seen_node_ranges, file_cache
         )
 
@@ -108,7 +114,7 @@ class TreeSitterLocalRetriever:
             base_path = Path(base_path).resolve()
             if base_path.is_dir():
                 contexts.extend(
-                    self._search_with_git_grep(
+                    self._search_references(
                         base_path,
                         removed_targets,
                         set(),
@@ -118,6 +124,10 @@ class TreeSitterLocalRetriever:
                 )
 
         contexts.sort(key=lambda x: x.score, reverse=True)
+        self.last_stats["ast_contexts"] = len(contexts)
+        self.last_stats["ast_contexts_truncated"] = max(
+            0, len(contexts) - MAX_CONTEXT_COUNT
+        )
         logger.debug("Retrieved %d contexts", len(contexts))
         return contexts[:MAX_CONTEXT_COUNT]
 
@@ -325,23 +335,10 @@ class TreeSitterLocalRetriever:
             return None
 
     def _is_valid_source_file(self, rel_path_str: str) -> bool:
-        """【通用路径剪枝】仅基于目录结构过滤文档与缓存，不硬编码任何具体文件名"""
-        path = Path(rel_path_str)
-        parts = path.parts
+        """与索引/impact 共用同一套目录剪枝规则，避免检索口径漂移。"""
+        return is_source_file(rel_path_str, self.parsers)
 
-        # 排除常见文档、打包、虚机及缓存目录
-        excluded_dirs = {
-            ".git", ".idea", ".tox", ".venv", "__pycache__", "venv",
-            "docs", "site-packages", ".cache", "examples", "node_modules",
-            "dist", "build",
-        }
-        if any(p in parts for p in excluded_dirs):
-            return False
-
-        # 仅放行支持的源码文件后缀
-        return path.suffix in self.parsers
-
-    def _search_with_git_grep(
+    def _search_references(
         self,
         repo_path: Path,
         targets: Set[str],
@@ -366,47 +363,38 @@ class TreeSitterLocalRetriever:
                 len(valid_targets),
                 MAX_SEARCH_TARGETS,
             )
+            self.last_stats["search_targets_truncated"] = (
+                self.last_stats.get("search_targets_truncated", 0)
+                + len(valid_targets)
+                - MAX_SEARCH_TARGETS
+            )
             valid_targets = valid_targets[:MAX_SEARCH_TARGETS]
 
-        cmd = ["git", "-C", str(repo_path), "grep", "-n", "-I", "-w"]
-        for symbol in valid_targets:
-            cmd.extend(["-e", symbol])
-
-        try:
-            process = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                timeout=GIT_GREP_TIMEOUT_SECONDS,
+        search = search_symbols(
+            repo_path,
+            valid_targets,
+            suffixes=tuple(self.parsers),
+        )
+        self.last_stats["grep_hits"] = (
+            self.last_stats.get("grep_hits", 0) + len(search.hits)
+        )
+        logger.debug(
+            "reference search engine=%s hits=%d timeouts=%d",
+            search.engine,
+            len(search.hits),
+            search.timeouts,
+        )
+        self.last_stats["grep_timeouts"] = (
+            self.last_stats.get("grep_timeouts", 0) + search.timeouts
+        )
+        if search.truncated:
+            self.last_stats["grep_hits_capped"] = (
+                self.last_stats.get("grep_hits_capped", 0) + 1
             )
-            if process.returncode not in (0, 1):
-                logger.warning("git grep failed with code %d", process.returncode)
-                return []
-        except subprocess.TimeoutExpired:
-            # 检索只是增强上下文，不能因为一个大仓库把整次 review 挂住。
-            logger.warning(
-                "git grep timed out after %.0fs for %d targets; "
-                "continuing without git-grep context",
-                GIT_GREP_TIMEOUT_SECONDS,
-                len(valid_targets),
-            )
-            return contexts
-        except FileNotFoundError as exc:
-            raise RuntimeError("Git is required but not found in system path.") from exc
 
-        for line in process.stdout.splitlines():
+        for hit_index, (rel_path_str, line_number, _) in enumerate(search.hits):
             try:
-                rel_path_str, line_str, _ = line.split(":", 2)
-
                 if not self._is_valid_source_file(rel_path_str):
-                    continue
-
-                try:
-                    line_number = int(line_str)
-                except ValueError:
                     continue
 
                 abs_file_path = self._resolve_repo_file(repo_path, rel_path_str)
@@ -462,8 +450,21 @@ class TreeSitterLocalRetriever:
                         ),
                     )
                 )
+                if len(contexts) >= MAX_REFERENCE_CONTEXTS:
+                    self.last_stats["reference_contexts_truncated"] = (
+                        self.last_stats.get("reference_contexts_truncated", 0)
+                        + len(search.hits)
+                        - hit_index
+                        - 1
+                    )
+                    break
             except Exception as exc:  # noqa: BLE001 - 单行解析失败不应中断整体检索
-                logger.debug("Failed to parse git grep line %r: %s", line, exc)
+                logger.debug(
+                    "Failed to parse grep hit %s:%s: %s",
+                    rel_path_str,
+                    line_number,
+                    exc,
+                )
                 continue
 
         return contexts

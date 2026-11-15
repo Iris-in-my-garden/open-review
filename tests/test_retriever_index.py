@@ -4,9 +4,12 @@ import subprocess
 from pathlib import Path
 
 from openreview.repo.diff_parser import DiffParser, ParsedChangedFile, ParsedDiff
+from openreview.retriever import index as index_module
 from openreview.retriever.hybrid import HybridRetriever
-from openreview.retriever.index import RepoIndex
+from openreview.retriever.index import RepoIndex, _iter_source_files
+from openreview.retriever.pathing import is_source_file
 from openreview.retriever.query import MAX_ADDED_LINE_IDENTIFIERS, QueryBuilder
+from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
 
 
 def _init_repo(root: Path) -> None:
@@ -295,4 +298,77 @@ def test_query_builder_caps_added_line_identifiers():
 
     assert len(identifiers) == MAX_ADDED_LINE_IDENTIFIERS
     assert len(identifiers) == len(set(identifiers))
+
+
+def test_index_file_cap_counts_only_indexable_files(tmp_path: Path, monkeypatch):
+    """文档/图片不能挤占源码索引名额。
+
+    旧实现按 git ls-files 的原始顺序计数；当仓库里非源码文件很多时，
+    可能在扫到 Python/Go 文件之前就达到 MAX_INDEXED_FILES。
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "a.md").write_text("# docs\n", encoding="utf-8")
+    (root / "b.py").write_text("def first():\n    pass\n", encoding="utf-8")
+    (root / "c.py").write_text("def second():\n    pass\n", encoding="utf-8")
+    _init_repo(root)
+
+    monkeypatch.setattr(index_module, "MAX_INDEXED_FILES", 1)
+
+    files = list(_iter_source_files(root))
+
+    assert files == ["b.py"]
+
+
+def test_retrieval_mechanisms_share_path_filters(tmp_path: Path):
+    """AST / index 必须对 docs、examples、vendor 做一致剪枝。"""
+    assert is_source_file("pkg/app.py", {".py"})
+    assert not is_source_file("docs/conf.py", {".py"})
+    assert not is_source_file("examples/demo.py", {".py"})
+    assert not is_source_file("vendor/lib.go", {".go"})
+
+    retriever = TreeSitterLocalRetriever()
+    assert retriever._is_valid_source_file("pkg/app.py")
+    assert not retriever._is_valid_source_file("docs/conf.py")
+    assert not retriever._is_valid_source_file("examples/demo.py")
+
+    assert index_module._is_indexable("pkg/app.py")
+    assert not index_module._is_indexable("docs/conf.py")
+    assert not index_module._is_indexable("vendor/lib.go")
+
+
+def test_hybrid_reports_candidates_deduped_and_truncated(tmp_path: Path):
+    """检索上限造成的丢失必须可观测，而不是静默截断。"""
+    from openreview.retriever.code_context import CodeContext
+
+    class _FakeAstRetriever:
+        last_stats = {"ast_contexts": 4, "ast_contexts_truncated": 1}
+
+        def retrieve(self, repo_path, parsed_diff, base_path=None):
+            return [
+                CodeContext(
+                    file_path="pkg/app.py",
+                    reason=f"definition {line}",
+                    snippet=f"def f{line}(): pass",
+                    score=0.9 - line / 100,
+                    kind="definition",
+                    start_line=line,
+                    end_line=line,
+                )
+                for line in range(1, 5)
+            ]
+
+    retriever = HybridRetriever(
+        ast_retriever=_FakeAstRetriever(),
+        enabled=False,
+        max_contexts=2,
+    )
+
+    contexts = retriever.retrieve(tmp_path, ParsedDiff(files=[]))
+
+    assert len(contexts) == 2
+    assert retriever.last_stats["contexts_candidates"] == 4
+    assert retriever.last_stats["contexts_deduped"] == 0
+    assert retriever.last_stats["contexts_truncated"] == 2
+    assert retriever.last_stats["ast_contexts_truncated"] == 1
 

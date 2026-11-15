@@ -19,7 +19,11 @@ from typing import Dict, List, Optional, Sequence, Set
 from openreview.repo.diff_parser import DiffParser, ParsedDiff
 from openreview.retriever.ast_utils import read_line_range
 from openreview.retriever.base import Retriever
-from openreview.retriever.code_context import CodeContext, make_context_id
+from openreview.retriever.code_context import (
+    CodeContext,
+    dedupe_contexts,
+    make_context_id,
+)
 from openreview.retriever.graph import GraphRetriever
 from openreview.retriever.index import RepoIndex, module_name
 from openreview.retriever.query import QueryBuilder, RetrievalQuery
@@ -80,10 +84,22 @@ class HybridRetriever:
             "index_error": 0,
             "graph_error": 0,
         }
+        # AST 层自己的截断/目标裁剪也汇总进来，避免“只看到最终 24 条”
+        # 而不知道上游是否已经丢过上下文。
+        ast_stats = getattr(self.ast_retriever, "last_stats", None)
+        if isinstance(ast_stats, dict):
+            stats.update(
+                {
+                    key: value
+                    for key, value in ast_stats.items()
+                    if isinstance(value, (int, float))
+                }
+            )
 
         if not self.enabled:
+            ranked = _rank_and_dedupe(contexts, self.max_contexts, stats=stats)
             self.last_stats = stats
-            return _rank_and_dedupe(contexts, self.max_contexts)
+            return ranked
 
         index = self._get_index(repo_path, stats)
         if index is not None:
@@ -102,8 +118,9 @@ class HybridRetriever:
                 stats["index_error"] = 1
                 logger.warning("Hybrid retrieval failed, falling back to AST: %s", exc)
 
+        ranked = _rank_and_dedupe(contexts, self.max_contexts, stats=stats)
         self.last_stats = stats
-        return _rank_and_dedupe(contexts, self.max_contexts)
+        return ranked
 
     def related_files(
         self,
@@ -242,35 +259,20 @@ class HybridRetriever:
 
 
 def _rank_and_dedupe(
-    contexts: Sequence[CodeContext], max_contexts: int
+    contexts: Sequence[CodeContext],
+    max_contexts: int,
+    *,
+    stats: Optional[Dict[str, float]] = None,
 ) -> List[CodeContext]:
-    """同一文件/行范围只保留分数最高的一条，避免 AST + FTS 重复注入。"""
-    best: Dict[tuple, CodeContext] = {}
-    order: List[tuple] = []
-    for context in contexts:
-        context.ensure_context_id()
-        key = _context_key(context)
-        existing = best.get(key)
-        if existing is None:
-            best[key] = context
-            order.append(key)
-        elif context.score > existing.score:
-            best[key] = context
+    """同一文件/行范围只保留分数最高的一条，避免 AST + FTS 重复注入。
 
-    ranked = sorted(
-        (best[key] for key in order),
-        key=lambda item: item.score,
-        reverse=True,
-    )
+    ``stats`` 会记录候选数、被去重数和被上限截断数。这样 Run Metrics 能
+    区分“本来就没检索到”和“检索到了但被 cap 丢掉”，为后续补证提供依据。
+    """
+    deduped = dedupe_contexts(contexts)
+    ranked = sorted(deduped, key=lambda item: item.score, reverse=True)
+    if stats is not None:
+        stats["contexts_candidates"] = len(contexts)
+        stats["contexts_deduped"] = len(contexts) - len(deduped)
+        stats["contexts_truncated"] = max(0, len(ranked) - max_contexts)
     return ranked[:max_contexts]
-
-
-def _context_key(context: CodeContext) -> tuple:
-    if context.start_line is not None or context.end_line is not None:
-        return (
-            context.file_path,
-            context.revision,
-            context.start_line,
-            context.end_line,
-        )
-    return (context.file_path, context.revision, context.kind, context.snippet[:80])

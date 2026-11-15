@@ -97,6 +97,17 @@ class PromptBuilder:
         self.system_prompt = system_prompt
         self.max_patch_tokens = max_patch_tokens
         self.max_context_tokens = max_context_tokens
+        # 累计本次 run 的上下文使用情况；executor 在每个 run 开始时 reset。
+        self.context_stats: Dict[str, int] = {
+            "used_contexts": 0,
+            "omitted_contexts": 0,
+            "used_context_tokens": 0,
+            "omitted_context_tokens": 0,
+        }
+
+    def reset_context_stats(self) -> None:
+        for key in self.context_stats:
+            self.context_stats[key] = 0
 
     def build_system_prompt(self) -> str:
         return self.system_prompt + SECURITY_SYSTEM_SUFFIX
@@ -263,6 +274,9 @@ class PromptBuilder:
         other_blocks: List[str] = []
         remaining = self.max_context_tokens
         omitted = 0
+        omitted_tokens = 0
+        used = 0
+        used_tokens = 0
         ordered = sorted(contexts, key=lambda item: item.score, reverse=True)
 
         # 先为每个变更文件保留至少一段上下文，避免全局按分数排序时
@@ -281,6 +295,8 @@ class PromptBuilder:
                 by_file.setdefault(filename, []).append(rendered)
                 per_file_count[filename] = per_file_count.get(filename, 0) + 1
                 reserved.add(id(ctx))
+                used += 1
+                used_tokens += cost
                 break
 
         max_per_file = max(2, min(8, len(ordered)))
@@ -291,10 +307,12 @@ class PromptBuilder:
             cost = estimate_tokens(rendered) + 20
             if cost > remaining:
                 omitted += 1
+                omitted_tokens += cost
                 continue
             if ctx.file_path in block_files:
                 if per_file_count.get(ctx.file_path, 0) >= max_per_file:
                     omitted += 1
+                    omitted_tokens += cost
                     continue
                 by_file.setdefault(ctx.file_path, []).append(rendered)
                 per_file_count[ctx.file_path] = (
@@ -303,6 +321,8 @@ class PromptBuilder:
             else:
                 other_blocks.append(rendered)
             remaining -= cost
+            used += 1
+            used_tokens += cost
 
         rendered_blocks: List[str] = []
         for filename, block in patch_blocks:
@@ -325,6 +345,10 @@ class PromptBuilder:
         )
         if omitted:
             context_str += f"\n\n> 另有 {omitted} 段上下文因 token 预算被省略。"
+        self.context_stats["used_contexts"] += used
+        self.context_stats["used_context_tokens"] += used_tokens
+        self.context_stats["omitted_contexts"] += omitted
+        self.context_stats["omitted_context_tokens"] += omitted_tokens
         return patch_str, context_str
 
     def build_user_prompt(

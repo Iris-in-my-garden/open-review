@@ -31,25 +31,13 @@ from filelock import FileLock
 from openreview.domain.versions import RETRIEVER_VERSION as RETRIEVER_VERSION
 from openreview.repo.manager import default_cache_dir
 from openreview.retriever import ast_utils
+from openreview.retriever.pathing import is_source_file
 
 logger = logging.getLogger(__name__)
 
 INDEX_SCHEMA_VERSION = "1"
 MAX_INDEXED_FILE_SIZE = 500 * 1024
 MAX_INDEXED_FILES = 20000
-EXCLUDED_DIRS = {
-    ".git",
-    ".idea",
-    ".tox",
-    ".venv",
-    "venv",
-    "__pycache__",
-    "node_modules",
-    "dist",
-    "build",
-    "vendor",
-    "site-packages",
-}
 SUPPORTED_SUFFIXES = {".py", ".go"}
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -864,7 +852,12 @@ def _git_changes(
 
 
 def _iter_source_files(repo_path: Path) -> Iterable[str]:
-    """优先用 git ls-files，非 git 目录降级为 rglob。"""
+    """优先用 git ls-files，非 git 目录降级为 rglob。
+
+    ``MAX_INDEXED_FILES`` 只统计真正可索引的源码文件。之前按
+    ``git ls-files`` 的原始顺序计数，会把文档、图片、生成物也算进上限，
+    大型 monorepo 可能在扫到 Python/Go 文件之前就提前停止。
+    """
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "ls-files", "-z"],
@@ -880,34 +873,32 @@ def _iter_source_files(repo_path: Path) -> Iterable[str]:
         raw_paths = []
 
     if raw_paths:
-        for count, rel_path in enumerate(raw_paths):
-            if count >= MAX_INDEXED_FILES:
-                logger.warning(
-                    "Repo has more than %d indexable files; truncating index.",
-                    MAX_INDEXED_FILES,
-                )
-                return
-            if _is_indexable(rel_path):
-                yield rel_path
+        yield from _yield_indexable(raw_paths)
         return
 
-    for count, path in enumerate(sorted(repo_path.rglob("*"))):
-        if count >= MAX_INDEXED_FILES:
+    rel_paths = (
+        path.relative_to(repo_path).as_posix()
+        for path in sorted(repo_path.rglob("*"))
+        if path.is_file()
+    )
+    yield from _yield_indexable(rel_paths)
+
+
+def _yield_indexable(rel_paths: Iterable[str]) -> Iterable[str]:
+    """Yield at most ``MAX_INDEXED_FILES`` indexable paths, counting only those."""
+    indexed = 0
+    for rel_path in rel_paths:
+        if not _is_indexable(rel_path):
+            continue
+        if indexed >= MAX_INDEXED_FILES:
             logger.warning(
-                "Repo has more than %d files; truncating index.", MAX_INDEXED_FILES
+                "Repo has more than %d indexable files; truncating index.",
+                MAX_INDEXED_FILES,
             )
             return
-        if not path.is_file():
-            continue
-        rel_path = path.relative_to(repo_path).as_posix()
-        if _is_indexable(rel_path):
-            yield rel_path
+        indexed += 1
+        yield rel_path
 
 
 def _is_indexable(rel_path: str) -> bool:
-    path = Path(rel_path)
-    if path.suffix not in SUPPORTED_SUFFIXES:
-        return False
-    if any(part in EXCLUDED_DIRS for part in path.parts):
-        return False
-    return True
+    return is_source_file(rel_path, SUPPORTED_SUFFIXES)

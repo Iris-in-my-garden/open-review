@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from pydantic import BaseModel
 
@@ -57,3 +57,50 @@ class CodeContext(BaseModel):
                 fallback=self.snippet[:120],
             )
         return self.context_id
+
+
+def context_identity(
+    context: CodeContext, *, include_kind: bool = False
+) -> Tuple[str, str, Optional[int], Optional[int], str]:
+    """Canonical dedupe key shared by AST / hybrid / graph / executor.
+
+    A code range is the strongest identity: the same ``file:start-end`` is the
+    same evidence regardless of which mechanism found it (AST enclosing, FTS
+    definition, graph caller, impact reference).  Keeping ``kind`` out of the
+    key is deliberate; otherwise the same snippet can be injected twice with
+    different labels and waste prompt budget.  Contexts without line ranges
+    fall back to file + revision + a short snippet fingerprint.
+    """
+    if context.start_line is not None or context.end_line is not None:
+        return (
+            context.file_path,
+            context.revision,
+            context.start_line,
+            context.end_line,
+            context.kind if include_kind else "",
+        )
+    return (
+        context.file_path,
+        context.revision,
+        None,
+        None,
+        context.kind if include_kind else context.snippet[:120],
+    )
+
+
+def dedupe_contexts(
+    contexts: Iterable[CodeContext], *, include_kind: bool = False
+) -> List[CodeContext]:
+    """Keep the highest-scored context per canonical identity, preserving order."""
+    best: Dict[tuple, CodeContext] = {}
+    order: List[tuple] = []
+    for context in contexts:
+        context.ensure_context_id()
+        key = context_identity(context, include_kind=include_kind)
+        existing = best.get(key)
+        if existing is None:
+            best[key] = context
+            order.append(key)
+        elif context.score > existing.score:
+            best[key] = context
+    return [best[key] for key in order]

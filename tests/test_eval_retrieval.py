@@ -57,6 +57,12 @@ def test_compute_retrieval_metrics(tmp_path: Path):
                             "graph_caller_hits": 1,
                             "graph_callee_hits": 2,
                         },
+                        "context_gap": {
+                            "prompt_contexts_used": 3,
+                            "prompt_contexts_omitted": 1,
+                            "retrieval_truncated": 2,
+                            "cross_batch_duplicates": 1,
+                        },
                     },
                 },
             },
@@ -111,6 +117,10 @@ def test_compute_retrieval_metrics(tmp_path: Path):
     assert retrieval["graph_contexts_total"] == 2
     assert retrieval["graph_contexts_avg"] == 1.0
     assert retrieval["graph_context_kinds"] == {"caller": 1, "import": 1}
+    assert retrieval["prompt_context_coverage"] == 0.75
+    assert retrieval["prompt_contexts_omitted_total"] == 1
+    assert retrieval["retrieval_truncated_total"] == 2
+    assert retrieval["cross_batch_duplicates_total"] == 1
     assert metrics["patch_validation"]["valid_rate"] == 1.0
 
     path = write_retrieval_metrics(metrics, tmp_path / "metrics", run_id="test")

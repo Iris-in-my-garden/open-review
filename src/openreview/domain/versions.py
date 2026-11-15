@@ -12,9 +12,9 @@ from typing import List
 
 PROMPT_VERSION = "review-v6"
 VALIDATOR_VERSION = "validator-v2"
-RETRIEVER_VERSION = "hybrid-v2"
+RETRIEVER_VERSION = "hybrid-v3"
 REVIEW_CACHE_SCHEMA_VERSION = 2
-METRICS_SCHEMA_VERSION = 2
+METRICS_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)

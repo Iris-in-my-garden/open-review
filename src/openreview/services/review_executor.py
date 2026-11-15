@@ -30,7 +30,7 @@ from openreview.repo.local import (
     prepare_local_workspace,
 )
 from openreview.repo.manager import RepoCommandError
-from openreview.retriever.code_context import CodeContext
+from openreview.retriever.code_context import context_identity, dedupe_contexts
 from openreview.review.cache import ReviewCache
 from openreview.review.comment_builder import (
     build_review_body,
@@ -453,7 +453,14 @@ class ReviewExecutor:
 
         impact_contexts, static_contexts = self.evidence_pipeline.collect(state)
 
+        prompt_builder = getattr(self.reviewer, "prompt_builder", None)
+        if prompt_builder is not None and hasattr(prompt_builder, "reset_context_stats"):
+            prompt_builder.reset_context_stats()
+
         batch_results: List[ReviewResult] = []
+        # 跨 batch 去重只影响 state/metrics/verifier 的“本次唯一上下文”，
+        # 不改变每个 batch 自己的 prompt：后一个 batch 仍然需要它自己的上下文。
+        seen_context_keys: set[tuple] = set()
         with self._timed(state, "retrieve_and_review"):
             for index, batch in enumerate(batches, start=1):
                 self._log(
@@ -475,11 +482,32 @@ class ReviewExecutor:
                             )
                 contexts.extend(
                     self.evidence_pipeline.extra_contexts(
-                        batch, impact_contexts, static_contexts
+                        batch,
+                        impact_contexts,
+                        static_contexts,
+                        include_global_impact=index == 1,
                     )
                 )
-                contexts = _dedupe_contexts(contexts)
-                state.all_contexts.extend(contexts)
+                contexts = dedupe_contexts(contexts)
+                state.context_stats["batch_context_occurrences"] = (
+                    state.context_stats.get("batch_context_occurrences", 0)
+                    + len(contexts)
+                )
+                unique_contexts = [
+                    context
+                    for context in contexts
+                    if context_identity(context) not in seen_context_keys
+                ]
+                for context in unique_contexts:
+                    seen_context_keys.add(context_identity(context))
+                state.context_stats["cross_batch_duplicate_contexts"] = (
+                    state.context_stats.get(
+                        "cross_batch_duplicate_contexts", 0
+                    )
+                    + len(contexts)
+                    - len(unique_contexts)
+                )
+                state.all_contexts.extend(unique_contexts)
 
                 estimated_tokens = sum(
                     estimate_tokens(context.snippet) for context in contexts
@@ -599,6 +627,7 @@ class ReviewExecutor:
                             state.validation_stats.get(key, 0) + int(value)
                         )
 
+        prompt_context_stats = self._collect_prompt_context_stats(state)
         state.batch_results = batch_results
         if not batch_results:
             raise RuntimeError(
@@ -631,7 +660,42 @@ class ReviewExecutor:
                 f"base 版本上下文不可用（{state.base_error}），"
                 "删除代码的上下文可能不完整。"
             )
+        omitted = int(prompt_context_stats.get("prompt_contexts_omitted", 0))
+        if omitted:
+            omitted_tokens = int(
+                prompt_context_stats.get("prompt_context_omitted_tokens", 0)
+            )
+            note = (
+                f"有 {omitted} 段检索上下文因 prompt 预算被省略"
+                f"（约 {omitted_tokens} tokens），关键证据可能不在本次输入中。"
+            )
+            review_result.review_notes.append(note)
+            state.add_note(f"[retrieval] {note}")
         state.review_result = review_result
+
+    def _collect_prompt_context_stats(self, state: ReviewState) -> Dict[str, int]:
+        """把 PromptBuilder 的上下文使用/省略统计并回本次 run。
+
+        检索层可能产出 24 段上下文，但 prompt 预算只装得下一部分；以前这个
+        差额只写在 prompt 文本里，Run Metrics 看不到。现在显式记录，便于
+        区分“没检索到”和“检索到但被预算丢掉”。
+        """
+        prompt_builder = getattr(self.reviewer, "prompt_builder", None)
+        stats = getattr(prompt_builder, "context_stats", None)
+        if not isinstance(stats, dict):
+            return {}
+        recorded = {
+            "prompt_contexts_used": int(stats.get("used_contexts", 0)),
+            "prompt_contexts_omitted": int(stats.get("omitted_contexts", 0)),
+            "prompt_context_used_tokens": int(
+                stats.get("used_context_tokens", 0)
+            ),
+            "prompt_context_omitted_tokens": int(
+                stats.get("omitted_context_tokens", 0)
+            ),
+        }
+        state.context_stats.update(recorded)
+        return recorded
 
     def _node_verify(self, state: ReviewState) -> None:
         if (
@@ -800,16 +864,3 @@ class ReviewExecutor:
             yield
         finally:
             state.stages[stage] = round(time.perf_counter() - start, 3)
-
-
-def _dedupe_contexts(contexts: List[CodeContext]) -> List[CodeContext]:
-    """同一文件、同一片段只保留一次，避免 impact/static 与 AST 检索重复。"""
-    seen: set[tuple[str, str, str]] = set()
-    result: List[CodeContext] = []
-    for context in contexts:
-        key = (context.file_path, context.revision, context.snippet)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(context)
-    return result

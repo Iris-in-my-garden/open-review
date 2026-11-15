@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import logging
 import re
-import subprocess
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -20,23 +19,13 @@ from pydantic import BaseModel, Field
 
 from openreview.repo.diff_parser import ParsedDiff
 from openreview.retriever.code_context import CodeContext, make_context_id
+from openreview.retriever.grep import search_symbols
 
 logger = logging.getLogger(__name__)
 
 MAX_IMPACT_FINDINGS = 30
 MAX_IMPACT_CONTEXTS = 12
 MAX_SYMBOLS = 40
-EXCLUDED_DIRS = {
-    ".git",
-    ".venv",
-    "venv",
-    "node_modules",
-    "dist",
-    "build",
-    "__pycache__",
-    ".mypy_cache",
-    ".ruff_cache",
-}
 COMMON_NAMES = {
     "main",
     "__init__",
@@ -123,10 +112,11 @@ class ImpactAnalyzer:
             return ImpactReport(changed_symbols=symbols)
 
         changed_files = {item.filename for item in parsed_diff.files}
-        pattern = r"\b(" + "|".join(re.escape(symbol) for symbol in symbols) + r")\b"
-        raw_matches = self._git_grep(repo_path, pattern)
-        if raw_matches is None:
-            raw_matches = self._filesystem_grep(repo_path, pattern)
+        # 走统一的符号检索：优先 ripgrep，退化时按小批次 git grep，最后才
+        # 做有界 Python 扫描。impact 关心配置/文档里的引用，所以不限制后缀。
+        raw_matches = search_symbols(
+            repo_path, symbols, suffixes=None
+        ).hits
 
         findings: List[ImpactFinding] = []
         seen: set[tuple[str, str, int]] = set()
@@ -187,68 +177,6 @@ class ImpactAnalyzer:
         if len(symbol) <= 4:
             return 0.55
         return 0.75
-
-    @staticmethod
-    def _git_grep(repo_path: Path, pattern: str) -> Optional[List[tuple[str, int, str]]]:
-        try:
-            result = subprocess.run(
-                ["git", "grep", "-n", "-E", pattern, "--", "."],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-
-        if result.returncode not in (0, 1):
-            return None
-
-        matches: List[tuple[str, int, str]] = []
-        for raw in result.stdout.splitlines():
-            parts = raw.split(":", 2)
-            if len(parts) != 3:
-                continue
-            path, line_text, code = parts
-            try:
-                line = int(line_text)
-            except ValueError:
-                continue
-            matches.append((path, line, code))
-        return matches
-
-    @staticmethod
-    def _filesystem_grep(
-        repo_path: Path, pattern: str
-    ) -> List[tuple[str, int, str]]:
-        regex = re.compile(pattern)
-        matches: List[tuple[str, int, str]] = []
-        for path in repo_path.rglob("*"):
-            if not path.is_file():
-                continue
-            # 只检查仓库内的相对路径：仓库本身可能位于 build/、dist/ 或
-            # venv/ 下，用绝对路径判断会把所有文件都误排除。
-            try:
-                relative = path.relative_to(repo_path)
-            except ValueError:
-                continue
-            if any(part in EXCLUDED_DIRS for part in relative.parts):
-                continue
-            try:
-                if path.stat().st_size > 500 * 1024:
-                    continue
-                text = path.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            for line_no, line in enumerate(text.splitlines(), start=1):
-                if regex.search(line):
-                    matches.append((str(path.relative_to(repo_path)), line_no, line))
-                    if len(matches) >= MAX_IMPACT_FINDINGS * 4:
-                        return matches
-        return matches
 
 
 def _read_snippet(repo_path: Path, filename: str, line: int, radius: int = 6) -> str:

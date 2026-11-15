@@ -297,6 +297,9 @@ class ReviewState:
     static_count: int = 0
     validation_stats: Dict[str, int] = field(default_factory=dict)
     retrieval_stats: Dict[str, float] = field(default_factory=dict)
+    # 上下文“使用/省略/跨批重复”等 run 级统计；与 retriever 自己的
+    # last_stats 分开，避免把编排层计数混进检索器指标。
+    context_stats: Dict[str, int] = field(default_factory=dict)
     verifier_stats: Dict[str, int] = field(default_factory=dict)
     # 结构化错误记录：节点、异常类型、稳定分类、批次。
     errors: List[Dict[str, Any]] = field(default_factory=list)
