@@ -1,38 +1,49 @@
-import logging
-import subprocess
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+"""本地单文件 AST 检索。
 
-# 引入 tree-sitter
+职责边界刻意收窄：
+
+- P2：变更行所属函数/类的完整 AST 片段（超长时折叠，保留 changed lines）
+- P5：被变更方法引用的类/结构体字段与模块常量
+- Base：删除符号在 base revision 同文件中的历史定义
+- Test：按需提取真正引用变更符号的单个测试函数
+
+跨文件引用、import/call graph 由 ``HybridRetriever`` + ``GraphRetriever``
+负责。这里的全局 grep 只在 ``allow_global_fallback=True``（索引崩溃）时启用，
+作为最后兜底，而不是正常路径。
+"""
+
+import logging
+import re
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
 from tree_sitter import Language, Node, Parser, Tree
 
-from openreview.repo.diff_parser import DiffParser, ParsedDiff
+from openreview.repo.diff_parser import ParsedDiff
+from openreview.retriever import ast_utils
 from openreview.retriever.code_context import CodeContext, make_context_id
 from openreview.retriever.folding import fold_snippet
-from openreview.retriever.globals import collect_referenced_fields
+from openreview.retriever.globals import collect_referenced_fields_from_tree
 from openreview.retriever.grep import search_symbols
 from openreview.retriever.pathing import is_source_file
 from openreview.review.token_budget import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
-MAX_CONTEXT_COUNT = 64
 MAX_FILE_SIZE = 500 * 1024  # 500 KB 限制
-# 大 PR（尤其是包含生成代码的 PR）可能有几百个符号。参考检索的耗时随
-# 目标数量增长，50 个目标已经足够覆盖主要变更，同时把单次检索压到秒级。
+# 仅用于索引崩溃时的全局 grep 兜底。
 MAX_SEARCH_TARGETS = 50
-# 匹配行再多也只会留下少量高分上下文；限制 AST 解析量，避免 `context` /
-# `New` 这类高频符号把一次检索放大到上万条候选。
 MAX_REFERENCE_CONTEXTS = 200
-MAX_TEST_CONTEXT_COUNT = 8
-MAX_TEST_SNIPPET_LINES = 120
+MAX_TEST_FUNCTION_CONTEXTS = 12
 # 单个 enclosing 方法超过该 token 数时做 AST 折叠；折叠会保留全部变更行。
 MAX_ENCLOSING_SNIPPET_TOKENS = 1600
 
 # 打分：变更行所在的函数/类 > 符号定义 > 关联测试 > 符号引用 > base 侧历史代码
 SCORE_ENCLOSING = 0.95
 SCORE_DEFINITION = 0.90
-SCORE_TEST_FILE = 0.85
+SCORE_TEST_FUNCTION = 0.85
+# 兼容旧名字：测试上下文不再注入整个文件，但分数语义不变。
+SCORE_TEST_FILE = SCORE_TEST_FUNCTION
 SCORE_REFERENCE = 0.65
 SCORE_BASE_DEFINITION = 0.80
 SCORE_BASE_REFERENCE = 0.55
@@ -41,34 +52,35 @@ DEFINITION_TYPES = {
     "function_definition", "class_definition", "method_definition",  # Python
     "function_declaration", "method_declaration", "type_declaration",  # Golang
 }
+TEST_PREFIXES = {
+    ".py": ("test_",),
+    ".go": ("Test", "Benchmark", "Example", "Fuzz"),
+}
 
 LoadedFile = Tuple[str, List[str], bytes, Tree]
+# (file, start_row, end_row, revision)：base/head 同一行范围是不同证据。
+NodeRangeKey = Tuple[str, int, int, str]
 
 
 class TreeSitterLocalRetriever:
-    """
-    通用工程级本地混合检索器 (Path Pruning + AST Boundary Extraction + Ref/Def Marking)。
-    具备强泛化能力，适用于各种 Python/Go 语言仓库。
-    """
+    """纯本地、单文件的 Tree-sitter 结构检索器。"""
 
     def __init__(self):
         self.parsers = {}
         # 供 HybridRetriever 汇总：AST 层自己的截断/目标裁剪也应该可见。
         self.last_stats: Dict[str, float] = {}
 
-        # 1. 初始化 Python Parser
         try:
             import tree_sitter_python as tspython
-            py_lang = Language(tspython.language())
-            self.parsers[".py"] = Parser(py_lang)
+
+            self.parsers[".py"] = Parser(Language(tspython.language()))
         except ImportError:
             pass
 
-        # 2. 初始化 Golang Parser
         try:
             import tree_sitter_go as tsgo
-            go_lang = Language(tsgo.language())
-            self.parsers[".go"] = Parser(go_lang)
+
+            self.parsers[".go"] = Parser(Language(tsgo.language()))
         except ImportError:
             pass
 
@@ -77,6 +89,8 @@ class TreeSitterLocalRetriever:
         repo_path: Path,
         parsed_diff: ParsedDiff,
         base_path: Optional[Path] = None,
+        *,
+        allow_global_fallback: bool = False,
     ) -> List[CodeContext]:
         repo_path = Path(repo_path).resolve()
         self.last_stats = {}
@@ -85,76 +99,56 @@ class TreeSitterLocalRetriever:
 
         # 同一次检索内复用已读取/已解析的文件，避免同一文件被反复 parse
         file_cache: Dict[Path, Optional[LoadedFile]] = {}
-        seen_node_ranges: Set[Tuple[str, int, int]] = set()
+        seen_node_ranges: Set[NodeRangeKey] = set()
 
-        # 1. 先处理“变更行所在的函数/类”。即使 PR 只改了函数体、没有改签名，
-        #    也能拿到完整上下文（修复只改函数体时检索为空的问题）。
-        enclosing_contexts, enclosing_names = self._collect_changed_line_contexts(
+        # P2：变更行所在的函数/类。即使 PR 只改函数体、没有改签名，
+        #     也能拿到完整上下文。
+        enclosing_contexts, definition_names = self._collect_changed_line_contexts(
             repo_path, parsed_diff, seen_node_ranges, file_cache
         )
-        # P5：只补充被变更方法引用的类/模块字段，预算不足时才自然被裁掉。
+        # P5：只补充被变更方法引用的类/结构体字段和模块常量。
         field_contexts = self._collect_field_contexts(
             repo_path, parsed_diff, file_cache
         )
-
-        # 2. 再用符号做全局检索。把变更行所属的函数/类也加入搜索目标，
-        #    这样能顺带找到它的调用方。
-        search_targets = self._extract_search_targets(parsed_diff) | enclosing_names
-        logger.debug("Search targets: %s", sorted(search_targets))
-
-        contexts = enclosing_contexts + self._search_references(
-            repo_path, search_targets, seen_node_ranges, file_cache
+        # Base：同文件旧版本中的被删除定义，用于历史对比。
+        base_contexts = self._collect_base_contexts(
+            repo_path, parsed_diff, base_path, seen_node_ranges, file_cache
+        )
+        # Test：只提取真正引用变更符号的测试函数，而不是整个测试文件。
+        test_contexts = self._collect_test_contexts(
+            repo_path, parsed_diff, definition_names, seen_node_ranges, file_cache
         )
 
-        # 3. 关联测试文件：用于测试缺口分析，而不是让模型凭空猜“应该有测试”
-        contexts.extend(
-            self._collect_test_contexts(
-                repo_path, parsed_diff, seen_node_ranges, file_cache
-            )
-        )
-        contexts.extend(field_contexts)
+        contexts: List[CodeContext] = [
+            *enclosing_contexts,
+            *field_contexts,
+            *base_contexts,
+            *test_contexts,
+        ]
 
-        # 4. base 侧历史代码：只查被删除的符号，补充“删掉的函数原来长什么样”
-        removed_targets = {
-            symbol
-            for file_diff in parsed_diff.files
-            for symbol in (file_diff.removed_symbols or [])
-        }
-        if base_path and removed_targets:
-            base_path = Path(base_path).resolve()
-            if base_path.is_dir():
-                contexts.extend(
-                    self._search_references(
-                        base_path,
-                        removed_targets,
-                        set(),
-                        file_cache,
-                        revision="base",
-                    )
+        # 索引不可用时的降级兜底：现场 grep 找跨文件引用。
+        if allow_global_fallback:
+            targets = self._extract_search_targets(parsed_diff) | definition_names
+            contexts.extend(
+                self._search_references(
+                    repo_path, targets, seen_node_ranges, file_cache
                 )
+            )
+            self.last_stats["grep_fallback"] = 1
 
-        contexts.sort(key=lambda x: x.score, reverse=True)
+        contexts.sort(key=lambda item: item.score, reverse=True)
         self.last_stats["ast_contexts"] = len(contexts)
-        self.last_stats["ast_contexts_truncated"] = max(
-            0, len(contexts) - MAX_CONTEXT_COUNT
-        )
-        logger.debug("Retrieved %d contexts", len(contexts))
-        return contexts[:MAX_CONTEXT_COUNT]
+        logger.debug("Retrieved %d local AST contexts", len(contexts))
+        return contexts
 
-    def _extract_search_targets(self, parsed_diff: ParsedDiff) -> Set[str]:
-        """从 Diff 中收集所有变更/删除符号与 Hunk 上下文符号。"""
-        targets: Set[str] = set()
-        for file_diff in parsed_diff.files:
-            targets.update(file_diff.changed_symbols or [])
-            targets.update(getattr(file_diff, "removed_symbols", []) or [])
-            targets.update(file_diff.enclosing_contexts or [])
-        return {target.strip() for target in targets if target and target.strip()}
-
+    # ------------------------------------------------------------------
+    # P2 enclosing
+    # ------------------------------------------------------------------
     def _collect_changed_line_contexts(
         self,
         repo_path: Path,
         parsed_diff: ParsedDiff,
-        seen_node_ranges: Set[Tuple[str, int, int]],
+        seen_node_ranges: Set[NodeRangeKey],
         file_cache: Dict[Path, Optional[LoadedFile]],
     ) -> Tuple[List[CodeContext], Set[str]]:
         """把每个变更行映射到其所在的函数/类，并抽取完整 AST 片段。"""
@@ -190,13 +184,18 @@ class TreeSitterLocalRetriever:
                 if name:
                     definition_names.add(name)
 
-                unique_key = (file_diff.filename, node.start_point[0], node.end_point[0])
+                unique_key = (
+                    file_diff.filename,
+                    node.start_point[0],
+                    node.end_point[0],
+                    "head",
+                )
                 if unique_key in seen_node_ranges:
                     continue
                 seen_node_ranges.add(unique_key)
 
                 start_row, end_row = node.start_point[0], node.end_point[0]
-                snippet = "\n".join(lines[start_row:end_row + 1])
+                snippet = "\n".join(lines[start_row : end_row + 1])
                 folded = False
                 if estimate_tokens(snippet) > MAX_ENCLOSING_SNIPPET_TOKENS:
                     snippet, folded = fold_snippet(
@@ -241,13 +240,16 @@ class TreeSitterLocalRetriever:
 
         return contexts, definition_names
 
+    # ------------------------------------------------------------------
+    # P5 fields
+    # ------------------------------------------------------------------
     def _collect_field_contexts(
         self,
         repo_path: Path,
         parsed_diff: ParsedDiff,
         file_cache: Dict[Path, Optional[LoadedFile]],
     ) -> List[CodeContext]:
-        """P5：收集被变更方法引用的类/模块字段定义。"""
+        """P5：收集被变更方法引用的类/结构体字段与模块常量。"""
         contexts: List[CodeContext] = []
         seen: Set[Tuple[str, int, int]] = set()
 
@@ -255,7 +257,7 @@ class TreeSitterLocalRetriever:
             if not file_diff.changed_lines or file_diff.status == "removed":
                 continue
             suffix = Path(file_diff.filename).suffix
-            if suffix != ".py":
+            if suffix not in self.parsers:
                 continue
             abs_path = self._resolve_repo_file(repo_path, file_diff.filename)
             if abs_path is None:
@@ -273,8 +275,8 @@ class TreeSitterLocalRetriever:
                 method_spans.add((node.start_point[0] + 1, node.end_point[0] + 1))
 
             for start_line, end_line in sorted(method_spans):
-                for field in collect_referenced_fields(
-                    text, suffix, start_line, end_line
+                for field in collect_referenced_fields_from_tree(
+                    text, source, tree, suffix, start_line, end_line
                 ):
                     key = (file_diff.filename, field.start_line, field.end_line)
                     if key in seen:
@@ -283,7 +285,10 @@ class TreeSitterLocalRetriever:
                     contexts.append(
                         CodeContext(
                             file_path=file_diff.filename,
-                            reason=f"field `{field.name}` referenced by changed method",
+                            reason=(
+                                f"field `{field.name}` referenced by "
+                                f"changed method"
+                            ),
                             snippet=field.source,
                             score=0.4,
                             kind="field",
@@ -302,146 +307,286 @@ class TreeSitterLocalRetriever:
                     )
         return contexts
 
+    # ------------------------------------------------------------------
+    # Base revision (same file only)
+    # ------------------------------------------------------------------
+    def _collect_base_contexts(
+        self,
+        repo_path: Path,
+        parsed_diff: ParsedDiff,
+        base_path: Optional[Path],
+        seen_node_ranges: Set[NodeRangeKey],
+        file_cache: Dict[Path, Optional[LoadedFile]],
+    ) -> List[CodeContext]:
+        """在 base revision 的同名文件中查找被删除的本地定义。"""
+        if base_path is None:
+            return []
+        base_root = Path(base_path).resolve()
+        if not base_root.is_dir():
+            return []
+
+        contexts: List[CodeContext] = []
+        for file_diff in parsed_diff.files:
+            removed = {
+                symbol.strip()
+                for symbol in (file_diff.removed_symbols or [])
+                if symbol and symbol.strip()
+            }
+            if not removed:
+                continue
+            suffix = Path(file_diff.filename).suffix
+            if suffix not in self.parsers:
+                continue
+
+            base_file = self._resolve_repo_file(base_root, file_diff.filename)
+            if base_file is None:
+                continue
+            loaded = self._load_file(base_file, file_cache)
+            if loaded is None:
+                continue
+
+            _, lines, source, tree = loaded
+            for node in self._iter_definitions(tree.root_node):
+                qualname = ast_utils.definition_qualname(node, source)
+                name = self._definition_name(node, source)
+                if not name:
+                    continue
+                if name not in removed and qualname not in removed:
+                    continue
+
+                start_row, end_row = node.start_point[0], node.end_point[0]
+                key = (file_diff.filename, start_row, end_row, "base")
+                if key in seen_node_ranges:
+                    continue
+                seen_node_ranges.add(key)
+                contexts.append(
+                    CodeContext(
+                        file_path=file_diff.filename,
+                        reason=(
+                            f"[base revision] removed definition "
+                            f"`{qualname or name}` "
+                            f"(lines {start_row + 1}-{end_row + 1})"
+                        ),
+                        snippet="\n".join(lines[start_row : end_row + 1]),
+                        score=SCORE_BASE_DEFINITION,
+                        revision="base",
+                        kind="base_definition",
+                        priority=6,
+                        symbol=name,
+                        start_line=start_row + 1,
+                        end_line=end_row + 1,
+                        context_id=make_context_id(
+                            file_diff.filename,
+                            start_row + 1,
+                            end_row + 1,
+                            "base_definition",
+                            revision="base",
+                        ),
+                    )
+                )
+        return contexts
+
+    # ------------------------------------------------------------------
+    # Linked test functions
+    # ------------------------------------------------------------------
     def _collect_test_contexts(
         self,
         repo_path: Path,
         parsed_diff: ParsedDiff,
-        seen_node_ranges: Set[Tuple[str, int, int]],
+        enclosing_names: Set[str],
+        seen_node_ranges: Set[NodeRangeKey],
         file_cache: Dict[Path, Optional[LoadedFile]],
     ) -> List[CodeContext]:
-        """找到与变更模块关联的测试文件，作为测试缺口分析的依据。"""
-        source_files = {
+        """只提取引用变更符号的测试函数，而不是整个测试文件。"""
+        symbols = self._extract_search_targets(parsed_diff) | enclosing_names
+        if not symbols:
+            return []
+
+        source_files = [
             file_diff.filename
             for file_diff in parsed_diff.files
-            if not file_diff.is_test_file
+            if file_diff.filename
+            and not file_diff.is_test_file
             and not file_diff.is_docs_file
             and not file_diff.is_config_file
-        }
+        ]
         if not source_files:
             return []
 
-        try:
-            process = subprocess.run(
-                ["git", "-C", str(repo_path), "ls-files"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError("Git is required but not found in system path.") from exc
-
-        if process.returncode != 0:
-            return []
-
-        tracked_tests = [
-            rel_path
-            for rel_path in process.stdout.splitlines()
-            if self._is_valid_source_file(rel_path)
-            and DiffParser.is_test_path(rel_path)
-        ]
-
-        selected: List[str] = []
-        for source_file in sorted(source_files):
-            matches = [
-                rel_path
-                for rel_path in tracked_tests
-                if DiffParser.is_linked_test(source_file, rel_path)
-            ]
-            selected.extend(matches[:2])
-            if len(selected) >= MAX_TEST_CONTEXT_COUNT:
-                break
-
-        selected = selected[:MAX_TEST_CONTEXT_COUNT]
-
         contexts: List[CodeContext] = []
-        for rel_path in dict.fromkeys(selected):
-            unique_key = (rel_path, -1, -1)
-            if unique_key in seen_node_ranges:
-                continue
+        for source_file in sorted(set(source_files)):
+            for test_file in self._linked_test_candidates(repo_path, source_file):
+                abs_path = self._resolve_repo_file(repo_path, test_file)
+                if abs_path is None:
+                    continue
+                loaded = self._load_file(abs_path, file_cache)
+                if loaded is None:
+                    continue
 
-            abs_path = self._resolve_repo_file(repo_path, rel_path)
-            if abs_path is None:
-                continue
-            loaded = self._load_file(abs_path, file_cache)
-            if loaded is None:
-                continue
+                _, lines, source, tree = loaded
+                for node, name in self._iter_test_functions(tree, source, test_file):
+                    if not self._references_any(node, source, symbols):
+                        continue
+                    key = (
+                        test_file,
+                        node.start_point[0],
+                        node.end_point[0],
+                        "head",
+                    )
+                    if key in seen_node_ranges:
+                        continue
+                    seen_node_ranges.add(key)
 
-            _, lines, _, _ = loaded
-            seen_node_ranges.add(unique_key)
-            end_line = min(len(lines), MAX_TEST_SNIPPET_LINES)
-            contexts.append(
-                CodeContext(
-                    file_path=rel_path,
-                    reason="Linked test file for changed module",
-                    snippet="\n".join(lines[:MAX_TEST_SNIPPET_LINES]),
-                    score=SCORE_TEST_FILE,
-                    revision="head",
-                    kind="test",
-                    priority=6,
-                    start_line=1,
-                    end_line=end_line,
-                    context_id=make_context_id(
-                        rel_path, 1, end_line, "test", revision="head"
-                    ),
-                )
-            )
-
+                    start_row, end_row = node.start_point[0], node.end_point[0]
+                    matched = self._matched_symbol(node, source, symbols, name)
+                    contexts.append(
+                        CodeContext(
+                            file_path=test_file,
+                            reason=(
+                                f"Linked test `{name}` references "
+                                f"changed symbol `{matched}`"
+                            ),
+                            snippet="\n".join(lines[start_row : end_row + 1]),
+                            score=SCORE_TEST_FUNCTION,
+                            revision="head",
+                            kind="test",
+                            priority=6,
+                            symbol=name,
+                            start_line=start_row + 1,
+                            end_line=end_row + 1,
+                            context_id=make_context_id(
+                                test_file,
+                                start_row + 1,
+                                end_row + 1,
+                                "test",
+                                revision="head",
+                            ),
+                        )
+                    )
+                    if len(contexts) >= MAX_TEST_FUNCTION_CONTEXTS:
+                        self.last_stats["test_functions_truncated"] = (
+                            self.last_stats.get("test_functions_truncated", 0) + 1
+                        )
+                        return contexts
         return contexts
 
-    def _resolve_repo_file(self, repo_path: Path, rel_path_str: str) -> Optional[Path]:
-        """把仓库相对路径解析为绝对路径，并阻止 ../ 越界。"""
-        candidate = (repo_path / rel_path_str).resolve()
-        try:
-            candidate.relative_to(repo_path)
-        except ValueError:
-            logger.warning("Skip path outside repository: %s", rel_path_str)
-            return None
-        return candidate
+    def _linked_test_candidates(
+        self, repo_path: Path, source_file: str
+    ) -> List[str]:
+        """按常见命名约定推导测试文件路径，不做全仓扫描。"""
+        path = Path(source_file)
+        suffix = path.suffix
+        if suffix == ".py":
+            names = [f"test_{path.stem}.py", f"{path.stem}_test.py"]
+        elif suffix == ".go":
+            names = [f"{path.stem}_test.go"]
+        else:
+            return []
 
-    def _load_file(
-        self, file_path: Path, cache: Dict[Path, Optional[LoadedFile]]
-    ) -> Optional[LoadedFile]:
-        if file_path in cache:
-            return cache[file_path]
+        directories = [
+            path.parent,
+            path.parent / "tests",
+            path.parent / "test",
+            Path("tests"),
+            Path("test"),
+            Path("tests") / path.parent.name,
+            Path("test") / path.parent.name,
+        ]
+        candidates: List[str] = []
+        for directory in directories:
+            for name in names:
+                candidate = (directory / name).as_posix()
+                if candidate.startswith("./"):
+                    candidate = candidate[2:]
+                if candidate not in candidates:
+                    candidates.append(candidate)
+        for name in names:
+            if name not in candidates:
+                candidates.append(name)
 
-        parser = self.parsers.get(file_path.suffix)
-        if parser is None:
-            cache[file_path] = None
-            return None
+        existing: List[str] = []
+        for candidate in candidates:
+            resolved = self._resolve_repo_file(repo_path, candidate)
+            if resolved is not None and resolved.is_file():
+                existing.append(candidate)
+        return existing
 
-        try:
-            if not file_path.exists() or file_path.stat().st_size > MAX_FILE_SIZE:
-                cache[file_path] = None
-                return None
-            text = file_path.read_text(encoding="utf-8", errors="ignore")
-            source = text.encode("utf-8")
-            tree = parser.parse(source)
-            loaded: LoadedFile = (text, text.splitlines(), source, tree)
-            cache[file_path] = loaded
-            return loaded
-        except OSError as exc:
-            logger.debug("Failed to read %s: %s", file_path, exc)
-            cache[file_path] = None
-            return None
+    def _iter_test_functions(
+        self, tree: Tree, source: bytes, file_path: str
+    ) -> Iterable[Tuple[Node, str]]:
+        prefixes = TEST_PREFIXES.get(Path(file_path).suffix, ())
+        if not prefixes:
+            return
+        for node in self._iter_functions(tree.root_node):
+            name = self._definition_name(node, source)
+            if name and name.startswith(prefixes):
+                yield node, name
 
-    def _is_valid_source_file(self, rel_path_str: str) -> bool:
-        """与索引/impact 共用同一套目录剪枝规则，避免检索口径漂移。"""
-        return is_source_file(rel_path_str, self.parsers)
+    def _iter_functions(self, root: Node) -> Iterable[Node]:
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.type in {
+                "function_definition",
+                "function_declaration",
+                "method_declaration",
+            }:
+                yield node
+            stack.extend(reversed(node.children))
+
+    @staticmethod
+    def _references_any(node: Node, source: bytes, symbols: Set[str]) -> bool:
+        body = ast_utils.node_text(node, source)
+        for symbol in symbols:
+            target = symbol.rsplit(".", 1)[-1]
+            if not target:
+                continue
+            if re.search(rf"\b{re.escape(target)}\b", body):
+                return True
+        return False
+
+    def _matched_symbol(
+        self,
+        node: Node,
+        source: bytes,
+        symbols: Set[str],
+        test_name: str,
+    ) -> str:
+        body = ast_utils.node_text(node, source)
+        for symbol in sorted(symbols, key=len, reverse=True):
+            target = symbol.rsplit(".", 1)[-1]
+            if target and re.search(rf"\b{re.escape(target)}\b", body):
+                return symbol
+        for symbol in sorted(symbols, key=len, reverse=True):
+            target = symbol.rsplit(".", 1)[-1]
+            if target and target.lower() in test_name.lower():
+                return symbol
+        return "unknown"
+
+    # ------------------------------------------------------------------
+    # Global grep fallback (index unavailable)
+    # ------------------------------------------------------------------
+    def _extract_search_targets(self, parsed_diff: ParsedDiff) -> Set[str]:
+        """从 Diff 中收集所有变更/删除符号与 Hunk 上下文符号。"""
+        targets: Set[str] = set()
+        for file_diff in parsed_diff.files:
+            targets.update(file_diff.changed_symbols or [])
+            targets.update(file_diff.removed_symbols or [])
+            targets.update(file_diff.enclosing_contexts or [])
+        return {target.strip() for target in targets if target and target.strip()}
 
     def _search_references(
         self,
         repo_path: Path,
         targets: Set[str],
-        seen_node_ranges: Set[Tuple[str, int, int]],
+        seen_node_ranges: Set[NodeRangeKey],
         file_cache: Dict[Path, Optional[LoadedFile]],
         revision: str = "head",
     ) -> List[CodeContext]:
+        """索引不可用时的最后兜底：现场 grep 找跨文件定义/引用。"""
         contexts: List[CodeContext] = []
 
-        # 超长 PR 必须截断时，优先保留更长、更具体的符号；按字母序截断容易
-        # 留下 `init` / `x` / `Context` 这类高频噪声，挤掉真正有信息量的名字。
+        # 超长 PR 必须截断时，优先保留更长、更具体的符号。
         valid_targets = sorted(
             (target for target in targets if target and target.strip()),
             key=lambda target: (-len(target), target),
@@ -493,7 +638,6 @@ class TreeSitterLocalRetriever:
                 if abs_file_path is None:
                     continue
 
-                # 核心：通过 Tree-sitter 提取 AST 边界并判断定义/引用
                 (
                     snippet,
                     reason,
@@ -507,12 +651,16 @@ class TreeSitterLocalRetriever:
                 if not snippet or not node_range:
                     continue
 
-                unique_key = (rel_path_str, node_range[0], node_range[1])
+                unique_key = (
+                    rel_path_str,
+                    node_range[0],
+                    node_range[1],
+                    revision,
+                )
                 if unique_key in seen_node_ranges:
                     continue
                 seen_node_ranges.add(unique_key)
 
-                # 定义给予较高权重，引用给予基础权重；base 侧整体降权
                 if revision == "base":
                     score = (
                         SCORE_BASE_DEFINITION if is_def else SCORE_BASE_REFERENCE
@@ -582,11 +730,10 @@ class TreeSitterLocalRetriever:
         target_line = lines[target_idx]
         target_node = self._find_enclosing_definition(tree.root_node, target_idx)
 
-        # 如果不在任何函数/类定义内（例如顶层代码），采用行窗口兜底
         if not target_node:
             start_row = max(0, target_idx - 7)
             end_row = min(len(lines) - 1, target_idx + 7)
-            snippet = "\n".join(lines[start_row:end_row + 1])
+            snippet = "\n".join(lines[start_row : end_row + 1])
             matched = next((t for t in targets if t in target_line), "unknown")
             return (
                 snippet,
@@ -597,7 +744,7 @@ class TreeSitterLocalRetriever:
             )
 
         start_row, end_row = target_node.start_point[0], target_node.end_point[0]
-        snippet = "\n".join(lines[start_row:end_row + 1])
+        snippet = "\n".join(lines[start_row : end_row + 1])
 
         definition_name = self._definition_name(target_node, source)
         matched_target = next(
@@ -605,9 +752,6 @@ class TreeSitterLocalRetriever:
             definition_name or "unknown",
         )
 
-        # 关键修复：只有“命中行就是该定义节点的声明行”时才算 Definition。
-        # 原实现只要命中行位于某个函数内部就判为 Definition，导致所有引用都被
-        # 打成 0.90 分，检索排序失真。
         is_def = (
             definition_name in targets
             and target_node.start_point[0] == target_idx
@@ -622,6 +766,59 @@ class TreeSitterLocalRetriever:
         )
         return snippet, reason, is_def, (start_row, end_row), matched_target
 
+    # ------------------------------------------------------------------
+    # tree / file helpers
+    # ------------------------------------------------------------------
+    def _iter_definitions(self, root: Node) -> Iterable[Node]:
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.type in DEFINITION_TYPES:
+                yield node
+            stack.extend(reversed(node.children))
+
+    def _resolve_repo_file(
+        self, repo_path: Path, rel_path_str: str
+    ) -> Optional[Path]:
+        """把仓库相对路径解析为绝对路径，并阻止 ../ 越界。"""
+        candidate = (repo_path / rel_path_str).resolve()
+        try:
+            candidate.relative_to(repo_path)
+        except ValueError:
+            logger.warning("Skip path outside repository: %s", rel_path_str)
+            return None
+        return candidate
+
+    def _load_file(
+        self, file_path: Path, cache: Dict[Path, Optional[LoadedFile]]
+    ) -> Optional[LoadedFile]:
+        if file_path in cache:
+            return cache[file_path]
+
+        parser = self.parsers.get(file_path.suffix)
+        if parser is None:
+            cache[file_path] = None
+            return None
+
+        try:
+            if not file_path.exists() or file_path.stat().st_size > MAX_FILE_SIZE:
+                cache[file_path] = None
+                return None
+            text = file_path.read_text(encoding="utf-8", errors="ignore")
+            source = text.encode("utf-8")
+            tree = parser.parse(source)
+            loaded: LoadedFile = (text, text.splitlines(), source, tree)
+            cache[file_path] = loaded
+            return loaded
+        except OSError as exc:
+            logger.debug("Failed to read %s: %s", file_path, exc)
+            cache[file_path] = None
+            return None
+
+    def _is_valid_source_file(self, rel_path_str: str) -> bool:
+        """与索引/impact 共用同一套目录剪枝规则，避免检索口径漂移。"""
+        return is_source_file(rel_path_str, self.parsers)
+
     @staticmethod
     def _definition_name(node: Node, source: bytes) -> Optional[str]:
         """读取定义节点的名字。Go 的 type_declaration 需要再下钻一层 type_spec。"""
@@ -634,9 +831,13 @@ class TreeSitterLocalRetriever:
                         break
         if name_node is None:
             return None
-        return source[name_node.start_byte:name_node.end_byte].decode("utf-8", "ignore")
+        return source[name_node.start_byte : name_node.end_byte].decode(
+            "utf-8", "ignore"
+        )
 
-    def _find_enclosing_definition(self, node: Node, target_row: int) -> Optional[Node]:
+    def _find_enclosing_definition(
+        self, node: Node, target_row: int
+    ) -> Optional[Node]:
         """递归遍历 AST，寻找包含 target_row 的最小定义节点"""
         best_match = None
 

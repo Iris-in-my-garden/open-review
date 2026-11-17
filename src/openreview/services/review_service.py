@@ -155,6 +155,7 @@ class ReviewPipeline:
             self.retriever: Retriever = HybridRetriever(
                 index_cache_dir=index_cache_dir,
                 graph_enabled=graph_retrieval_enabled,
+                max_context_tokens=self.config.max_context_tokens,
             )
         else:
             self.retriever = TreeSitterLocalRetriever()

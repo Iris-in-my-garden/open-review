@@ -31,9 +31,11 @@ logger = logging.getLogger(__name__)
 
 MAX_CALLER_CONTEXTS = 8
 MAX_CALLEE_CONTEXTS = 8
-MAX_IMPORTER_CONTEXTS = 6
 MAX_DEPENDENCY_CONTEXTS = 6
 CALL_SITE_RADIUS = 5
+# 同文件/同包的短小私有 helper 直接展开完整函数体：签名往往不足以判断
+# 调用语义，而几十行的成本可控。
+MAX_PRIVATE_HELPER_LINES = 25
 
 
 class GraphRetriever:
@@ -43,13 +45,11 @@ class GraphRetriever:
         self,
         max_callers: int = MAX_CALLER_CONTEXTS,
         max_callees: int = MAX_CALLEE_CONTEXTS,
-        max_importers: int = MAX_IMPORTER_CONTEXTS,
         max_dependencies: int = MAX_DEPENDENCY_CONTEXTS,
         python_calls_only: bool = True,
     ):
         self.max_callers = max(0, max_callers)
         self.max_callees = max(0, max_callees)
-        self.max_importers = max(0, max_importers)
         self.max_dependencies = max(0, max_dependencies)
         self.python_calls_only = python_calls_only
 
@@ -65,7 +65,6 @@ class GraphRetriever:
         for key in (
             "graph_caller_hits",
             "graph_callee_hits",
-            "index_importer_hits",
             "index_dependency_hits",
             "graph_error",
         ):
@@ -83,11 +82,8 @@ class GraphRetriever:
                     "callee", self._callee_contexts, repo_path, index, query, stats
                 )
             )
-        contexts.extend(
-            self._collect(
-                "importer", self._importer_contexts, repo_path, index, query, stats
-            )
-        )
+        # P6 只保留“变更模块 import 了哪些仓库内定义”。反向的“谁 import 了
+        # 变更模块”噪声大且与调用点重复，已移除。
         contexts.extend(
             self._collect(
                 "dependency",
@@ -257,15 +253,30 @@ class GraphRetriever:
             if key in seen:
                 continue
             seen.add(key)
-            snippet = self._callee_signature_snippet(repo_path, definition)
+            expanded = self._should_expand_helper(edge, definition)
+            snippet = (
+                read_line_range(
+                    repo_path / definition.file_path,
+                    definition.start_line,
+                    definition.end_line,
+                )
+                if expanded
+                else self._callee_signature_snippet(repo_path, definition)
+            )
             if not snippet:
                 continue
             contexts.append(
                 CodeContext(
                     file_path=definition.file_path,
                     reason=(
-                        f"callee `{definition.qualname}` signature "
-                        f"(lines {definition.start_line}-{definition.end_line})"
+                        f"callee `{definition.qualname}` "
+                        + (
+                            f"full body of short private helper "
+                            f"(lines {definition.start_line}-{definition.end_line})"
+                            if expanded
+                            else f"signature "
+                            f"(lines {definition.start_line}-{definition.end_line})"
+                        )
                     ),
                     snippet=snippet,
                     score=0.72,
@@ -319,6 +330,25 @@ class GraphRetriever:
         return False
 
     @staticmethod
+    def _should_expand_helper(edge, definition) -> bool:
+        """同文件/同包的短小私有 helper 才展开完整函数体。"""
+        name = definition.name or ""
+        if not name:
+            return False
+        is_private = name.startswith("_") or name[0].islower()
+        if not is_private:
+            return False
+        if definition.end_line - definition.start_line + 1 > MAX_PRIVATE_HELPER_LINES:
+            return False
+        if definition.file_path == edge.caller_file:
+            return True
+        # Go 的包边界就是目录；Python 同目录也视为同包（保守近似）。
+        return (
+            Path(definition.file_path).parent
+            == Path(edge.caller_file).parent
+        )
+
+    @staticmethod
     def _callee_signature_snippet(repo_path: Path, definition) -> str:
         """只保留签名 + docstring + raise 语句，而不是完整函数体。"""
         parsed = ast_utils.parse_file(repo_path / definition.file_path)
@@ -361,53 +391,6 @@ class GraphRetriever:
     # ------------------------------------------------------------------
     # import graph
     # ------------------------------------------------------------------
-    def _importer_contexts(
-        self,
-        repo_path: Path,
-        index: RepoIndex,
-        query: RetrievalQuery,
-        stats: Dict[str, float],
-    ) -> List[CodeContext]:
-        if self.max_importers <= 0:
-            return []
-        contexts: List[CodeContext] = []
-        seen: set[tuple[str, int]] = set()
-        for edge in index.importers_of(
-            query.modules, limit=max(self.max_importers * 3, self.max_importers)
-        ):
-            key = (edge.src_file, edge.line)
-            if key in seen:
-                continue
-            seen.add(key)
-            start = max(1, edge.line - 4)
-            end = edge.line + 8
-            snippet = read_line_range(repo_path / edge.src_file, start, end)
-            if not snippet:
-                continue
-            contexts.append(
-                CodeContext(
-                    file_path=edge.src_file,
-                    reason=(
-                        f"import of `{edge.dst_module}`"
-                        + (f" (`{edge.symbol}`)" if edge.symbol else "")
-                    ),
-                    snippet=snippet,
-                    score=0.6,
-                    kind="import",
-                    priority=6,
-                    symbol=edge.symbol,
-                    start_line=start,
-                    end_line=end,
-                    context_id=make_context_id(
-                        edge.src_file, start, end, "import", fallback=edge.dst_module
-                    ),
-                )
-            )
-            stats["index_importer_hits"] += 1
-            if len(contexts) >= self.max_importers:
-                break
-        return contexts
-
     def _dependency_contexts(
         self,
         repo_path: Path,

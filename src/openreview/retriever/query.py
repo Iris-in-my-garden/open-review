@@ -4,7 +4,7 @@ Natural-language RAG 的 query 是用户问题；code review 的 query 是 diff�
 这里把 diff 里有信息量的信号抽出来，而不是只拿 changed_symbols 去 grep：
 
 - 变更/删除符号 + 包围符号
-- 变更文件对应的模块名（用于找 importer）
+- 变更文件对应的模块名（供索引/依赖关系使用）
 - 变更文件自己的 import（用于找依赖定义）
 - 新增行里的标识符和字符串（错误串、配置 key、SQL 等）
 """

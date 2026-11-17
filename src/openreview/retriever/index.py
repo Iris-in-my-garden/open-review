@@ -102,7 +102,9 @@ class RepoIndex:
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), timeout=30)
+        self._conn = sqlite3.connect(
+            str(self.db_path), timeout=30, check_same_thread=False
+        )
         self._conn.row_factory = sqlite3.Row
         self.fts_enabled = True
         self.last_stats: Dict[str, Any] = {}

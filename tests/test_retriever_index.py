@@ -5,10 +5,15 @@ from pathlib import Path
 
 from openreview.repo.diff_parser import DiffParser, ParsedChangedFile, ParsedDiff
 from openreview.retriever import index as index_module
+from openreview.retriever.code_context import CodeContext
 from openreview.retriever.hybrid import HybridRetriever
 from openreview.retriever.index import RepoIndex, _iter_source_files
 from openreview.retriever.pathing import is_source_file
-from openreview.retriever.query import MAX_ADDED_LINE_IDENTIFIERS, QueryBuilder
+from openreview.retriever.query import (
+    MAX_ADDED_LINE_IDENTIFIERS,
+    QueryBuilder,
+    RetrievalQuery,
+)
 from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
 
 
@@ -278,12 +283,101 @@ def test_hybrid_retriever_adds_index_contexts_with_ids(tmp_path: Path):
         assert contexts
         assert retriever.last_stats["index_symbol_hits"] >= 1
         assert any(context.kind == "enclosing" for context in contexts)
-        assert any(context.kind in {"import", "dependency"} for context in contexts)
+        assert any(context.kind == "dependency" for context in contexts)
+        assert not any(context.kind == "import" for context in contexts)
         ids = [context.context_id for context in contexts]
         assert all(ids)
         assert len(ids) == len(set(ids))
     finally:
         retriever.close()
+
+
+def test_hybrid_enables_grep_fallback_only_without_index(tmp_path: Path):
+    """只有索引不可用时，AST 才被允许现场 grep 兜底。"""
+    from openreview.retriever.code_context import CodeContext
+
+    class _RecordingAstRetriever:
+        last_stats = {"ast_contexts": 0}
+
+        def __init__(self) -> None:
+            self.flags: list[bool] = []
+
+        def retrieve(
+            self,
+            repo_path,
+            parsed_diff,
+            base_path=None,
+            *,
+            allow_global_fallback=False,
+        ):
+            self.flags.append(allow_global_fallback)
+            return [
+                CodeContext(
+                    file_path="pkg/app.py",
+                    reason="enclosing",
+                    snippet="def f(): pass",
+                    score=0.9,
+                    kind="enclosing",
+                )
+            ]
+
+    ast_retriever = _RecordingAstRetriever()
+    retriever = HybridRetriever(ast_retriever=ast_retriever)
+    retriever._get_index = lambda *_: None  # type: ignore[method-assign]
+    try:
+        contexts = retriever.retrieve(tmp_path, ParsedDiff(files=[]))
+    finally:
+        retriever.close()
+
+    assert contexts
+    assert ast_retriever.flags == [True]
+    assert retriever.last_stats["index_symbol_hits"] == 0
+
+
+def test_hybrid_fts_fallback_is_top3_and_skips_covered(tmp_path: Path):
+    """FTS5 只补充图谱未命中的符号，且最多 Top-3。"""
+    root = tmp_path / "repo"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "mod.py").write_text(
+        "def alpha():\n    pass\n\n"
+        "def beta():\n    pass\n\n"
+        "def gamma():\n    pass\n\n"
+        "def delta():\n    pass\n",
+        encoding="utf-8",
+    )
+    _init_repo(root)
+
+    index = RepoIndex.for_worktree(root, cache_dir=tmp_path / "idx")
+    retriever = HybridRetriever(index_cache_dir=tmp_path / "idx2")
+    try:
+        query = RetrievalQuery(
+            symbols=["alpha", "beta", "gamma", "delta"],
+            files=["pkg/mod.py"],
+        )
+        graph_contexts = [
+            CodeContext(
+                file_path="pkg/mod.py",
+                reason="callee `alpha` signature",
+                snippet="def alpha():\n    pass",
+                score=0.72,
+                kind="callee",
+                symbol="alpha",
+                start_line=1,
+                end_line=2,
+            )
+        ]
+        stats: dict[str, float] = {"index_symbol_hits": 0}
+
+        contexts = retriever._fts_fallback_contexts(
+            root, index, query, graph_contexts, stats
+        )
+
+        assert 1 <= len(contexts) <= 3
+        assert all(context.symbol != "alpha" for context in contexts)
+        assert stats["index_symbol_hits"] == len(contexts)
+    finally:
+        retriever.close()
+        index.close()
 
 
 def test_index_like_lookups_escape_wildcards(tmp_path: Path):
@@ -384,7 +478,7 @@ def test_retrieval_mechanisms_share_path_filters(tmp_path: Path):
 
 
 def test_hybrid_reports_candidates_deduped_and_truncated(tmp_path: Path):
-    """检索上限造成的丢失必须可观测，而不是静默截断。"""
+    """Token 预算造成的丢失必须可观测，而不是静默截断。"""
     from openreview.retriever.code_context import CodeContext
 
     class _FakeAstRetriever:
@@ -407,7 +501,7 @@ def test_hybrid_reports_candidates_deduped_and_truncated(tmp_path: Path):
     retriever = HybridRetriever(
         ast_retriever=_FakeAstRetriever(),
         enabled=False,
-        max_contexts=2,
+        max_context_tokens=60,
     )
 
     contexts = retriever.retrieve(tmp_path, ParsedDiff(files=[]))
@@ -416,5 +510,6 @@ def test_hybrid_reports_candidates_deduped_and_truncated(tmp_path: Path):
     assert retriever.last_stats["contexts_candidates"] == 4
     assert retriever.last_stats["contexts_deduped"] == 0
     assert retriever.last_stats["contexts_truncated"] == 2
+    assert retriever.last_stats["context_tokens_remaining"] >= 0
     assert retriever.last_stats["ast_contexts_truncated"] == 1
 

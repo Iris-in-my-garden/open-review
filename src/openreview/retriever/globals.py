@@ -1,17 +1,24 @@
-"""P5：提取被当前方法引用的类/文件级字段定义。
+"""P5：提取被当前方法引用的类/结构体字段与模块常量。
 
-只看“方法里真的用到了哪些全局字段”，避免把整个模块的常量表塞进 prompt。
-Python 用 ``ast`` 精确区分局部变量、参数和真正的模块/类属性；Go 暂不启用。
+统一使用 Tree-sitter，覆盖 Python 和 Go，避免 Python ast / Go 文本匹配两套
+口径。只看“方法里真的用到了哪些字段”，避免把整个模块的常量表塞进 prompt。
+
+- Python：``self.x`` / ``Cls.x`` 以及模块级赋值常量。
+- Go：selector 访问的 struct 字段，以及包级 ``const`` / ``var``。
 """
 
 from __future__ import annotations
 
-import ast
-import builtins
 from dataclasses import dataclass
-from typing import List, Set
+from typing import Iterable, List, Optional, Set
 
-_BUILTIN_NAMES = set(dir(builtins))
+from tree_sitter import Node, Tree
+
+from openreview.retriever.ast_utils import (
+    find_enclosing_definition,
+    node_text,
+    parse_text,
+)
 
 
 @dataclass(frozen=True)
@@ -28,177 +35,303 @@ def collect_referenced_fields(
     start_line: int,
     end_line: int,
 ) -> List[FieldDefinition]:
-    """返回被 ``start_line``–``end_line`` 方法引用的模块/类级字段。"""
-    if suffix != ".py" or not text:
+    """返回被 ``start_line``–``end_line`` 方法引用的类/模块级字段。"""
+    parsed = parse_text(text, suffix)
+    if parsed is None:
         return []
+    parsed_text, source, tree = parsed
+    return collect_referenced_fields_from_tree(
+        parsed_text, source, tree, suffix, start_line, end_line
+    )
 
-    try:
-        tree = ast.parse(text)
-    except SyntaxError:
+
+def collect_referenced_fields_from_tree(
+    text: str,
+    source: bytes,
+    tree: Tree,
+    suffix: str,
+    start_line: int,
+    end_line: int,
+) -> List[FieldDefinition]:
+    """复用已解析的 tree，避免每个方法重复 parse 同一文件。"""
+    if not text:
         return []
-
-    function = _find_function(tree, start_line, end_line)
+    function = find_enclosing_definition(tree, max(0, start_line - 1))
     if function is None:
         return []
-
-    enclosing_class = _find_enclosing_class(tree, start_line, end_line)
-    class_name = enclosing_class.name if enclosing_class is not None else ""
-
-    references = _collect_references(function, class_name)
-    if not references:
+    if function.end_point[0] + 1 < end_line:
         return []
 
     lines = text.splitlines()
-    definitions: List[FieldDefinition] = []
+    if suffix == ".py":
+        candidates = _python_field_candidates(tree, function, source, lines)
+    elif suffix == ".go":
+        candidates = _go_field_candidates(tree, function, source, lines)
+    else:
+        return []
 
-    # 类字段优先：self.x / Cls.x 通常比模块常量更贴近当前方法。
-    if enclosing_class is not None:
-        for statement in enclosing_class.body:
-            for name in _assigned_names(statement):
-                if name in references:
-                    definitions.append(
-                        _to_definition(name, statement, lines)
-                    )
+    references = _collect_references(function, source, suffix)
+    if not references:
+        return []
 
-    for statement in tree.body:
-        for name in _assigned_names(statement):
-            if name in references:
-                definitions.append(_to_definition(name, statement, lines))
-
-    # 同名只保留第一条（类字段优先于模块字段）。
-    seen: Set[str] = set()
     result: List[FieldDefinition] = []
-    for item in definitions:
-        if item.name in seen:
+    seen: Set[str] = set()
+    for definition in candidates:
+        if definition.name in seen or definition.name not in references:
             continue
-        seen.add(item.name)
-        result.append(item)
+        seen.add(definition.name)
+        result.append(definition)
     return result
 
 
-def _find_function(
-    tree: ast.AST, start_line: int, end_line: int
-) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
-    best: ast.FunctionDef | ast.AsyncFunctionDef | None = None
-    best_span: int | None = None
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+# ----------------------------------------------------------------------
+# Python
+# ----------------------------------------------------------------------
+def _python_field_candidates(
+    tree: Tree,
+    function: Node,
+    source: bytes,
+    lines: List[str],
+) -> List[FieldDefinition]:
+    candidates: List[FieldDefinition] = []
+
+    class_node = _enclosing_class(function)
+    if class_node is not None:
+        body = class_node.child_by_field_name("body")
+        if body is not None:
+            for statement in _assignment_statements(body):
+                candidates.extend(
+                    _statement_fields(statement, source, lines)
+                )
+
+    for statement in _assignment_statements(tree.root_node):
+        candidates.extend(_statement_fields(statement, source, lines))
+    return candidates
+
+
+def _enclosing_class(node: Node) -> Optional[Node]:
+    current = node.parent
+    while current is not None:
+        if current.type == "class_definition":
+            return current
+        current = current.parent
+    return None
+
+
+def _assignment_statements(container: Node) -> Iterable[Node]:
+    """读取直接子节点里的赋值语句，不递归进方法/嵌套类。"""
+    for child in container.children:
+        if child.type != "expression_statement":
             continue
-        node_start = node.lineno
-        node_end = getattr(node, "end_lineno", node_start)
-        if node_start <= start_line and end_line <= node_end:
-            span = node_end - node_start
-            if best_span is None or span < best_span:
-                best = node
-                best_span = span
-    return best
+        for statement in child.children:
+            if statement.type in {
+                "assignment",
+                "annotated_assignment",
+                "augmented_assignment",
+            }:
+                yield statement
 
 
-def _find_enclosing_class(
-    tree: ast.AST, start_line: int, end_line: int
-) -> ast.ClassDef | None:
-    best: ast.ClassDef | None = None
-    best_span: int | None = None
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ClassDef):
+def _statement_fields(
+    statement: Node,
+    source: bytes,
+    lines: List[str],
+) -> List[FieldDefinition]:
+    target = statement.child_by_field_name("left")
+    if target is None:
+        return []
+    names = _python_target_names(target, source)
+    start = statement.start_point[0]
+    end = statement.end_point[0]
+    snippet = "\n".join(lines[start : end + 1])
+    return [
+        FieldDefinition(
+            name=name,
+            start_line=start + 1,
+            end_line=end + 1,
+            source=snippet,
+        )
+        for name in names
+    ]
+
+
+def _python_target_names(target: Node, source: bytes) -> List[str]:
+    names: List[str] = []
+    stack = [target]
+    while stack:
+        node = stack.pop()
+        if node.type == "identifier":
+            names.append(node_text(node, source))
             continue
-        node_start = node.lineno
-        node_end = getattr(node, "end_lineno", node_start)
-        if node_start <= start_line and end_line <= node_end:
-            span = node_end - node_start
-            if best_span is None or span < best_span:
-                best = node
-                best_span = span
-    return best
-
-
-def _collect_references(
-    function: ast.FunctionDef | ast.AsyncFunctionDef, class_name: str
-) -> Set[str]:
-    local_names = _local_names(function)
-    references: Set[str] = set()
-
-    class Visitor(ast.NodeVisitor):
-        def visit_Name(self, node: ast.Name) -> None:
-            if isinstance(node.ctx, ast.Load) and node.id not in local_names:
-                references.add(node.id)
-            self.generic_visit(node)
-
-        def visit_Attribute(self, node: ast.Attribute) -> None:
-            root: ast.AST = node
-            while isinstance(root, ast.Attribute):
-                root = root.value
-            if isinstance(root, ast.Name) and (
-                root.id == "self" or (class_name and root.id == class_name)
-            ):
-                references.add(node.attr)
-            self.generic_visit(node)
-
-    Visitor().visit(function)
-    references.difference_update(_BUILTIN_NAMES)
-    return references
-
-
-def _local_names(
-    function: ast.FunctionDef | ast.AsyncFunctionDef,
-) -> Set[str]:
-    names: Set[str] = set()
-
-    args = function.args
-    for arg in (
-        list(args.args)
-        + list(args.kwonlyargs)
-        + list(getattr(args, "posonlyargs", []))
-    ):
-        names.add(arg.arg)
-    if args.vararg is not None:
-        names.add(args.vararg.arg)
-    if args.kwarg is not None:
-        names.add(args.kwarg.arg)
-
-    for node in ast.walk(function):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            names.add(node.id)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node is not function:
-            names.add(node.name)
-        elif isinstance(node, ast.ClassDef) and node is not function:
-            names.add(node.name)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                names.add(alias.asname or alias.name.split(".")[0])
+        stack.extend(node.children)
     return names
 
 
-def _assigned_names(statement: ast.AST) -> List[str]:
-    if isinstance(statement, ast.Assign):
-        names: List[str] = []
-        for target in statement.targets:
-            names.extend(_target_names(target))
-        return names
-    if isinstance(statement, ast.AnnAssign):
-        return _target_names(statement.target)
-    return []
+def _python_local_names(function: Node, source: bytes) -> Set[str]:
+    names: Set[str] = set()
+
+    parameters = function.child_by_field_name("parameters")
+    if parameters is not None:
+        names.update(_identifier_texts(parameters, source))
+
+    stack = [function]
+    while stack:
+        node = stack.pop()
+        if node is not function and node.type in {
+            "function_definition",
+            "class_definition",
+        }:
+            name = node.child_by_field_name("name")
+            if name is not None:
+                names.add(node_text(name, source))
+            continue
+        if node.type in {
+            "assignment",
+            "annotated_assignment",
+            "augmented_assignment",
+            "for_statement",
+            "named_expression",
+        }:
+            target = node.child_by_field_name("left")
+            if target is None:
+                target = node.child_by_field_name("name")
+            if target is not None:
+                names.update(_python_target_names(target, source))
+        stack.extend(node.children)
+    return names
 
 
-def _target_names(target: ast.AST) -> List[str]:
-    if isinstance(target, ast.Name):
-        return [target.id]
-    if isinstance(target, (ast.Tuple, ast.List)):
-        names: List[str] = []
-        for element in target.elts:
-            names.extend(_target_names(element))
-        return names
-    return []
+# ----------------------------------------------------------------------
+# Go
+# ----------------------------------------------------------------------
+def _go_field_candidates(
+    tree: Tree,
+    function: Node,
+    source: bytes,
+    lines: List[str],
+) -> List[FieldDefinition]:
+    candidates: List[FieldDefinition] = []
+
+    for type_decl in _walk_type(tree.root_node, "type_declaration"):
+        for type_spec in type_decl.children:
+            if type_spec.type != "type_spec":
+                continue
+            struct_type = type_spec.child_by_field_name("type")
+            if struct_type is None or struct_type.type != "struct_type":
+                continue
+            for field in _walk_type(struct_type, "field_declaration"):
+                for identifier in field.children:
+                    if identifier.type != "field_identifier":
+                        continue
+                    start = field.start_point[0]
+                    end = field.end_point[0]
+                    candidates.append(
+                        FieldDefinition(
+                            name=node_text(identifier, source),
+                            start_line=start + 1,
+                            end_line=end + 1,
+                            source="\n".join(lines[start : end + 1]),
+                        )
+                    )
+
+    for child in tree.root_node.children:
+        if child.type not in {"const_declaration", "var_declaration"}:
+            continue
+        for spec in child.children:
+            if spec.type not in {"const_spec", "var_spec"}:
+                continue
+            start = spec.start_point[0]
+            end = spec.end_point[0]
+            snippet = "\n".join(lines[start : end + 1])
+            for identifier in spec.children:
+                if identifier.type != "identifier":
+                    continue
+                candidates.append(
+                    FieldDefinition(
+                        name=node_text(identifier, source),
+                        start_line=start + 1,
+                        end_line=end + 1,
+                        source=snippet,
+                    )
+                )
+    return candidates
 
 
-def _to_definition(
-    name: str, statement: ast.stmt, lines: List[str]
-) -> FieldDefinition:
-    start = statement.lineno
-    end = getattr(statement, "end_lineno", start)
-    return FieldDefinition(
-        name=name,
-        start_line=start,
-        end_line=end,
-        source="\n".join(lines[start - 1 : end]),
-    )
+def _walk_type(root: Node, node_type: str) -> Iterable[Node]:
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == node_type:
+            yield node
+        stack.extend(reversed(node.children))
+
+
+def _go_local_names(function: Node, source: bytes) -> Set[str]:
+    names: Set[str] = set()
+
+    for field_name in ("receiver", "parameters"):
+        parameters = function.child_by_field_name(field_name)
+        if parameters is not None:
+            names.update(_identifier_texts(parameters, source))
+
+    stack = [function]
+    while stack:
+        node = stack.pop()
+        if node is not function and node.type in {
+            "function_declaration",
+            "method_declaration",
+        }:
+            continue
+        if node.type in {"short_var_declaration", "assignment_statement"}:
+            left = node.child_by_field_name("left")
+            if left is not None:
+                names.update(_identifier_texts(left, source))
+        elif node.type in {"var_declaration", "const_declaration"}:
+            for spec in node.children:
+                if spec.type not in {"var_spec", "const_spec"}:
+                    continue
+                for child in spec.children:
+                    if child.type == "identifier":
+                        names.add(node_text(child, source))
+        elif node.type == "range_clause":
+            left = node.child_by_field_name("left")
+            if left is not None:
+                names.update(_identifier_texts(left, source))
+        stack.extend(node.children)
+    return names
+
+
+# ----------------------------------------------------------------------
+# references shared
+# ----------------------------------------------------------------------
+def _collect_references(function: Node, source: bytes, suffix: str) -> Set[str]:
+    if suffix == ".py":
+        local_names = _python_local_names(function, source)
+    else:
+        local_names = _go_local_names(function, source)
+
+    references: Set[str] = set()
+    stack = [function]
+    while stack:
+        node = stack.pop()
+        if node.type == "identifier":
+            text = node_text(node, source)
+            if text not in local_names:
+                references.add(text)
+        elif node.type in {"attribute", "selector_expression"}:
+            target = node.child_by_field_name("attribute") or node.child_by_field_name(
+                "field"
+            )
+            if target is not None:
+                references.add(node_text(target, source))
+        stack.extend(node.children)
+    references.difference_update(local_names)
+    return references
+
+
+def _identifier_texts(node: Node, source: bytes) -> Set[str]:
+    return {
+        node_text(item, source)
+        for item in _walk_type(node, "identifier")
+        if item is not node
+    }

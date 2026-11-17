@@ -5,7 +5,7 @@ from pathlib import Path
 
 from openreview.retriever.code_context import CodeContext, dedupe_contexts
 from openreview.retriever.graph import GraphRetriever
-from openreview.retriever.index import ImportEdge, RepoIndex
+from openreview.retriever.index import IndexedSymbol, RepoIndex
 from openreview.retriever.query import RetrievalQuery
 
 
@@ -60,7 +60,7 @@ def _query() -> RetrievalQuery:
     )
 
 
-def test_graph_retriever_expands_callers_callees_and_imports(tmp_path: Path):
+def test_graph_retriever_expands_callers_callees_and_dependencies(tmp_path: Path):
     root = tmp_path / "repo"
     root.mkdir()
     _write_repo(root)
@@ -72,7 +72,7 @@ def test_graph_retriever_expands_callers_callees_and_imports(tmp_path: Path):
         contexts = GraphRetriever().retrieve(root, index, _query(), stats=stats)
 
         kinds = {context.kind for context in contexts}
-        assert {"caller", "callee", "import", "dependency"} <= kinds
+        assert kinds == {"caller", "callee", "dependency"}
 
         caller = next(context for context in contexts if context.kind == "caller")
         assert caller.file_path == "pkg/api.py"
@@ -84,10 +84,6 @@ def test_graph_retriever_expands_callers_callees_and_imports(tmp_path: Path):
         assert callee.symbol == "make_token"
         assert "def make_token" in callee.snippet
 
-        importer = next(context for context in contexts if context.kind == "import")
-        assert importer.file_path == "pkg/api.py"
-        assert "from pkg.auth import AuthService" in importer.snippet
-
         dependency = next(
             context for context in contexts if context.kind == "dependency"
         )
@@ -96,9 +92,10 @@ def test_graph_retriever_expands_callers_callees_and_imports(tmp_path: Path):
 
         assert stats["graph_caller_hits"] == 1
         assert stats["graph_callee_hits"] == 1
-        assert stats["index_importer_hits"] == 1
         assert stats["index_dependency_hits"] == 1
         assert stats["graph_error"] == 0
+        # P6 不再收集“谁 import 了变更模块”。
+        assert "index_importer_hits" not in stats
     finally:
         index.close()
 
@@ -233,11 +230,11 @@ def test_callees_of_escapes_like_wildcards(tmp_path: Path):
         index.close()
 
 
-def test_call_graph_failure_does_not_drop_import_contexts(tmp_path: Path):
+def test_call_graph_failure_does_not_drop_dependency_contexts(tmp_path: Path):
     root = tmp_path / "repo"
     (root / "pkg").mkdir(parents=True)
-    (root / "pkg" / "api.py").write_text(
-        "from pkg.auth import AuthService\n",
+    (root / "pkg" / "models.py").write_text(
+        "class User:\n    pass\n",
         encoding="utf-8",
     )
 
@@ -248,18 +245,17 @@ def test_call_graph_failure_does_not_drop_import_contexts(tmp_path: Path):
         def callees_of(self, *_args, **_kwargs):
             raise RuntimeError("call graph unavailable")
 
-        def importers_of(self, *_args, **_kwargs):
+        def definitions_in_modules(self, *_args, **_kwargs):
             return [
-                ImportEdge(
-                    src_file="pkg/api.py",
-                    dst_module="pkg.auth",
-                    symbol="AuthService",
-                    line=1,
+                IndexedSymbol(
+                    name="User",
+                    qualname="User",
+                    kind="class_definition",
+                    file_path="pkg/models.py",
+                    start_line=1,
+                    end_line=2,
                 )
             ]
-
-        def definitions_in_modules(self, *_args, **_kwargs):
-            return []
 
     stats: dict[str, float] = {}
     contexts = GraphRetriever().retrieve(
@@ -268,12 +264,13 @@ def test_call_graph_failure_does_not_drop_import_contexts(tmp_path: Path):
         RetrievalQuery(
             symbols=["login"],
             modules=["pkg.auth"],
+            imports=["pkg.models"],
             signature_changed_symbols=["login"],
         ),
         stats=stats,
     )
 
-    assert any(context.kind == "import" for context in contexts)
+    assert any(context.kind == "dependency" for context in contexts)
     assert stats["graph_error"] == 2
 
 
@@ -395,5 +392,70 @@ def test_callee_contexts_ignore_stdlib_and_third_party_calls(tmp_path: Path):
             context.kind == "callee" and context.symbol == "loads"
             for context in contexts
         )
+    finally:
+        index.close()
+
+
+def test_short_private_helper_expands_full_body(tmp_path: Path):
+    root = tmp_path / "repo"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "api.py").write_text(
+        "def _short(x):\n"
+        "    return x + 1\n"
+        "\n"
+        "def get_user():\n"
+        "    return _short(1)\n",
+        encoding="utf-8",
+    )
+    _init_repo(root)
+
+    index = RepoIndex.for_worktree(root, cache_dir=tmp_path / "idx")
+    try:
+        contexts = GraphRetriever().retrieve(
+            root,
+            index,
+            RetrievalQuery(symbols=["get_user"], files=["pkg/api.py"]),
+        )
+        callee = next(
+            context for context in contexts if context.kind == "callee"
+        )
+
+        assert callee.symbol == "_short"
+        assert "return x + 1" in callee.snippet
+        assert "full body" in callee.reason
+    finally:
+        index.close()
+
+
+def test_long_private_helper_keeps_signature_only(tmp_path: Path):
+    root = tmp_path / "repo"
+    (root / "pkg").mkdir(parents=True)
+    body = "".join(f"    value += {index}\n" for index in range(30))
+    (root / "pkg" / "api.py").write_text(
+        "def _long(value):\n"
+        f"{body}"
+        "    return value\n"
+        "\n"
+        "def get_user():\n"
+        "    return _long(1)\n",
+        encoding="utf-8",
+    )
+    _init_repo(root)
+
+    index = RepoIndex.for_worktree(root, cache_dir=tmp_path / "idx")
+    try:
+        contexts = GraphRetriever().retrieve(
+            root,
+            index,
+            RetrievalQuery(symbols=["get_user"], files=["pkg/api.py"]),
+        )
+        callee = next(
+            context for context in contexts if context.kind == "callee"
+        )
+
+        assert callee.symbol == "_long"
+        assert "def _long(value):" in callee.snippet
+        assert "value += 0" not in callee.snippet
+        assert "signature" in callee.reason
     finally:
         index.close()
