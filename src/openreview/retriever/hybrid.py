@@ -31,7 +31,7 @@ from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
 
 logger = logging.getLogger(__name__)
 
-MAX_HYBRID_CONTEXTS = 24
+MAX_HYBRID_CONTEXTS = 64
 MAX_SYMBOL_CONTEXTS = 12
 
 
@@ -243,6 +243,7 @@ class HybridRetriever:
                     snippet=snippet,
                     score=score,
                     kind=kind,
+                    priority=6,
                     symbol=symbol.name,
                     start_line=symbol.start_line,
                     end_line=symbol.end_line,
@@ -270,7 +271,9 @@ def _rank_and_dedupe(
     区分“本来就没检索到”和“检索到了但被 cap 丢掉”，为后续补证提供依据。
     """
     deduped = dedupe_contexts(contexts)
-    ranked = sorted(deduped, key=lambda item: item.score, reverse=True)
+    ranked = sorted(
+        deduped, key=lambda item: (item.priority, -item.score)
+    )
     if stats is not None:
         stats["contexts_candidates"] = len(contexts)
         stats["contexts_deduped"] = len(contexts) - len(deduped)

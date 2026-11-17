@@ -86,6 +86,9 @@ class ParsedChangedFile(BaseModel):
     deleted_lines: List[int] = Field(default_factory=list)
     # 旧文件侧可见的行号（删除行 + 上下文行）
     old_visible_lines: List[int] = Field(default_factory=list)
+    # 当前 diff 是否修改了方法/类的签名或返回值注解，用于决定是否注入 caller 上下文
+    signature_changed: bool = False
+    signature_changed_symbols: List[str] = Field(default_factory=list)
 
 
 class ParsedDiff(BaseModel):
@@ -210,6 +213,56 @@ class DiffParser:
                         _append_unique(target, match.group(1))
 
         return added, removed, contexts
+
+    @classmethod
+    def extract_signature_changes(
+        cls, patch: Optional[str], language: Optional[str]
+    ) -> tuple[bool, List[str]]:
+        """判断 patch 是否修改了函数/类的签名或返回值注解。
+
+        这里只做文本级比较：把 ``-def`` 与 ``+def`` 按符号名配对，归一化
+        空白后比较整行。它能覆盖参数、默认值、返回注解和 ``async`` 的改动，
+        成本远低于对 base/head 两侧做完整 AST 比对；多行签名会退化为逐行
+        比较，可能漏掉“只在续行里改参数”的极端情况，但不会误报。
+        """
+        if not patch:
+            return False, []
+
+        patterns = SYMBOL_PATTERNS.get(language, []) if language else []
+        if not patterns:
+            return False, []
+
+        removed: dict[str, List[str]] = {}
+        added: dict[str, List[str]] = {}
+
+        for raw_line in patch.splitlines():
+            if raw_line.startswith(("+++", "---")):
+                continue
+            if not raw_line.startswith(("+", "-")):
+                continue
+            content = raw_line[1:]
+            for pattern in patterns:
+                match = pattern.search(content)
+                if not match:
+                    continue
+                name = match.group(1)
+                normalized = " ".join(content.split())
+                target = added if raw_line.startswith("+") else removed
+                target.setdefault(name, []).append(normalized)
+                break
+
+        changed: List[str] = []
+        for name in sorted(set(removed) | set(added)):
+            before = removed.get(name, [])
+            after = added.get(name, [])
+            if before and after:
+                if before != after:
+                    changed.append(name)
+            elif before:
+                # 方法被删除：调用方必然需要重新检查。
+                changed.append(name)
+            # 新增方法没有旧签名，不存在“签名变更”。
+        return bool(changed), changed
 
     @staticmethod
     def extract_changed_lines(patch: Optional[str]) -> List[int]:
@@ -364,6 +417,9 @@ class DiffParser:
         visible_lines = cls.extract_visible_lines(patch)
         deleted_lines = cls.extract_deleted_lines(patch)
         old_visible_lines = cls.extract_old_visible_lines(patch)
+        signature_changed, signature_changed_symbols = cls.extract_signature_changes(
+            patch, file.language
+        )
         # 只统计 hunk 内的行；hunk 之前的 `---` / `+++` 是文件头，不是变更。
         # 不能用 `startswith("+++")` 判断，因为内容以 `++` 开头的真实新增行
         # 在 patch 里也会显示成 `+++...`。
@@ -392,6 +448,8 @@ class DiffParser:
                 "visible_lines": visible_lines,
                 "deleted_lines": deleted_lines,
                 "old_visible_lines": old_visible_lines,
+                "signature_changed": signature_changed,
+                "signature_changed_symbols": signature_changed_symbols,
             }
         )
 
@@ -425,6 +483,9 @@ class DiffParser:
         visible_lines = cls.extract_visible_lines(patch)
         deleted_lines = cls.extract_deleted_lines(patch)
         old_visible_lines = cls.extract_old_visible_lines(patch)
+        signature_changed, signature_changed_symbols = cls.extract_signature_changes(
+            patch, language
+        )
 
         return ParsedChangedFile(
             filename=filename,
@@ -443,6 +504,8 @@ class DiffParser:
             visible_lines=visible_lines,
             deleted_lines=deleted_lines,
             old_visible_lines=old_visible_lines,
+            signature_changed=signature_changed,
+            signature_changed_symbols=signature_changed_symbols,
         )
 
     @classmethod

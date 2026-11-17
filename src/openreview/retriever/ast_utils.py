@@ -116,6 +116,28 @@ def definition_qualname(node: Node, source: bytes) -> str:
     return ".".join(reversed(parts))
 
 
+def definition_doc(node: Node, source: bytes) -> str:
+    """读取 Python 定义的第一段 docstring；Go 暂不支持。"""
+    body = node.child_by_field_name("body")
+    if body is None and node.type == "class_definition":
+        body = node.child_by_field_name("body")
+    if body is None:
+        return ""
+    for child in body.children:
+        if child.type in {"comment"}:
+            continue
+        if child.type != "expression_statement":
+            return ""
+        for item in child.children:
+            if item.type in {"string", "concatenated_string"}:
+                raw = source[item.start_byte : item.end_byte].decode(
+                    "utf-8", "ignore"
+                )
+                return raw.strip().strip("\"'")[:500]
+        return ""
+    return ""
+
+
 def node_text(node: Node, source: bytes) -> str:
     return source[node.start_byte : node.end_byte].decode("utf-8", "ignore")
 
@@ -127,12 +149,12 @@ def node_span(node: Node) -> Tuple[int, int]:
 
 def iter_definitions(
     tree: Tree, source: bytes
-) -> List[Tuple[str, str, str, int, int]]:
-    """遍历所有定义，返回 (name, qualname, kind, start_line, end_line)。
+) -> List[Tuple[str, str, str, int, int, str]]:
+    """遍历所有定义，返回 (name, qualname, kind, start_line, end_line, doc)。
 
     line 使用 1-based，方便直接写进数据库和报告。
     """
-    result: List[Tuple[str, str, str, int, int]] = []
+    result: List[Tuple[str, str, str, int, int, str]] = []
     stack: List[Node] = [tree.root_node]
     while stack:
         node = stack.pop()
@@ -147,6 +169,7 @@ def iter_definitions(
                         node.type,
                         start_line + 1,
                         end_line + 1,
+                        definition_doc(node, source),
                     )
                 )
         stack.extend(node.children)

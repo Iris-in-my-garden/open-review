@@ -30,7 +30,8 @@ from openreview.repo.local import (
     prepare_local_workspace,
 )
 from openreview.repo.manager import RepoCommandError
-from openreview.retriever.code_context import context_identity, dedupe_contexts
+from openreview.retriever.code_context import context_identity
+from openreview.retriever.context_planner import plan_contexts
 from openreview.review.cache import ReviewCache
 from openreview.review.comment_builder import (
     build_review_body,
@@ -488,7 +489,11 @@ class ReviewExecutor:
                         include_global_impact=index == 1,
                     )
                 )
-                contexts = dedupe_contexts(contexts)
+                contexts = plan_contexts(
+                    contexts,
+                    self.config.max_context_tokens,
+                    stats=state.retrieval_stats,
+                )
                 state.context_stats["batch_context_occurrences"] = (
                     state.context_stats.get("batch_context_occurrences", 0)
                     + len(contexts)
@@ -686,12 +691,18 @@ class ReviewExecutor:
             return {}
         recorded = {
             "prompt_contexts_used": int(stats.get("used_contexts", 0)),
-            "prompt_contexts_omitted": int(stats.get("omitted_contexts", 0)),
+            "prompt_contexts_omitted": int(stats.get("omitted_contexts", 0))
+            + int(state.retrieval_stats.get("contexts_omitted_by_priority", 0)),
             "prompt_context_used_tokens": int(
                 stats.get("used_context_tokens", 0)
             ),
             "prompt_context_omitted_tokens": int(
                 stats.get("omitted_context_tokens", 0)
+            )
+            + int(
+                state.retrieval_stats.get(
+                    "context_tokens_omitted_by_priority", 0
+                )
             ),
         }
         state.context_stats.update(recorded)

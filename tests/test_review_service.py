@@ -12,7 +12,6 @@ from openreview.review.single_shot import SingleShotReviewer
 from openreview.review.token_budget import (
     DEFAULT_HARD_PROMPT_TOKENS,
     DEFAULT_SOFT_PROMPT_TOKENS,
-    context_reserve_tokens_for,
 )
 from openreview.review.workflow import ReviewStatus
 from openreview.services.review_executor import ReviewExecutor
@@ -477,7 +476,10 @@ def test_pipeline_surfaces_retrieval_metrics_and_context_refs(tmp_path: Path):
         "src/file_1.py",
     ]
     assert retrieval["context_kinds"] == {"definition": 2}
-    assert retrieval["stats"] == {"index_symbol_hits": 2}
+    assert retrieval["stats"]["index_symbol_hits"] == 2
+    assert retrieval["stats"]["contexts_by_priority"] == 2
+    assert retrieval["stats"]["context_tokens_remaining"] > 0
+    assert retrieval["context_priorities"] == {"P6": 2}
     assert retrieval["symbol_coverage"] == 1.0
 
     # context_refs 从 prompt 上下文 -> finding -> validator -> result 全链路保留。
@@ -850,11 +852,10 @@ def test_review_cache_key_includes_output_affecting_config(tmp_path: Path):
 def test_pipeline_derives_effective_prompt_caps_internally():
     pipeline = ReviewPipeline(mock_llm=True)
     try:
-        # 外部传入的 max_patch/context 只是硬上限；真正的预算由内部策略决定。
-        assert pipeline.config.max_patch_tokens == DEFAULT_HARD_PROMPT_TOKENS
-        assert pipeline.config.max_context_tokens == context_reserve_tokens_for(
-            DEFAULT_SOFT_PROMPT_TOKENS
-        )
+        # Diff 与 P2-P5 各自独立预算；48k 只做单个超大文件的硬熔断。
+        assert pipeline.config.max_patch_tokens == 8192
+        assert pipeline.config.max_context_tokens == 8192
+        assert pipeline.config.hard_patch_tokens == 48_000
         assert pipeline.config.soft_prompt_tokens == DEFAULT_SOFT_PROMPT_TOKENS
         assert pipeline.config.hard_prompt_tokens == DEFAULT_HARD_PROMPT_TOKENS
     finally:

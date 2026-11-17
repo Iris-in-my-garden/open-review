@@ -72,6 +72,52 @@ def test_hybrid_related_files_links_imports_and_tests(tmp_path: Path):
     assert "tests/test_auth.py" in related["pkg/auth.py"]
 
 
+def test_repo_index_migrates_v1_schema_columns(tmp_path: Path):
+    """旧缓存库没有 doc / callee_qualifier，打开时不能直接崩。"""
+    import sqlite3
+
+    db_path = tmp_path / "v1.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE symbols (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            qualname TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            signature TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            caller_file TEXT NOT NULL,
+            caller_symbol TEXT NOT NULL DEFAULT '',
+            callee_name TEXT NOT NULL,
+            line INTEGER NOT NULL
+        );
+        """
+    )
+    conn.close()
+
+    index = RepoIndex(db_path)
+    try:
+        symbol_columns = {
+            row["name"]
+            for row in index._conn.execute("PRAGMA table_info(symbols)")
+        }
+        call_columns = {
+            row["name"]
+            for row in index._conn.execute("PRAGMA table_info(calls)")
+        }
+        assert "doc" in symbol_columns
+        assert "callee_qualifier" in call_columns
+    finally:
+        index.close()
+
+
 def test_repo_index_builds_symbols_imports_and_search(tmp_path: Path):
     root = tmp_path / "repo"
     root.mkdir()

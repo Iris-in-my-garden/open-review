@@ -91,8 +91,8 @@ class PromptBuilder:
     def __init__(
         self,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-        max_patch_tokens: int = 48000,
-        max_context_tokens: int = 16000,
+        max_patch_tokens: int = 8192,
+        max_context_tokens: int = 8192,
     ):
         self.system_prompt = system_prompt
         self.max_patch_tokens = max_patch_tokens
@@ -244,13 +244,15 @@ class PromptBuilder:
     @staticmethod
     def _render_context(ctx: CodeContext) -> str:
         context_id = ctx.ensure_context_id()
-        meta = [f"Kind: {ctx.kind}"]
+        meta = [f"Priority: P{ctx.priority}", f"Kind: {ctx.kind}"]
         if ctx.symbol:
             meta.append(f"Symbol: {ctx.symbol}")
         if ctx.start_line is not None and ctx.end_line is not None:
             meta.append(f"Lines: {ctx.start_line}-{ctx.end_line}")
         if ctx.revision:
             meta.append(f"Revision: {ctx.revision}")
+        if ctx.folded:
+            meta.append("Folded: true (changed lines preserved)")
         meta.append(f"Score: {ctx.score}")
         return (
             f"### [{context_id}] File: {ctx.file_path} "
@@ -277,32 +279,13 @@ class PromptBuilder:
         omitted_tokens = 0
         used = 0
         used_tokens = 0
-        ordered = sorted(contexts, key=lambda item: item.score, reverse=True)
+        # 严格按 priority 填充：P2 enclosing > P3 callee > P4 caller > P5 field
+        # > P6 其他。planner 已经做过一次预算，这里是渲染层的最终兜底。
+        ordered = sorted(
+            contexts, key=lambda item: (item.priority, -item.score)
+        )
 
-        # 先为每个变更文件保留至少一段上下文，避免全局按分数排序时
-        # 一个大文件的高分片段把小文件的上下文全部挤掉。
-        reserved: set[int] = set()
-        per_file_count: Dict[str, int] = {}
-        for filename in block_order:
-            for ctx in ordered:
-                if ctx.file_path != filename or id(ctx) in reserved:
-                    continue
-                rendered = self._render_context(ctx)
-                cost = estimate_tokens(rendered) + 20
-                if cost > remaining:
-                    continue
-                remaining -= cost
-                by_file.setdefault(filename, []).append(rendered)
-                per_file_count[filename] = per_file_count.get(filename, 0) + 1
-                reserved.add(id(ctx))
-                used += 1
-                used_tokens += cost
-                break
-
-        max_per_file = max(2, min(8, len(ordered)))
         for ctx in ordered:
-            if id(ctx) in reserved:
-                continue
             rendered = self._render_context(ctx)
             cost = estimate_tokens(rendered) + 20
             if cost > remaining:
@@ -310,14 +293,7 @@ class PromptBuilder:
                 omitted_tokens += cost
                 continue
             if ctx.file_path in block_files:
-                if per_file_count.get(ctx.file_path, 0) >= max_per_file:
-                    omitted += 1
-                    omitted_tokens += cost
-                    continue
                 by_file.setdefault(ctx.file_path, []).append(rendered)
-                per_file_count[ctx.file_path] = (
-                    per_file_count.get(ctx.file_path, 0) + 1
-                )
             else:
                 other_blocks.append(rendered)
             remaining -= cost

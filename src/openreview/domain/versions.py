@@ -10,11 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
 
-PROMPT_VERSION = "review-v6"
+PROMPT_VERSION = "review-v7"
 VALIDATOR_VERSION = "validator-v2"
-RETRIEVER_VERSION = "hybrid-v3"
-REVIEW_CACHE_SCHEMA_VERSION = 2
-METRICS_SCHEMA_VERSION = 3
+RETRIEVER_VERSION = "hybrid-v4"
+REVIEW_CACHE_SCHEMA_VERSION = 3
+METRICS_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)

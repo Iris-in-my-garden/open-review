@@ -46,6 +46,14 @@ class CodeContext(BaseModel):
     start_line: Optional[int] = None
     end_line: Optional[int] = None
 
+    # 上下文扩展优先级：1=Diff，2=变更方法，3=Callee 签名，4=Caller 调用点，
+    # 5=类/文件级字段，6=其他补充证据（impact/static/reference/test）。
+    priority: int = 6
+    # 是否做过 AST 分支折叠；折叠时 changed lines 必须被保留。
+    folded: bool = False
+    # 装配时计算的估算成本，便于 metrics / 调试。
+    token_cost: int = 0
+
     def ensure_context_id(self) -> str:
         if not self.context_id:
             self.context_id = make_context_id(
@@ -101,6 +109,11 @@ def dedupe_contexts(
         if existing is None:
             best[key] = context
             order.append(key)
-        elif context.score > existing.score:
+        elif (context.priority, -context.score) < (
+            existing.priority,
+            -existing.score,
+        ):
+            # 同一代码范围优先保留更高优先级的证据（如 P4 调用点胜过
+            # P6 import 行），优先级相同时再比较 score。
             best[key] = context
     return [best[key] for key in order]

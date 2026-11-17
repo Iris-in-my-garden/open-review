@@ -66,7 +66,7 @@ def review(
         help="Post findings back to the PR as GitHub inline review comments",
     ),
     max_batch_tokens: int = typer.Option(
-        60000,
+        12000,
         "--max-batch-tokens",
         help=(
             "Optional extra upper bound on estimated patch tokens per batch; "

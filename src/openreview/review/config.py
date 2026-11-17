@@ -50,9 +50,12 @@ class ReviewConfig:
     max_completion_tokens: int = 2048
 
     # batching 与 prompt 预算
-    max_batch_tokens: int = 60000
-    max_patch_tokens: int = 48000
-    max_context_tokens: int = 16000
+    # 单批原始 Diff 目标 8k；硬熔断 48k 只用于无法继续拆分的单个超大 hunk。
+    max_batch_tokens: int = 12000
+    max_patch_tokens: int = 8192
+    hard_patch_tokens: int = 48000
+    # P2-P5 共享的上下文扩展预算。
+    max_context_tokens: int = 8192
     # 内部 prompt 预算策略（不暴露 CLI）：
     # soft 用于把超限内容打包成多个调用，hard 是触发拆分的上限。
     soft_prompt_tokens: int = DEFAULT_SOFT_PROMPT_TOKENS
@@ -156,6 +159,7 @@ class ReviewConfig:
             f"graph={int(self.graph_retrieval_enabled)}",
             f"max_batch_tokens={self.max_batch_tokens}",
             f"max_patch_tokens={self.max_patch_tokens}",
+            f"hard_patch_tokens={self.hard_patch_tokens}",
             f"max_context_tokens={self.max_context_tokens}",
             f"soft_prompt_tokens={self.soft_prompt_tokens}",
             f"hard_prompt_tokens={self.hard_prompt_tokens}",

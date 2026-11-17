@@ -48,8 +48,18 @@ class MetricsCollector:
         covered_files = changed_files & context_files
         context_ids = {context.ensure_context_id() for context in state.all_contexts}
         context_kinds: Dict[str, int] = {}
+        priority_counts: Dict[str, int] = {}
+        priority_tokens: Dict[str, int] = {}
+        folded_contexts = 0
         for context in state.all_contexts:
             context_kinds[context.kind] = context_kinds.get(context.kind, 0) + 1
+            key = f"P{context.priority}"
+            priority_counts[key] = priority_counts.get(key, 0) + 1
+            priority_tokens[key] = priority_tokens.get(key, 0) + estimate_tokens(
+                context.snippet
+            )
+            if context.folded:
+                folded_contexts += 1
         changed_symbols = {
             symbol
             for file in diff_files
@@ -117,6 +127,9 @@ class MetricsCollector:
                 "unique_contexts": len(context_ids),
                 "duplicate_contexts": len(state.all_contexts) - len(context_ids),
                 "context_kinds": context_kinds,
+                "context_priorities": priority_counts,
+                "context_tokens_by_priority": priority_tokens,
+                "folded_contexts": folded_contexts,
                 "changed_symbols": len(changed_symbols),
                 "retrieved_symbols": len(retrieved_symbols),
                 "symbol_coverage": (

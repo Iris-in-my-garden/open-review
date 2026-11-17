@@ -6,6 +6,7 @@
 
 import math
 import re
+from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional
 
 from openreview.repo.diff_parser import (
@@ -152,29 +153,33 @@ def _group_hunks_by_symbol(hunks: List[str]) -> List[List[str]]:
 def _slice_oversized_hunk(
     file_diff: ParsedChangedFile,
     hunk: str,
-    patch_soft: int,
+    patch_hard: int,
 ) -> ParsedChangedFile:
-    """单个 hunk 仍超预算时截断，保证不会生成无限大的单次调用。"""
-    truncated, _ = truncate_to_tokens(hunk, max(1, patch_soft - 40))
+    """单个 hunk 连硬熔断阈值都超过时截断，保证不会生成无限大的单次调用。"""
+    truncated, _ = truncate_to_tokens(hunk, max(1, patch_hard - 40))
     return DiffParser.slice_changed_file(file_diff, [truncated])
 
 
 def _file_to_units(
     file_diff: ParsedChangedFile,
     patch_soft: int,
+    patch_hard: int | None = None,
 ) -> List[ParsedChangedFile]:
-    """把一个文件拆成尽量大的、语义连续的 review unit。"""
+    """把一个文件拆成尽量大的、语义连续的 review unit。
+
+    ``patch_soft`` 是单批目标；``patch_hard`` 是单个超大 hunk 的熔断阈值。
+    介于两者之间的 hunk 会独占一个 unit，而不是被截断，避免破坏语义。
+    """
+    hard = patch_hard if patch_hard is not None else patch_soft
     if not file_diff.patch or file_patch_cost(file_diff) <= patch_soft:
         return [file_diff]
 
     hunks = DiffParser.split_patch_into_hunks(file_diff.patch)
     if len(hunks) <= 1:
-        # 单个 hunk 无法再按语义切分，只能截断。
-        return [
-            _slice_oversized_hunk(file_diff, hunks[0], patch_soft)
-            if hunks
-            else file_diff
-        ]
+        hunk = hunks[0] if hunks else file_diff.patch
+        if estimate_tokens(hunk) + 40 <= hard:
+            return [file_diff]
+        return [_slice_oversized_hunk(file_diff, hunk, hard)]
 
     units: List[ParsedChangedFile] = []
     for group in _group_hunks_by_symbol(hunks):
@@ -183,14 +188,14 @@ def _file_to_units(
             units.append(DiffParser.slice_changed_file(file_diff, group))
             continue
 
-        # 同一个符号仍然太大，退化为逐个 hunk；单个 hunk 过大再截断。
+        # 同一符号的 group 仍超软预算：先拆 hunk；单个 hunk 低于硬熔断时
+        # 保留完整 hunk，只有超过硬阈值才截断。
         for hunk in group:
-            if estimate_tokens(hunk) + 40 <= patch_soft:
+            hunk_cost = estimate_tokens(hunk) + 40
+            if hunk_cost <= patch_soft or hunk_cost <= hard:
                 units.append(DiffParser.slice_changed_file(file_diff, [hunk]))
             else:
-                units.append(
-                    _slice_oversized_hunk(file_diff, hunk, patch_soft)
-                )
+                units.append(_slice_oversized_hunk(file_diff, hunk, hard))
     return units
 
 
@@ -229,7 +234,12 @@ def _order_units_by_dependency(
     同一文件的所有 hunk unit 共享同一个分量，因此文件内部顺序不变。
     """
     if not dependencies:
-        return units
+        # 没有 import/test 关系时，退化为“同目录文件相邻”：目录通常代表
+        # 同一模块边界，和 2~4 个紧密关联文件同批的目标一致。
+        return sorted(
+            units,
+            key=lambda unit: (str(Path(unit.filename).parent), unit.filename),
+        )
 
     parent: Dict[str, str] = {}
 
@@ -301,15 +311,17 @@ def plan_review_batches(
     prompt_overhead_tokens: int = PROMPT_OVERHEAD_TOKENS,
     context_reserve_tokens: int | None = None,
     dependencies: Optional[Mapping[str, Iterable[str]]] = None,
+    patch_soft_tokens: int | None = None,
+    patch_hard_tokens: int | None = None,
 ) -> List[ParsedDiff]:
     """按最终 prompt 预算规划 review batch。
 
     策略：
 
-    - 总 patch 成本 <= ``patch_hard`` 时**不拆**，保留完整上下文；
-    - 超过 ``patch_hard`` 才拆，并尽量按 ``patch_soft`` 把 bin 装到接近上限；
+    - 总 patch 成本 <= ``patch_soft`` 时**不拆**，保留完整上下文；
+    - 超过 ``patch_soft`` 才拆，并尽量把 bin 装到接近上限；
     - 文件过大时先按 hunk / 符号切片，保持语义连续；
-    - ``max_batch_tokens`` 作为外部硬上限（兼容旧调用），只能让 batch 更小；
+    - ``patch_hard_tokens`` 是单个无法再拆分的 hunk 的硬熔断阈值；
     - ``dependencies`` 描述文件之间的依赖（import / 测试关联），用于把相关
       文件尽量排进同一批次。
     """
@@ -318,31 +330,44 @@ def plan_review_batches(
     if soft_prompt_tokens <= 0 or hard_prompt_tokens <= 0:
         return split_parsed_diff(parsed_diff, max_batch_tokens)
 
-    if context_reserve_tokens is None:
-        context_reserve_tokens = context_reserve_tokens_for(
-            soft_prompt_tokens
+    if patch_soft_tokens is not None:
+        patch_soft = max(1, patch_soft_tokens)
+    else:
+        if context_reserve_tokens is None:
+            context_reserve_tokens = context_reserve_tokens_for(
+                soft_prompt_tokens
+            )
+        patch_soft = max(
+            1,
+            soft_prompt_tokens - prompt_overhead_tokens - context_reserve_tokens,
         )
 
-    patch_soft = max(
-        1,
-        soft_prompt_tokens - prompt_overhead_tokens - context_reserve_tokens,
-    )
-    patch_hard = max(
-        1,
-        hard_prompt_tokens - prompt_overhead_tokens - context_reserve_tokens,
-    )
+    if patch_hard_tokens is not None:
+        patch_hard = max(patch_soft, patch_hard_tokens)
+    else:
+        hard_reserve = (
+            context_reserve_tokens
+            if context_reserve_tokens is not None
+            else context_reserve_tokens_for(soft_prompt_tokens)
+        )
+        patch_hard = max(
+            1,
+            hard_prompt_tokens - prompt_overhead_tokens - hard_reserve,
+        )
+
     if max_batch_tokens > 0:
+        # max_batch_tokens 是正常分批的外部上限，只约束软预算；硬熔断
+        # 仍然由 patch_hard_tokens 决定，否则 48k 永远不可达。
         patch_soft = min(patch_soft, max_batch_tokens)
-        patch_hard = min(patch_hard, max_batch_tokens)
     patch_soft = min(patch_soft, patch_hard)
 
     total_cost = sum(file_patch_cost(f) for f in parsed_diff.files)
-    if total_cost <= patch_hard:
+    if total_cost <= patch_soft:
         return [parsed_diff]
 
     units: List[ParsedChangedFile] = []
     for file_diff in parsed_diff.files:
-        units.extend(_file_to_units(file_diff, patch_soft))
+        units.extend(_file_to_units(file_diff, patch_soft, patch_hard))
     if not units:
         return [parsed_diff]
 

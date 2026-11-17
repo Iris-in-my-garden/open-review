@@ -56,6 +56,7 @@ def _query() -> RetrievalQuery:
         modules=["pkg.auth"],
         imports=["pkg.models"],
         terms=["login"],
+        signature_changed_symbols=["login"],
     )
 
 
@@ -152,7 +153,11 @@ def test_caller_contexts_dedupe_multiple_call_sites(tmp_path: Path):
         contexts = GraphRetriever(max_callers=8).retrieve(
             root,
             index,
-            RetrievalQuery(symbols=["login"], files=["pkg/auth.py"]),
+            RetrievalQuery(
+                symbols=["login"],
+                files=["pkg/auth.py"],
+                signature_changed_symbols=["login"],
+            ),
             stats=stats,
         )
 
@@ -260,7 +265,11 @@ def test_call_graph_failure_does_not_drop_import_contexts(tmp_path: Path):
     contexts = GraphRetriever().retrieve(
         root,
         BrokenCallGraphIndex(),  # type: ignore[arg-type]
-        RetrievalQuery(symbols=["login"], modules=["pkg.auth"]),
+        RetrievalQuery(
+            symbols=["login"],
+            modules=["pkg.auth"],
+            signature_changed_symbols=["login"],
+        ),
         stats=stats,
     )
 
@@ -333,3 +342,58 @@ def test_context_dedupe_uses_range_identity_across_kinds():
     assert len(deduped) == 2
     assert deduped[0].kind == "enclosing"
     assert deduped[0].score == 0.95
+
+
+def test_caller_contexts_only_emitted_for_signature_changes(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_repo(root)
+    _init_repo(root)
+
+    index = RepoIndex.for_worktree(root, cache_dir=tmp_path / "idx")
+    try:
+        contexts = GraphRetriever().retrieve(
+            root,
+            index,
+            RetrievalQuery(symbols=["login"], files=["pkg/auth.py"]),
+        )
+
+        # 只改函数体时，调用点不是证据，不应注入 caller 上下文。
+        assert not any(context.kind == "caller" for context in contexts)
+    finally:
+        index.close()
+
+
+def test_callee_contexts_ignore_stdlib_and_third_party_calls(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "pkg").mkdir()
+    # 仓库里存在同名定义，但调用方 import 的是标准库 json，不能误匹配。
+    (root / "pkg" / "other.py").write_text(
+        "def loads(payload):\n"
+        "    return payload\n",
+        encoding="utf-8",
+    )
+    (root / "pkg" / "api.py").write_text(
+        "import json\n"
+        "\n"
+        "def parse(payload):\n"
+        "    return json.loads(payload)\n",
+        encoding="utf-8",
+    )
+    _init_repo(root)
+
+    index = RepoIndex.for_worktree(root, cache_dir=tmp_path / "idx")
+    try:
+        contexts = GraphRetriever().retrieve(
+            root,
+            index,
+            RetrievalQuery(symbols=["parse"], files=["pkg/api.py"]),
+        )
+
+        assert not any(
+            context.kind == "callee" and context.symbol == "loads"
+            for context in contexts
+        )
+    finally:
+        index.close()

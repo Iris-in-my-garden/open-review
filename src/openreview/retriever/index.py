@@ -35,7 +35,7 @@ from openreview.retriever.pathing import is_source_file
 
 logger = logging.getLogger(__name__)
 
-INDEX_SCHEMA_VERSION = "1"
+INDEX_SCHEMA_VERSION = "2"
 MAX_INDEXED_FILE_SIZE = 500 * 1024
 MAX_INDEXED_FILES = 20000
 SUPPORTED_SUFFIXES = {".py", ".go"}
@@ -75,6 +75,7 @@ class IndexedSymbol:
     start_line: int
     end_line: int
     signature: str = ""
+    doc: str = ""
     score: float = 0.0
 
 
@@ -92,6 +93,7 @@ class CallEdge:
     caller_symbol: str
     callee_name: str
     line: int
+    callee_qualifier: str = ""
 
 
 class RepoIndex:
@@ -189,12 +191,36 @@ class RepoIndex:
                 caller_file TEXT NOT NULL,
                 caller_symbol TEXT NOT NULL DEFAULT '',
                 callee_name TEXT NOT NULL,
+                callee_qualifier TEXT NOT NULL DEFAULT '',
                 line INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller_file);
             CREATE INDEX IF NOT EXISTS idx_calls_callee ON calls(callee_name);
             """
         )
+
+        # v1 -> v2：旧索引的 calls 表没有 qualifier，用于过滤标准库/第三方
+        # 调用。schema version 会触发重建，但这里仍做一次兼容迁移，避免
+        # 用户在一个已存在的缓存库上直接崩溃。
+        call_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(calls)").fetchall()
+        }
+        if "callee_qualifier" not in call_columns:
+            self._conn.execute(
+                "ALTER TABLE calls ADD COLUMN callee_qualifier TEXT NOT NULL DEFAULT ''"
+            )
+
+        # 同理，v1 的 symbols 表没有 doc；schema bump 会触发重建，但重建只
+        # 重新 INSERT，不会自动加列。
+        symbol_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(symbols)").fetchall()
+        }
+        if "doc" not in symbol_columns:
+            self._conn.execute(
+                "ALTER TABLE symbols ADD COLUMN doc TEXT NOT NULL DEFAULT ''"
+            )
 
         try:
             self._conn.executescript(
@@ -343,21 +369,21 @@ class RepoIndex:
     ) -> None:
         suffix = Path(rel_path).suffix
         parsed = ast_utils.parse_text(text, suffix)
-        symbols: List[Tuple[str, str, str, int, int, str]] = []
+        symbols: List[Tuple[str, str, str, int, int, str, str]] = []
         imports: List[Tuple[str, str, int]] = []
-        calls: List[Tuple[str, str, int]] = []
+        calls: List[Tuple[str, str, str, int]] = []
 
         if parsed is not None:
             _, source, tree = parsed
             lines = text.splitlines()
-            for name, qualname, kind, start_line, end_line in ast_utils.iter_definitions(
+            for name, qualname, kind, start_line, end_line, doc in ast_utils.iter_definitions(
                 tree, source
             ):
                 signature = ""
                 if 0 < start_line <= len(lines):
                     signature = lines[start_line - 1].strip()[:240]
                 symbols.append(
-                    (name, qualname, kind, start_line, end_line, signature)
+                    (name, qualname, kind, start_line, end_line, signature, doc)
                 )
 
             if suffix == ".py":
@@ -367,12 +393,12 @@ class RepoIndex:
 
         self._conn.executemany(
             """
-            INSERT INTO symbols(name, qualname, kind, file_path, start_line, end_line, signature)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO symbols(name, qualname, kind, file_path, start_line, end_line, signature, doc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                (name, qualname, kind, rel_path, start_line, end_line, signature)
-                for name, qualname, kind, start_line, end_line, signature in symbols
+                (name, qualname, kind, rel_path, start_line, end_line, signature, doc)
+                for name, qualname, kind, start_line, end_line, signature, doc in symbols
             ],
         )
         self._conn.executemany(
@@ -381,8 +407,14 @@ class RepoIndex:
         )
         # calls 里 caller_symbol 在 _python/_go 提取时已经算好。
         self._conn.executemany(
-            "INSERT INTO calls(caller_file, caller_symbol, callee_name, line) VALUES (?, ?, ?, ?)",
-            [(rel_path, caller, callee, line) for caller, callee, line in calls],
+            """
+            INSERT INTO calls(caller_file, caller_symbol, callee_name, callee_qualifier, line)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (rel_path, caller, callee, qualifier, line)
+                for caller, callee, qualifier, line in calls
+            ],
         )
         self._conn.execute(
             """
@@ -593,8 +625,8 @@ class RepoIndex:
             return []
         placeholders = ",".join("?" for _ in cleaned)
         rows = self._conn.execute(
-            f"SELECT caller_file, caller_symbol, callee_name, line FROM calls "
-            f"WHERE callee_name IN ({placeholders}) LIMIT ?",
+            f"SELECT caller_file, caller_symbol, callee_name, callee_qualifier, line "
+            f"FROM calls WHERE callee_name IN ({placeholders}) LIMIT ?",
             (*cleaned, max(1, limit)),
         ).fetchall()
         return [
@@ -603,6 +635,7 @@ class RepoIndex:
                 caller_symbol=row["caller_symbol"],
                 callee_name=row["callee_name"],
                 line=int(row["line"]),
+                callee_qualifier=row["callee_qualifier"] or "",
             )
             for row in rows
         ]
@@ -626,7 +659,8 @@ class RepoIndex:
             clauses.append("caller_symbol LIKE ? ESCAPE '\\'")
             params.append(f"%.{_escape_like(name)}")
         rows = self._conn.execute(
-            "SELECT caller_file, caller_symbol, callee_name, line FROM calls "
+            "SELECT caller_file, caller_symbol, callee_name, callee_qualifier, line "
+            "FROM calls "
             f"WHERE {' OR '.join(clauses)} LIMIT ?",
             (*params, max(1, limit)),
         ).fetchall()
@@ -636,6 +670,7 @@ class RepoIndex:
                 caller_symbol=row["caller_symbol"],
                 callee_name=row["callee_name"],
                 line=int(row["line"]),
+                callee_qualifier=row["callee_qualifier"] or "",
             )
             for row in rows
         ]
@@ -676,6 +711,7 @@ def _row_to_symbol(row: sqlite3.Row, score: float) -> IndexedSymbol:
         start_line=int(row["start_line"]),
         end_line=int(row["end_line"]),
         signature=row["signature"],
+        doc=row["doc"] if "doc" in row.keys() else "",
         score=score,
     )
 
@@ -690,9 +726,9 @@ def _fts_query(terms: Sequence[str]) -> str:
 
 def _python_imports_and_calls(
     text: str,
-) -> Tuple[List[Tuple[str, str, int]], List[Tuple[str, str, int]]]:
+) -> Tuple[List[Tuple[str, str, int]], List[Tuple[str, str, str, int]]]:
     imports: List[Tuple[str, str, int]] = []
-    calls: List[Tuple[str, str, int]] = []
+    calls: List[Tuple[str, str, str, int]] = []
     try:
         tree = ast.parse(text)
     except SyntaxError:
@@ -710,7 +746,7 @@ def _python_imports_and_calls(
     class _CallVisitor(ast.NodeVisitor):
         def __init__(self) -> None:
             self.stack: List[str] = []
-            self.items: List[Tuple[str, str, int]] = []
+            self.items: List[Tuple[str, str, str, int]] = []
 
         def _visit_def(self, node: ast.AST) -> None:
             name = getattr(node, "name", "")
@@ -728,10 +764,16 @@ def _python_imports_and_calls(
             self._visit_def(node)
 
         def visit_Call(self, node: ast.Call) -> None:
-            callee = _call_name(node.func)
-            if callee:
+            raw = _call_name(node.func)
+            if raw:
+                parts = raw.split(".")
                 self.items.append(
-                    (".".join(self.stack), callee.split(".")[-1], node.lineno)
+                    (
+                        ".".join(self.stack),
+                        parts[-1],
+                        ".".join(parts[:-1]),
+                        node.lineno,
+                    )
                 )
             self.generic_visit(node)
 
@@ -745,7 +787,17 @@ def _call_name(node: ast.AST) -> str:
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Attribute):
-        return node.attr
+        parts: List[str] = []
+        current: ast.AST = node
+        while isinstance(current, ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+        if isinstance(current, ast.Name):
+            parts.append(current.id)
+        elif parts:
+            # 例如 func().attr：保留可读的尾部，但 qualifier 只到最后一个点。
+            parts.append(_call_name(current))
+        return ".".join(reversed(parts))
     try:
         return ast.unparse(node)
     except Exception:  # noqa: BLE001
@@ -754,9 +806,9 @@ def _call_name(node: ast.AST) -> str:
 
 def _go_imports_and_calls(
     tree: Any, source: bytes
-) -> Tuple[List[Tuple[str, str, int]], List[Tuple[str, str, int]]]:
+) -> Tuple[List[Tuple[str, str, int]], List[Tuple[str, str, str, int]]]:
     imports: List[Tuple[str, str, int]] = []
-    calls: List[Tuple[str, str, int]] = []
+    calls: List[Tuple[str, str, str, int]] = []
     stack = [tree.root_node]
     while stack:
         node = stack.pop()
@@ -779,7 +831,14 @@ def _go_imports_and_calls(
                         if enclosing is not None
                         else ""
                     )
-                    calls.append((caller, raw.split(".")[-1], node.start_point[0] + 1))
+                    calls.append(
+                        (
+                            caller,
+                            raw.split(".")[-1],
+                            ".".join(raw.split(".")[:-1]),
+                            node.start_point[0] + 1,
+                        )
+                    )
         stack.extend(node.children)
     return imports, calls
 

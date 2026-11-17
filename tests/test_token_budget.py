@@ -266,3 +266,91 @@ def test_plan_review_batches_merges_same_file_units_in_one_batch():
         for line in file_diff.visible_lines
     }
     assert batched_lines == original_lines
+
+
+def test_patch_soft_budget_splits_before_hard_breaker():
+    """软预算 8k 控制分批；硬熔断只兜底单个无法拆分的 hunk。"""
+    file = _multi_hunk_file("src/a.py", hunk_count=4, lines_per_hunk=40)
+    diff = ParsedDiff(files=[file])
+    total = sum(file_patch_cost(item) for item in diff.files)
+    soft = max(1, total // 2)
+
+    batches = plan_review_batches(
+        diff,
+        soft_prompt_tokens=total,
+        hard_prompt_tokens=total,
+        prompt_overhead_tokens=0,
+        context_reserve_tokens=0,
+        patch_soft_tokens=soft,
+        patch_hard_tokens=48_000,
+    )
+
+    assert len(batches) > 1
+    # 远低于硬熔断：所有 hunk 都被完整保留，没有截断标记。
+    assert all(
+        TRUNCATION_MARKER not in (file_diff.patch or "")
+        for batch in batches
+        for file_diff in batch.files
+    )
+
+
+def test_single_hunk_between_soft_and_hard_is_kept_whole():
+    file = _file("src/big.py", 400)
+    diff = ParsedDiff(files=[file])
+    total = file_patch_cost(file)
+    assert total > 100
+
+    batches = plan_review_batches(
+        diff,
+        soft_prompt_tokens=total,
+        hard_prompt_tokens=48_000,
+        prompt_overhead_tokens=0,
+        context_reserve_tokens=0,
+        patch_soft_tokens=100,
+        patch_hard_tokens=10_000,
+    )
+
+    assert len(batches) == 1
+    assert batches[0].files[0].patch == file.patch
+    assert TRUNCATION_MARKER not in batches[0].files[0].patch
+
+
+def test_max_batch_tokens_does_not_lower_hard_breaker():
+    """外部 max_batch_tokens 只约束正常分批，不能把 48k 硬熔断压到 12k。"""
+    file = _file("src/big_hunk.py", 2500)
+    diff = ParsedDiff(files=[file])
+    total = file_patch_cost(file)
+    assert 12_000 < total < 48_000
+
+    batches = plan_review_batches(
+        diff,
+        soft_prompt_tokens=total,
+        hard_prompt_tokens=48_000,
+        max_batch_tokens=12_000,
+        prompt_overhead_tokens=0,
+        context_reserve_tokens=0,
+        patch_soft_tokens=8192,
+        patch_hard_tokens=48_000,
+    )
+
+    assert len(batches) == 1
+    assert batches[0].files[0].patch == file.patch
+    assert TRUNCATION_MARKER not in batches[0].files[0].patch
+
+
+def test_single_hunk_above_hard_breaker_is_truncated():
+    file = _file("src/huge.py", 400)
+    diff = ParsedDiff(files=[file])
+
+    batches = plan_review_batches(
+        diff,
+        soft_prompt_tokens=file_patch_cost(file),
+        hard_prompt_tokens=48_000,
+        prompt_overhead_tokens=0,
+        context_reserve_tokens=0,
+        patch_soft_tokens=100,
+        patch_hard_tokens=200,
+    )
+
+    assert len(batches) == 1
+    assert TRUNCATION_MARKER in batches[0].files[0].patch

@@ -51,6 +51,9 @@ class RetrievalMetrics(TypedDict, total=False):
     unique_contexts: int
     duplicate_contexts: int
     context_kinds: Dict[str, int]
+    context_priorities: Dict[str, int]
+    context_tokens_by_priority: Dict[str, int]
+    folded_contexts: int
     changed_symbols: int
     retrieved_symbols: int
     symbol_coverage: float

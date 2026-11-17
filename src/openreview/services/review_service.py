@@ -44,7 +44,6 @@ from openreview.review.single_shot import SingleShotReviewer
 from openreview.review.token_budget import (
     DEFAULT_HARD_PROMPT_TOKENS,
     DEFAULT_SOFT_PROMPT_TOKENS,
-    context_reserve_tokens_for,
 )
 from openreview.review.verifier import FindingVerifier
 from openreview.review.workflow import ReviewOutcome, ReviewState
@@ -70,9 +69,10 @@ class ReviewPipeline:
         llm_api_key: Optional[str] = None,
         llm_model: Optional[str] = None,
         llm_base_url: Optional[str] = None,
-        max_batch_tokens: int = 60000,
-        max_patch_tokens: int = 48000,
-        max_context_tokens: int = 16000,
+        max_batch_tokens: int = 12000,
+        max_patch_tokens: int = 8192,
+        hard_patch_tokens: int = 48000,
+        max_context_tokens: int = 8192,
         soft_prompt_tokens: int = DEFAULT_SOFT_PROMPT_TOKENS,
         hard_prompt_tokens: int = DEFAULT_HARD_PROMPT_TOKENS,
         reviewer_mode: str = "single",
@@ -102,12 +102,10 @@ class ReviewPipeline:
         llm_cache_mode: str = "auto",
         debug_dir: Optional[str] = None,
     ):
-        # prompt 预算由内部策略决定；max_patch/context 只是外部硬上限。
-        effective_context_tokens = min(
-            max_context_tokens,
-            context_reserve_tokens_for(soft_prompt_tokens),
-        )
-        effective_patch_tokens = min(max_patch_tokens, hard_prompt_tokens)
+        # Diff 使用独立预算，P2-P5 共享 max_context_tokens；hard_patch 只做
+        # 单个无法拆分文件的硬熔断，不参与正常分批。
+        effective_context_tokens = max_context_tokens
+        effective_patch_tokens = min(max_patch_tokens, hard_patch_tokens)
         self.config = ReviewConfig(
             mock_llm=mock_llm,
             github_token=github_token,
@@ -116,6 +114,7 @@ class ReviewPipeline:
             llm_base_url=llm_base_url,
             max_batch_tokens=max_batch_tokens,
             max_patch_tokens=effective_patch_tokens,
+            hard_patch_tokens=hard_patch_tokens,
             max_context_tokens=effective_context_tokens,
             soft_prompt_tokens=soft_prompt_tokens,
             hard_prompt_tokens=hard_prompt_tokens,

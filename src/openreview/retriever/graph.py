@@ -17,6 +17,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+from openreview.retriever import ast_utils
 from openreview.retriever.ast_utils import read_line_range
 from openreview.retriever.code_context import (
     CodeContext,
@@ -97,7 +98,9 @@ class GraphRetriever:
                 stats,
             )
         )
-        return dedupe_contexts(contexts)
+        # 图检索内不同 kind 是不同证据（同一段代码可能既是 import 行也是
+        # 调用点），这里按 kind 去重，跨机制的去重交给 Hybrid/planner。
+        return dedupe_contexts(contexts, include_kind=True)
 
     @staticmethod
     def _collect(
@@ -128,43 +131,42 @@ class GraphRetriever:
     ) -> List[CodeContext]:
         if self.max_callers <= 0:
             return []
+        # 只有签名/返回值变更时，调用点才需要作为证据注入；否则完整调用方
+        # 函数只会占用预算，和 diff 审查目标无关。
+        targets = query.signature_changed_symbols
+        if not targets:
+            return []
+
         contexts: List[CodeContext] = []
-        seen: set[tuple[str, int, int]] = set()
+        # 同一个调用方的多个调用点只注入一次：以“文件 + 调用方符号”去重，
+        # 而不是按行号范围，否则同一个函数里的 3 次调用会占 3 份预算。
+        seen: set[tuple[str, str]] = set()
         for edge in index.callers_of(
-            query.symbols, limit=max(self.max_callers * 8, 32)
+            targets, limit=max(self.max_callers * 8, 32)
         ):
             if self.python_calls_only and not edge.caller_file.endswith(".py"):
                 continue
-            enclosing = index.enclosing_symbol(edge.caller_file, edge.line)
-            if enclosing is not None:
-                start, end = enclosing.start_line, enclosing.end_line
-                symbol = enclosing.qualname
-                reason = (
-                    f"caller `{enclosing.qualname}` calls changed symbol "
-                    f"`{edge.callee_name}` at line {edge.line}"
-                )
-            else:
-                start = max(1, edge.line - CALL_SITE_RADIUS)
-                end = edge.line + CALL_SITE_RADIUS
-                symbol = edge.caller_symbol or edge.callee_name
-                reason = (
-                    f"call site `{edge.callee_name}` "
-                    f"(caller symbol unknown) at line {edge.line}"
-                )
-            key = (edge.caller_file, start, end)
+            symbol = edge.caller_symbol or edge.callee_name
+            key = (edge.caller_file, symbol)
             if key in seen:
                 continue
             seen.add(key)
+            start = max(1, edge.line - CALL_SITE_RADIUS)
+            end = edge.line + CALL_SITE_RADIUS
             snippet = read_line_range(repo_path / edge.caller_file, start, end)
             if not snippet:
                 continue
             contexts.append(
                 CodeContext(
                     file_path=edge.caller_file,
-                    reason=reason,
+                    reason=(
+                        f"call site `{edge.callee_name}` at line {edge.line}; "
+                        f"signature changed"
+                    ),
                     snippet=snippet,
                     score=0.58,
                     kind="caller",
+                    priority=4,
                     symbol=symbol,
                     start_line=start,
                     end_line=end,
@@ -247,28 +249,28 @@ class GraphRetriever:
             definition = self._resolve_definition(index, edge, definitions)
             if definition is None:
                 continue
+            if not self._is_local_callee(index, edge, definition):
+                # 标准库 / 第三方调用没有仓库内定义，直接跳过；同名仓库符号
+                # 的误匹配也在这里被 import 关系过滤掉。
+                continue
             key = (definition.file_path, definition.start_line)
             if key in seen:
                 continue
             seen.add(key)
-            snippet = read_line_range(
-                repo_path / definition.file_path,
-                definition.start_line,
-                definition.end_line,
-            )
+            snippet = self._callee_signature_snippet(repo_path, definition)
             if not snippet:
                 continue
             contexts.append(
                 CodeContext(
                     file_path=definition.file_path,
                     reason=(
-                        f"`{edge.caller_symbol or 'caller'}` calls "
-                        f"`{edge.callee_name}`; definition "
+                        f"callee `{definition.qualname}` signature "
                         f"(lines {definition.start_line}-{definition.end_line})"
                     ),
                     snippet=snippet,
-                    score=0.56,
+                    score=0.72,
                     kind="callee",
+                    priority=3,
                     symbol=definition.name,
                     start_line=definition.start_line,
                     end_line=definition.end_line,
@@ -284,6 +286,77 @@ class GraphRetriever:
             if len(contexts) >= self.max_callees:
                 break
         return contexts
+
+    @staticmethod
+    def _is_local_callee(index: RepoIndex, edge, definition) -> bool:
+        """只保留“仓库内、且调用方确实 import 了该模块”的 callee。
+
+        这是标准库/第三方过滤的核心：索引里没有定义的名字自然被丢弃；
+        同名定义则通过 import 关系消歧，避免把 ``json.loads`` 误判成仓库
+        里另一个 ``loads``。
+        """
+        if definition.file_path == edge.caller_file:
+            return True
+        imports_of = getattr(index, "imports_of", None)
+        if not callable(imports_of):
+            return False
+        try:
+            imported = {
+                item.dst_module for item in imports_of([edge.caller_file])
+            }
+        except Exception:  # noqa: BLE001 - import 图失败时保守跳过
+            return False
+        if not imported:
+            return False
+        target = module_name(definition.file_path)
+        for module in imported:
+            if not module:
+                continue
+            if module == target:
+                return True
+            if target.startswith(module + ".") or module.startswith(target + "."):
+                return True
+        return False
+
+    @staticmethod
+    def _callee_signature_snippet(repo_path: Path, definition) -> str:
+        """只保留签名 + docstring + raise 语句，而不是完整函数体。"""
+        parsed = ast_utils.parse_file(repo_path / definition.file_path)
+        if parsed is None:
+            return definition.signature or ""
+        text, source, tree = parsed
+        node = ast_utils.find_enclosing_definition(tree, definition.start_line - 1)
+        if node is None:
+            return definition.signature or ""
+
+        root = node
+        if root.parent is not None and root.parent.type == "decorated_definition":
+            root = root.parent
+        body = node.child_by_field_name("body")
+        header_end = body.start_point[0] if body is not None else node.end_point[0] + 1
+        lines = text.splitlines()
+        header = "\n".join(lines[root.start_point[0] : header_end])
+
+        parts = [header]
+        doc = definition.doc or ast_utils.definition_doc(node, source)
+        if doc:
+            parts.append(f'"""{doc.strip()}"""')
+
+        raises: List[str] = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current.type == "raise_statement":
+                start = current.start_point[0]
+                end = current.end_point[0]
+                raises.append("\n".join(lines[start : end + 1]))
+                if len(raises) >= 5:
+                    break
+                continue
+            stack.extend(current.children)
+        if raises:
+            parts.append("\n".join(raises))
+        return "\n".join(part for part in parts if part).strip()
 
     # ------------------------------------------------------------------
     # import graph
@@ -321,6 +394,7 @@ class GraphRetriever:
                     snippet=snippet,
                     score=0.6,
                     kind="import",
+                    priority=6,
                     symbol=edge.symbol,
                     start_line=start,
                     end_line=end,
@@ -362,6 +436,7 @@ class GraphRetriever:
                     snippet=snippet,
                     score=0.62,
                     kind="dependency",
+                    priority=6,
                     symbol=symbol.name,
                     start_line=symbol.start_line,
                     end_line=symbol.end_line,

@@ -32,6 +32,8 @@ class BatchPlanner:
                 self.config.soft_prompt_tokens
             ),
             dependencies=self._dependencies(state, retriever),
+            patch_soft_tokens=self.config.max_patch_tokens,
+            patch_hard_tokens=self.config.hard_patch_tokens,
         )
 
     def _dependencies(self, state: ReviewState, retriever) -> Dict[str, Set[str]]:

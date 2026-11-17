@@ -8,12 +8,15 @@ from tree_sitter import Language, Node, Parser, Tree
 
 from openreview.repo.diff_parser import DiffParser, ParsedDiff
 from openreview.retriever.code_context import CodeContext, make_context_id
+from openreview.retriever.folding import fold_snippet
+from openreview.retriever.globals import collect_referenced_fields
 from openreview.retriever.grep import search_symbols
 from openreview.retriever.pathing import is_source_file
+from openreview.review.token_budget import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
-MAX_CONTEXT_COUNT = 20
+MAX_CONTEXT_COUNT = 64
 MAX_FILE_SIZE = 500 * 1024  # 500 KB 限制
 # 大 PR（尤其是包含生成代码的 PR）可能有几百个符号。参考检索的耗时随
 # 目标数量增长，50 个目标已经足够覆盖主要变更，同时把单次检索压到秒级。
@@ -23,6 +26,8 @@ MAX_SEARCH_TARGETS = 50
 MAX_REFERENCE_CONTEXTS = 200
 MAX_TEST_CONTEXT_COUNT = 8
 MAX_TEST_SNIPPET_LINES = 120
+# 单个 enclosing 方法超过该 token 数时做 AST 折叠；折叠会保留全部变更行。
+MAX_ENCLOSING_SNIPPET_TOKENS = 1600
 
 # 打分：变更行所在的函数/类 > 符号定义 > 关联测试 > 符号引用 > base 侧历史代码
 SCORE_ENCLOSING = 0.95
@@ -87,6 +92,10 @@ class TreeSitterLocalRetriever:
         enclosing_contexts, enclosing_names = self._collect_changed_line_contexts(
             repo_path, parsed_diff, seen_node_ranges, file_cache
         )
+        # P5：只补充被变更方法引用的类/模块字段，预算不足时才自然被裁掉。
+        field_contexts = self._collect_field_contexts(
+            repo_path, parsed_diff, file_cache
+        )
 
         # 2. 再用符号做全局检索。把变更行所属的函数/类也加入搜索目标，
         #    这样能顺带找到它的调用方。
@@ -103,6 +112,7 @@ class TreeSitterLocalRetriever:
                 repo_path, parsed_diff, seen_node_ranges, file_cache
             )
         )
+        contexts.extend(field_contexts)
 
         # 4. base 侧历史代码：只查被删除的符号，补充“删掉的函数原来长什么样”
         removed_targets = {
@@ -166,6 +176,7 @@ class TreeSitterLocalRetriever:
                 continue
 
             _, lines, source, tree = loaded
+            text = "\n".join(lines)
             for line_number in file_diff.changed_lines:
                 target_idx = line_number - 1
                 if target_idx < 0 or target_idx >= len(lines):
@@ -186,17 +197,36 @@ class TreeSitterLocalRetriever:
 
                 start_row, end_row = node.start_point[0], node.end_point[0]
                 snippet = "\n".join(lines[start_row:end_row + 1])
+                folded = False
+                if estimate_tokens(snippet) > MAX_ENCLOSING_SNIPPET_TOKENS:
+                    snippet, folded = fold_snippet(
+                        text,
+                        Path(file_diff.filename).suffix,
+                        start_row + 1,
+                        end_row + 1,
+                        file_diff.changed_lines,
+                        MAX_ENCLOSING_SNIPPET_TOKENS,
+                    )
+                    if folded:
+                        self.last_stats["folded_contexts"] = (
+                            self.last_stats.get("folded_contexts", 0) + 1
+                        )
                 display_name = name or "unknown"
+                reason = (
+                    f"Enclosing {node.type} '{display_name}' of changed line "
+                    f"{line_number} (lines {start_row + 1}-{end_row + 1})"
+                )
+                if folded:
+                    reason += "; long body folded, changed lines preserved"
                 contexts.append(
                     CodeContext(
                         file_path=file_diff.filename,
-                        reason=(
-                            f"Enclosing {node.type} '{display_name}' of changed line "
-                            f"{line_number} (lines {start_row + 1}-{end_row + 1})"
-                        ),
+                        reason=reason,
                         snippet=snippet,
                         score=SCORE_ENCLOSING,
                         kind="enclosing",
+                        priority=2,
+                        folded=folded,
                         symbol=display_name if name else "",
                         start_line=start_row + 1,
                         end_line=end_row + 1,
@@ -210,6 +240,67 @@ class TreeSitterLocalRetriever:
                 )
 
         return contexts, definition_names
+
+    def _collect_field_contexts(
+        self,
+        repo_path: Path,
+        parsed_diff: ParsedDiff,
+        file_cache: Dict[Path, Optional[LoadedFile]],
+    ) -> List[CodeContext]:
+        """P5：收集被变更方法引用的类/模块字段定义。"""
+        contexts: List[CodeContext] = []
+        seen: Set[Tuple[str, int, int]] = set()
+
+        for file_diff in parsed_diff.files:
+            if not file_diff.changed_lines or file_diff.status == "removed":
+                continue
+            suffix = Path(file_diff.filename).suffix
+            if suffix != ".py":
+                continue
+            abs_path = self._resolve_repo_file(repo_path, file_diff.filename)
+            if abs_path is None:
+                continue
+            loaded = self._load_file(abs_path, file_cache)
+            if loaded is None:
+                continue
+
+            text, lines, source, tree = loaded
+            method_spans: Set[Tuple[int, int]] = set()
+            for line_number in file_diff.changed_lines:
+                node = self._find_enclosing_definition(tree.root_node, line_number - 1)
+                if node is None:
+                    continue
+                method_spans.add((node.start_point[0] + 1, node.end_point[0] + 1))
+
+            for start_line, end_line in sorted(method_spans):
+                for field in collect_referenced_fields(
+                    text, suffix, start_line, end_line
+                ):
+                    key = (file_diff.filename, field.start_line, field.end_line)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    contexts.append(
+                        CodeContext(
+                            file_path=file_diff.filename,
+                            reason=f"field `{field.name}` referenced by changed method",
+                            snippet=field.source,
+                            score=0.4,
+                            kind="field",
+                            priority=5,
+                            symbol=field.name,
+                            start_line=field.start_line,
+                            end_line=field.end_line,
+                            context_id=make_context_id(
+                                file_diff.filename,
+                                field.start_line,
+                                field.end_line,
+                                "field",
+                                fallback=field.name,
+                            ),
+                        )
+                    )
+        return contexts
 
     def _collect_test_contexts(
         self,
@@ -288,6 +379,7 @@ class TreeSitterLocalRetriever:
                     score=SCORE_TEST_FILE,
                     revision="head",
                     kind="test",
+                    priority=6,
                     start_line=1,
                     end_line=end_line,
                     context_id=make_context_id(
@@ -438,6 +530,7 @@ class TreeSitterLocalRetriever:
                         score=score,
                         revision=revision,
                         kind=kind,
+                        priority=6,
                         symbol=matched_symbol,
                         start_line=node_range[0] + 1,
                         end_line=node_range[1] + 1,

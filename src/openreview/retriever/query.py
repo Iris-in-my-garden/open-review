@@ -70,6 +70,8 @@ class RetrievalQuery:
     modules: List[str] = field(default_factory=list)
     imports: List[str] = field(default_factory=list)
     terms: List[str] = field(default_factory=list)
+    # 只有这些符号的调用方需要注入：签名/返回值发生变更时，调用点才是证据。
+    signature_changed_symbols: List[str] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         return not self.terms
@@ -102,7 +104,17 @@ class QueryBuilder:
             modules=modules,
             imports=imports,
             terms=terms,
+            signature_changed_symbols=self._collect_signature_changed(parsed_diff),
         )
+
+    @staticmethod
+    def _collect_signature_changed(parsed_diff: ParsedDiff) -> List[str]:
+        changed: List[str] = []
+        for file_diff in parsed_diff.files:
+            for symbol in file_diff.signature_changed_symbols or []:
+                if symbol and symbol not in changed:
+                    changed.append(symbol)
+        return changed
 
     @classmethod
     def _collect_symbols(
