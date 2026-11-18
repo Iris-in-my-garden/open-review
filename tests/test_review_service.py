@@ -139,7 +139,7 @@ class FakeContextRetriever:
 
     def __init__(self):
         self.calls = 0
-        self.last_stats = {"index_symbol_hits": 1}
+        self.last_stats = {"graph_callee_hits": 1}
 
     def retrieve(self, repo_path, parsed_diff, base_path=None):
         self.calls += 1
@@ -162,7 +162,7 @@ class FakeRepeatedContextRetriever:
     """每个 batch 都返回同一段上下文，用于验证跨批去重与统计。"""
 
     def __init__(self):
-        self.last_stats = {"index_symbol_hits": 1}
+        self.last_stats = {"graph_callee_hits": 1}
 
     def retrieve(self, repo_path, parsed_diff, base_path=None):
         return [
@@ -183,7 +183,7 @@ class HugeContextRetriever:
     """返回一段远超 prompt 上下文预算的片段，用于验证省略统计。"""
 
     def __init__(self):
-        self.last_stats = {"index_symbol_hits": 1}
+        self.last_stats = {"graph_callee_hits": 1}
 
     def retrieve(self, repo_path, parsed_diff, base_path=None):
         return [
@@ -475,7 +475,7 @@ def test_pipeline_surfaces_retrieval_metrics_and_context_refs(tmp_path: Path):
         "src/file_1.py",
     ]
     assert retrieval["context_kinds"] == {"definition": 2}
-    assert retrieval["stats"]["index_symbol_hits"] == 2
+    assert retrieval["stats"]["graph_callee_hits"] == 2
     assert retrieval["stats"]["contexts_by_priority"] == 2
     assert retrieval["stats"]["context_tokens_remaining"] > 0
     assert retrieval["context_priorities"] == {"P6": 2}

@@ -53,7 +53,6 @@ def test_compute_retrieval_metrics(tmp_path: Path):
                         "graph_contexts": 2,
                         "graph_context_kinds": {"caller": 1, "import": 1},
                         "stats": {
-                            "index_symbol_hits": 1,
                             "graph_caller_hits": 1,
                             "graph_callee_hits": 2,
                         },

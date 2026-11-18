@@ -73,7 +73,7 @@ def context_identity(
     """Canonical dedupe key shared by AST / hybrid / graph / executor.
 
     A code range is the strongest identity: the same ``file:start-end`` is the
-    same evidence regardless of which mechanism found it (AST enclosing, FTS
+    same evidence regardless of which mechanism found it (AST enclosing, index
     definition, graph caller, impact reference).  Keeping ``kind`` out of the
     key is deliberate; otherwise the same snippet can be injected twice with
     different labels and waste prompt budget.  Contexts without line ranges

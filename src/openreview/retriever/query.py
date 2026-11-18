@@ -26,7 +26,7 @@ MAX_STRING_TERMS = 10
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 _STRING_LITERAL = re.compile(r"""["']([^"'\n]{4,80})["']""")
 
-# 这些名字出现在几乎每个文件里，作为 FTS query 只会制造噪声。
+# 这些名字出现在几乎每个文件里，作为检索词只会制造噪声。
 _COMMON_NAMES = {
     "self",
     "cls",

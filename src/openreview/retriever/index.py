@@ -1,10 +1,10 @@
-"""基于 SQLite FTS5 的仓库符号索引。
+"""基于 SQLite 的仓库符号与关系索引。
 
 设计目标不是“把仓库切成固定 chunk 做向量检索”，而是给 code review 提供
 确定性、可增量、可解释的检索底座：
 
 - 符号定义：name / qualname / kind / file / start_line / end_line
-- 符号检索：SQLite FTS5（BM25）+ 精确名字匹配
+- 符号查找：精确名字匹配 + LIKE 兜底（不使用 FTS5）
 - 跨文件关系：imports / calls（best-effort，只作为 candidate）
 - 增量更新：按 git blob SHA 判断文件是否变化，只重排变更文件
 
@@ -35,7 +35,7 @@ from openreview.retriever.pathing import is_source_file
 
 logger = logging.getLogger(__name__)
 
-INDEX_SCHEMA_VERSION = "2"
+INDEX_SCHEMA_VERSION = "3"
 MAX_INDEXED_FILE_SIZE = 500 * 1024
 MAX_INDEXED_FILES = 20000
 SUPPORTED_SUFFIXES = {".py", ".go"}
@@ -106,7 +106,6 @@ class RepoIndex:
             str(self.db_path), timeout=30, check_same_thread=False
         )
         self._conn.row_factory = sqlite3.Row
-        self.fts_enabled = True
         self.last_stats: Dict[str, Any] = {}
         self._init_schema()
 
@@ -224,38 +223,20 @@ class RepoIndex:
                 "ALTER TABLE symbols ADD COLUMN doc TEXT NOT NULL DEFAULT ''"
             )
 
-        try:
+        # 旧版本曾用 FTS5 做符号检索。清理遗留的触发器和虚拟表，避免缓存库
+        # 继续维护一份无人读取的索引；新库不产生任何 FTS 写入。
+        legacy_fts = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'symbols_fts'"
+        ).fetchone()
+        if legacy_fts is not None:
             self._conn.executescript(
                 """
-                CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
-                    name, qualname, signature, doc,
-                    content='symbols',
-                    content_rowid='id',
-                    tokenize='unicode61'
-                );
-
-                CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
-                    INSERT INTO symbols_fts(rowid, name, qualname, signature, doc)
-                    VALUES (new.id, new.name, new.qualname, new.signature, new.doc);
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
-                    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualname, signature, doc)
-                    VALUES ('delete', old.id, old.name, old.qualname, old.signature, old.doc);
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
-                    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualname, signature, doc)
-                    VALUES ('delete', old.id, old.name, old.qualname, old.signature, old.doc);
-                    INSERT INTO symbols_fts(rowid, name, qualname, signature, doc)
-                    VALUES (new.id, new.name, new.qualname, new.signature, new.doc);
-                END;
+                DROP TRIGGER IF EXISTS symbols_ai;
+                DROP TRIGGER IF EXISTS symbols_ad;
+                DROP TRIGGER IF EXISTS symbols_au;
+                DROP TABLE IF EXISTS symbols_fts;
                 """
             )
-        except sqlite3.OperationalError as exc:
-            # 某些 Python 构建没有 FTS5；降级为 LIKE 搜索，不阻断 review。
-            logger.warning("SQLite FTS5 unavailable, falling back to LIKE search: %s", exc)
-            self.fts_enabled = False
 
     # ------------------------------------------------------------------
     # build / update
@@ -485,54 +466,23 @@ class RepoIndex:
             _row_to_symbol(row, score=1.0) for row in exact_rows
         ]
 
-        # 2) FTS5/BM25 兜底：覆盖 qualname、signature 和前缀匹配。
+        # 2) LIKE 兜底：覆盖 qualname 与部分前缀匹配。
         if len(results) < limit:
             remaining = limit - len(results)
-            if self.fts_enabled:
-                query = _fts_query(cleaned)
-                if query:
-                    try:
-                        rows = self._conn.execute(
-                            """
-                            SELECT s.*, bm25(symbols_fts) AS rank
-                            FROM symbols_fts
-                            JOIN symbols s ON s.id = symbols_fts.rowid
-                            WHERE symbols_fts MATCH ?
-                            ORDER BY rank
-                            LIMIT ?
-                            """,
-                            (query, remaining + len(seen)),
-                        ).fetchall()
-                        for row in rows:
-                            if int(row["id"]) in seen:
-                                continue
-                            rank = float(row["rank"] or 0.0)
-                            results.append(
-                                _row_to_symbol(
-                                    row, score=round(0.7 - min(abs(rank) / 100.0, 0.25), 3)
-                                )
-                            )
-                            seen.add(int(row["id"]))
-                            if len(results) >= limit:
-                                break
-                    except sqlite3.OperationalError as exc:
-                        logger.debug("FTS query failed, falling back to LIKE: %s", exc)
-
-            if len(results) < limit:
-                like = f"%{_escape_like(cleaned[0])}%"
-                rows = self._conn.execute(
-                    "SELECT * FROM symbols WHERE name LIKE ? ESCAPE '\\' "
-                    "OR qualname LIKE ? ESCAPE '\\' "
-                    "ORDER BY name LIMIT ?",
-                    (like, like, remaining),
-                ).fetchall()
-                for row in rows:
-                    if int(row["id"]) in seen:
-                        continue
-                    results.append(_row_to_symbol(row, score=0.5))
-                    seen.add(int(row["id"]))
-                    if len(results) >= limit:
-                        break
+            like = f"%{_escape_like(cleaned[0])}%"
+            rows = self._conn.execute(
+                "SELECT * FROM symbols WHERE name LIKE ? ESCAPE '\\' "
+                "OR qualname LIKE ? ESCAPE '\\' "
+                "ORDER BY name LIMIT ?",
+                (like, like, remaining),
+            ).fetchall()
+            for row in rows:
+                if int(row["id"]) in seen:
+                    continue
+                results.append(_row_to_symbol(row, score=0.5))
+                seen.add(int(row["id"]))
+                if len(results) >= limit:
+                    break
 
         return results
 
@@ -716,14 +666,6 @@ def _row_to_symbol(row: sqlite3.Row, score: float) -> IndexedSymbol:
         doc=row["doc"] if "doc" in row.keys() else "",
         score=score,
     )
-
-
-def _fts_query(terms: Sequence[str]) -> str:
-    quoted = []
-    for term in terms:
-        safe = term.replace('"', '""')
-        quoted.append(f'"{safe}"')
-    return " OR ".join(quoted)
 
 
 def _python_imports_and_calls(

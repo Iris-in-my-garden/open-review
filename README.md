@@ -1,6 +1,6 @@
 # OpenReview
 
-一个面向 GitHub Pull Request 的 AI Code Review 工具：拉取 PR → 解析 Diff → 混合上下文检索 → 单遍结构化审查 → 结果校验 → 生成 Markdown 报告。
+一个面向 GitHub Pull Request 的 AI Code Review 工具：拉取 PR → 解析 Diff → 结构化上下文检索 → 单遍结构化审查 → 结果校验 → 生成 Markdown 报告。
 
 > 项目定位是**有界、可验证、可观测的代码审查流水线**，而不是自主 Agent：尽量把结论约束在真实 Diff 与代码证据上，并控制调用量。
 
@@ -11,9 +11,9 @@
 - **默认单遍审查（single-pass per batch）**：每个 batch 一次结构化 LLM 调用，覆盖 `clean_code` / `bugs` / `performance` / `security` 四类风险；大 PR 仍按 token 预算分批
 - **固定四档消融**：`--ablation diff|ast|graph|verifier` 依次叠加 AST 折叠上下文、代码图谱与后置 verifier，保证相邻档位只差一个变量
 - **规则 triage（0 LLM 调用）**：文档/配置-only PR 直接跳过模型；纯测试变更收窄审查重点
-- **混合上下文检索**（默认启用）：tree-sitter AST 提供结构化主路径，SQLite FTS5 符号索引与 import/call graph 补充跨文件候选：
+- **结构化上下文检索**（默认启用）：tree-sitter AST 提供结构化主路径，import/call graph 补充跨文件候选：
   - 只要改动了函数体，就能自动定位并抽取所属函数/类
-  - 符号索引支持精确匹配与 BM25 召回，import 关系补充模块使用方及依赖
+  - import 关系补充模块使用方及依赖，符号查找只做精确名字与 LIKE 匹配
   - call graph 补充“谁调用了变更符号 / 变更函数调用了谁”，把影响面从文件级提升到函数级
   - 关联测试文件检索，用于测试缺口分析
   - base worktree 检索被删除符号的历史实现
@@ -78,7 +78,7 @@ GitHub PR URL
 │ Evidence Collectors          │
 │ 1. ImpactAnalyzer：跨文件引用 │
 │ 2. StaticAnalysis：ruff/mypy │
-│ 3. Retriever：AST + FTS5 +    │
+│ 3. Retriever：AST +           │
 │    import/call graph          │
 └────────┬─────────────────────┘
          ▼
@@ -122,7 +122,7 @@ pip install -e .
 | `OPENAI_BASE_URL` | 否 | 兼容 OpenAI 协议的服务地址（如代理、本地模型网关） |
 | `GITHUB_TOKEN` | 否 | 访问私有仓库或避免 GitHub API 限流时填写 |
 | `OPENREVIEW_CACHE_DIR` | 否 | 覆盖仓库缓存目录；默认 macOS 为 `~/Library/Caches/openreview/repos`，Linux 为 `$XDG_CACHE_HOME/openreview/repos`（缺省 `~/.cache/openreview/repos`） |
-| `OPENREVIEW_INDEX_DIR` | 否 | 覆盖 FTS5 符号索引目录；默认在仓库缓存同级 `index/` |
+| `OPENREVIEW_INDEX_DIR` | 否 | 覆盖符号/关系索引目录；默认在仓库缓存同级 `index/` |
 | `OPENREVIEW_REVIEW_CACHE_DIR` | 否 | 覆盖 review 结果缓存目录；默认在仓库缓存同级 `review/` |
 
 > GitHub Token 与 LLM API Key 是两套独立凭证，互不复用。
@@ -252,8 +252,8 @@ src/openreview/
 │   ├── pathing.py             # AST / index / impact 共用的目录剪枝规则
 │   ├── grep.py                # 符号引用检索：rg 优先，git grep 分批 + 有界 Python 兜底
 │   ├── tree_sitter_retriever.py  # AST 边界 + 定义/引用 + 测试文件 + base 检索
-│   ├── hybrid.py                # AST + 符号索引 + graph 融合与去重
-│   ├── index.py                 # SQLite FTS5 符号索引与 import/call 关系
+│   ├── hybrid.py                # AST + 关系索引 + graph 融合与去重
+│   ├── index.py                 # SQLite 符号与 import/call 关系索引
 │   ├── graph.py                 # import/call graph 扩展（caller/callee/依赖）
 │   └── query.py                 # 从 Diff 构造检索查询
 ├── review/
@@ -285,8 +285,8 @@ src/openreview/
 
 ## 设计取舍
 
-**为什么检索采用 AST + 符号索引 + 图扩展？**
-tree-sitter AST 是结构化主路径，能定位变更行所属的函数/类；SQLite FTS5 符号索引提供精确匹配与 BM25 召回；import/call graph 再补上“谁调用了变更符号 / 变更函数调用了谁”，把影响面从文件级提升到函数级。上下文按相关性排序并去重，任何增强失败时仍可退回 AST 结果。call graph 是 best-effort：Python 用 `ast` 抽取 caller/callee，Go 的调用边暂不默认启用，不宣称完整类型解析。当前索引和 AST 解析都聚焦 Python / Go；其他语言只使用 diff，不注入结构上下文。
+**为什么检索采用 AST + 图扩展，而不是 FTS5？**
+tree-sitter AST 是结构化主路径，能定位变更行所属的函数/类；SQLite 只保存符号定义与 import/call 关系，符号查找走精确名字和 LIKE 兜底。FTS5/BM25 在这里收益有限：代码审查更依赖精确符号和结构关系，而全文检索容易把弱相关定义带进 prompt。import/call graph 补上“谁调用了变更符号 / 变更函数调用了谁”，把影响面从文件级提升到函数级。上下文按相关性排序并去重，任何增强失败时仍可退回 AST 结果。call graph 是 best-effort：Python 用 `ast` 抽取 caller/callee，Go 的调用边暂不默认启用，不宣称完整类型解析。当前索引和 AST 解析都聚焦 Python / Go；其他语言只使用 diff，不注入结构上下文。
 
 **为什么引用检索不直接用 `git grep`？**
 `git grep -e sym1 -e sym2 ...` 会把多个模式合成一个交替正则，耗时随模式数和匹配行数一起放大。实测同一个 676 文件 / 10MB 的 Go 仓库：1 个模式 0.03s，10 个 2.8s，20 个 5.6s，而 20 个模式用 ripgrep 只要 0.02s。默认 50 个检索目标会让每次 batch 都撞上 15s 超时并被静默降级。现在 `retriever/grep.py` 优先用 `rg -F -w`（固定字符串、整词、源码 glob），没有 ripgrep 时把 `git grep` 拆成 4 个模式一批并共享总时间预算，最后才退到有界的 Python 扫描；命中数和 AST 解析量都有硬上限，引擎超时只降级、不挂住 review。
@@ -445,7 +445,7 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 - [x] Prompt Injection 防护与红队测试
 - [x] RepoManager：FileLock、blobless clone、平台缓存目录、LRU 式缓存淘汰
 - [x] GitHub API 429/5xx/限流重试，CLI `finally` 关闭 HTTP 连接
-- [x] 默认混合检索：tree-sitter AST 主路径 + SQLite FTS5 符号索引 + import/call graph；支持 AST-only / +FTS / +graph 检索消融
+- [x] 默认结构化检索：tree-sitter AST 主路径 + SQLite 符号/关系索引 + import/call graph；支持 AST / +graph 消融
 - [x] 默认采用单遍 Review（每个 batch 1 次调用）；检索与 verifier 收敛为固定四档消融
 - [x] 有界工作流（`workflow.py`）：条件节点、`ReviewBudget`、trace
 - [x] 规则 triage：docs-only 跳过、test-only 收窄审查重点

@@ -5,15 +5,10 @@ from pathlib import Path
 
 from openreview.repo.diff_parser import DiffParser, ParsedChangedFile, ParsedDiff
 from openreview.retriever import index as index_module
-from openreview.retriever.code_context import CodeContext
 from openreview.retriever.hybrid import HybridRetriever
 from openreview.retriever.index import RepoIndex, _iter_source_files
 from openreview.retriever.pathing import is_source_file
-from openreview.retriever.query import (
-    MAX_ADDED_LINE_IDENTIFIERS,
-    QueryBuilder,
-    RetrievalQuery,
-)
+from openreview.retriever.query import MAX_ADDED_LINE_IDENTIFIERS, QueryBuilder
 from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
 
 
@@ -281,7 +276,6 @@ def test_hybrid_retriever_adds_index_contexts_with_ids(tmp_path: Path):
     try:
         contexts = retriever.retrieve(root, parsed)
         assert contexts
-        assert retriever.last_stats["index_symbol_hits"] >= 1
         assert any(context.kind == "enclosing" for context in contexts)
         assert any(context.kind == "dependency" for context in contexts)
         assert not any(context.kind == "import" for context in contexts)
@@ -331,53 +325,6 @@ def test_hybrid_enables_grep_fallback_only_without_index(tmp_path: Path):
 
     assert contexts
     assert ast_retriever.flags == [True]
-    assert retriever.last_stats["index_symbol_hits"] == 0
-
-
-def test_hybrid_fts_fallback_is_top3_and_skips_covered(tmp_path: Path):
-    """FTS5 只补充图谱未命中的符号，且最多 Top-3。"""
-    root = tmp_path / "repo"
-    (root / "pkg").mkdir(parents=True)
-    (root / "pkg" / "mod.py").write_text(
-        "def alpha():\n    pass\n\n"
-        "def beta():\n    pass\n\n"
-        "def gamma():\n    pass\n\n"
-        "def delta():\n    pass\n",
-        encoding="utf-8",
-    )
-    _init_repo(root)
-
-    index = RepoIndex.for_worktree(root, cache_dir=tmp_path / "idx")
-    retriever = HybridRetriever(index_cache_dir=tmp_path / "idx2")
-    try:
-        query = RetrievalQuery(
-            symbols=["alpha", "beta", "gamma", "delta"],
-            files=["pkg/mod.py"],
-        )
-        graph_contexts = [
-            CodeContext(
-                file_path="pkg/mod.py",
-                reason="callee `alpha` signature",
-                snippet="def alpha():\n    pass",
-                score=0.72,
-                kind="callee",
-                symbol="alpha",
-                start_line=1,
-                end_line=2,
-            )
-        ]
-        stats: dict[str, float] = {"index_symbol_hits": 0}
-
-        contexts = retriever._fts_fallback_contexts(
-            root, index, query, graph_contexts, stats
-        )
-
-        assert 1 <= len(contexts) <= 3
-        assert all(context.symbol != "alpha" for context in contexts)
-        assert stats["index_symbol_hits"] == len(contexts)
-    finally:
-        retriever.close()
-        index.close()
 
 
 def test_index_like_lookups_escape_wildcards(tmp_path: Path):
@@ -411,7 +358,7 @@ def test_index_like_lookups_escape_wildcards(tmp_path: Path):
         assert "get_user" in definition_names
         assert "getXuser" not in definition_names
 
-        # 精确命中之后仍会走 FTS/LIKE 兜底，兜底同样必须转义。
+        # 精确命中之后仍会走 LIKE 兜底，兜底同样必须转义。
         symbols = index.search_symbols(["get_user"], limit=20)
         symbol_names = {symbol.name for symbol in symbols}
         assert "get_user" in symbol_names

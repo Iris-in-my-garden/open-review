@@ -70,7 +70,7 @@ class MetricsCollector:
             context.symbol for context in state.all_contexts if context.symbol
         }
         # 只有“符号/定义/import/依赖/引用”这类结构化上下文才算索引召回；
-        # test/impact/static 不是 FTS 索引的直接产物。
+        # test/impact/static 不是符号索引的直接产物。
         index_kinds = {
             "symbol",
             "definition",

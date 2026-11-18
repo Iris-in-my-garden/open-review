@@ -2,7 +2,7 @@
 
 Phase 1 覆盖 file recall / symbol coverage / citation / context 膨胀；
 Phase 2 追加 call graph / import graph 的实际注入上下文数，用于
-AST vs +FTS vs +graph 消融。
+AST vs +graph 消融。
 
 这里回答四个面试里最容易被追问的问题：
 

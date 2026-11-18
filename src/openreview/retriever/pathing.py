@@ -4,7 +4,7 @@ AST retrieval, the SQLite symbol index and impact analysis used to keep their
 own directory exclusion lists.  The lists drifted (for example ``docs`` and
 ``examples`` were skipped by one path but indexed by another), which made
 "what can be retrieved" depend on which mechanism happened to run.  Keep the
-policy in one place so AST / FTS / graph / impact agree on the source surface.
+policy in one place so AST / index / graph / impact agree on the source surface.
 """
 
 from __future__ import annotations

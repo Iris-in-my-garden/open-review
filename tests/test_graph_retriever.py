@@ -303,7 +303,7 @@ def test_graph_retriever_ignores_non_python_callers_when_configured(tmp_path: Pa
 
 
 def test_context_dedupe_uses_range_identity_across_kinds():
-    """同一段代码由 AST / FTS / graph 以不同 kind 找到时只保留一条。"""
+    """同一段代码由 AST / index / graph 以不同 kind 找到时只保留一条。"""
     contexts = [
         CodeContext(
             file_path="pkg/auth.py",
