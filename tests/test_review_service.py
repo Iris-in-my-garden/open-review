@@ -6,7 +6,6 @@ import pytest
 from openreview.domain.versions import METRICS_SCHEMA_VERSION
 from openreview.github.client import ChangedFile, PullRequestInfo
 from openreview.retriever.code_context import CodeContext
-from openreview.review.aspect_reviewer import ReviewOrchestrator
 from openreview.review.report_writer import PotentialIssue, ReviewResult
 from openreview.review.single_shot import SingleShotReviewer
 from openreview.review.token_budget import (
@@ -662,35 +661,11 @@ def test_pipeline_defaults_to_single_shot_one_call_per_batch(tmp_path: Path):
         assert isinstance(pipeline.reviewer, SingleShotReviewer)
         assert pipeline.last_result is not None
         metrics = pipeline.last_result.metrics
-        assert metrics["reviewer_mode"] == "single"
+        assert metrics["ablation"] == "production"
+        assert metrics["retrieval_mode"] == "graph"
         # 两个文件各成一批，single-pass 每批 1 次调用。
         assert metrics["batches"] == 2
         assert metrics["llm_calls"] == 2
-    finally:
-        pipeline.close()
-
-
-def test_pipeline_multi_aspect_mode_keeps_four_calls_per_batch(tmp_path: Path):
-    pipeline = ReviewPipeline(
-        mock_llm=True,
-        max_batch_tokens=1,
-        reviewer_mode="multi_aspect",
-        verifier_enabled=False,
-    )
-    pipeline.gh_client = FakeGitHubClient()
-    pipeline.repo_mgr = FakeRepoManager(tmp_path)
-    pipeline.retriever = FakeRetriever()
-
-    try:
-        pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
-
-        assert isinstance(pipeline.reviewer, ReviewOrchestrator)
-        assert not isinstance(pipeline.reviewer, SingleShotReviewer)
-        assert pipeline.last_result is not None
-        metrics = pipeline.last_result.metrics
-        assert metrics["reviewer_mode"] == "multi_aspect"
-        assert metrics["batches"] == 2
-        assert metrics["llm_calls"] == 8
     finally:
         pipeline.close()
 
@@ -809,10 +784,9 @@ def test_partial_review_is_not_written_to_review_cache(tmp_path: Path):
 
 def test_review_cache_key_includes_output_affecting_config(tmp_path: Path):
     def key_for(**kwargs) -> str:
+        kwargs.setdefault("ablation", "ast")
         pipeline = ReviewPipeline(
             mock_llm=True,
-            hybrid_retrieval_enabled=False,
-            verifier_enabled=False,
             **kwargs,
         )
         try:
@@ -845,8 +819,8 @@ def test_review_cache_key_includes_output_affecting_config(tmp_path: Path):
     assert key_for(hard_prompt_tokens=15_000) != base
     assert key_for(static_tools=("ruff", "mypy")) != base
     assert key_for(verify_severities=("high",)) != base
-    assert key_for(max_workers=2) != base
-    assert key_for(aspect_timeout=10.0) != base
+    assert key_for(ablation="diff") != base
+    assert key_for(ablation="graph") != base
 
 
 def test_pipeline_derives_effective_prompt_caps_internally():
@@ -866,8 +840,7 @@ def test_debug_dir_is_not_part_of_review_cache_key(tmp_path: Path):
     def key_for(debug_dir: str) -> str:
         pipeline = ReviewPipeline(
             mock_llm=True,
-            hybrid_retrieval_enabled=False,
-            verifier_enabled=False,
+            ablation="ast",
             debug_dir=debug_dir,
         )
         try:

@@ -23,10 +23,9 @@ from openreview.github.client import GitHubClient
 from openreview.repo.diff_parser import DiffParser
 from openreview.repo.local import LocalReviewInput
 from openreview.repo.manager import RepoManager
-from openreview.retriever.base import Retriever, ScopedRetriever
+from openreview.retriever.base import EmptyRetriever, Retriever, ScopedRetriever
 from openreview.retriever.hybrid import HybridRetriever
 from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
-from openreview.review.aspect_reviewer import ReviewOrchestrator
 from openreview.review.cache import ReviewCache
 from openreview.review.config import ReviewConfig
 from openreview.review.debug_sink import DebugSink
@@ -56,10 +55,10 @@ logger = logging.getLogger(__name__)
 class ReviewPipeline:
     """Review 的 facade / 组合根。
 
-    默认使用 single-pass reviewer（每个 batch 一次 LLM 调用），
-    ``reviewer_mode="multi_aspect"`` 可切回四维度并行，作为高召回模式和评测
-    消融。这里刻意不引入“自主 Agent”：PR Review 的步骤是稳定的，真正需要
-    动态决策的只有 triage、证据增强、verifier 回炉和失败兜底。
+    默认使用 single-pass reviewer（每个 batch 一次 LLM 调用），检索与后处理
+    通过固定四档消融配置切换（``ablation``）。这里刻意不引入“自主 Agent”：
+    PR Review 的步骤是稳定的，真正需要动态决策的只有 triage、证据增强、
+    verifier 回炉和失败兜底。
     """
 
     def __init__(
@@ -75,16 +74,12 @@ class ReviewPipeline:
         max_context_tokens: int = 8192,
         soft_prompt_tokens: int = DEFAULT_SOFT_PROMPT_TOKENS,
         hard_prompt_tokens: int = DEFAULT_HARD_PROMPT_TOKENS,
-        reviewer_mode: str = "single",
-        max_workers: int = 4,
-        aspect_timeout: float = 90.0,
+        ablation: Optional[str] = None,
         llm_timeout: float = 60.0,
         llm_max_retries: int = 0,
         max_completion_tokens: int = 2048,
         temperature: float = 0.0,
         seed: Optional[int] = None,
-        hybrid_retrieval_enabled: bool = True,
-        graph_retrieval_enabled: bool = True,
         index_cache_dir: Optional[str] = None,
         triage_enabled: bool = True,
         impact_enabled: bool = True,
@@ -118,16 +113,12 @@ class ReviewPipeline:
             max_context_tokens=effective_context_tokens,
             soft_prompt_tokens=soft_prompt_tokens,
             hard_prompt_tokens=hard_prompt_tokens,
-            reviewer_mode=reviewer_mode,
-            max_workers=max_workers,
-            aspect_timeout=aspect_timeout,
+            ablation=ablation,
             llm_timeout=llm_timeout,
             llm_max_retries=llm_max_retries,
             max_completion_tokens=max_completion_tokens,
             temperature=temperature,
             seed=seed,
-            hybrid_retrieval_enabled=hybrid_retrieval_enabled,
-            graph_retrieval_enabled=graph_retrieval_enabled,
             index_cache_dir=index_cache_dir,
             triage_enabled=triage_enabled,
             impact_enabled=impact_enabled,
@@ -149,16 +140,7 @@ class ReviewPipeline:
         self.gh_client = GitHubClient(token=github_token)
         self.repo_mgr = RepoManager()
         self.diff_parser = DiffParser()
-        # HybridRetriever 以 tree-sitter AST 为主路径，FTS5 符号索引只做增强；
-        # 关闭时行为与旧版 TreeSitterLocalRetriever 完全一致，方便做消融。
-        if hybrid_retrieval_enabled:
-            self.retriever: Retriever = HybridRetriever(
-                index_cache_dir=index_cache_dir,
-                graph_enabled=graph_retrieval_enabled,
-                max_context_tokens=self.config.max_context_tokens,
-            )
-        else:
-            self.retriever = TreeSitterLocalRetriever()
+        self.retriever: Retriever = self._build_retriever()
         self._default_retriever = self.retriever
         # 多个 run 共享 retriever 的索引缓存，但 last_stats 是可变状态；
         # ScopedRetriever 用同一把锁串行化 retrieve 并快照 stats。
@@ -166,9 +148,6 @@ class ReviewPipeline:
 
         # 根据标志直接切换实例，不需要用 MagicMock 动态拼装。
         # 注意：GitHub Token 与 LLM API Key 是两套完全独立的凭证。
-        effective_llm_timeout = (
-            min(llm_timeout, aspect_timeout) if aspect_timeout > 0 else llm_timeout
-        )
         self._base_client: AbstractLLMClient = (
             MockLLMClient()
             if mock_llm
@@ -176,21 +155,21 @@ class ReviewPipeline:
                 api_key=llm_api_key,
                 model=llm_model,
                 base_url=llm_base_url,
-                timeout=effective_llm_timeout,
+                timeout=llm_timeout,
                 max_retries=llm_max_retries,
                 temperature=temperature,
                 seed=seed,
                 max_completion_tokens=max_completion_tokens,
             )
         )
-        # 预算包在真实客户端外面：aspect / verifier / retry 的每次调用都扣账。
+        # 预算包在真实客户端外面：review / verifier / retry 的每次调用都扣账。
         # 这组客户端是“原型”，供兼容属性/测试观察；每次 run 会新建
         # run-scoped BudgetedLLMClient，避免并发 run 共用同一本预算账。
         self._budgeted_client = BudgetedLLMClient(self._base_client)
         self.llm_client = self._wrap_llm_client(self._budgeted_client)
 
         self.debug_sink = DebugSink(debug_dir) if debug_dir else None
-        self.reviewer: ReviewOrchestrator = self._build_reviewer(self.llm_client)
+        self.reviewer: SingleShotReviewer = self._build_reviewer(self.llm_client)
         self._default_reviewer = self.reviewer
         self.verifier = self._build_verifier(self.llm_client)
         self._default_verifier = self.verifier
@@ -218,30 +197,31 @@ class ReviewPipeline:
             )
         return client
 
-    def _build_reviewer(self, llm_client) -> ReviewOrchestrator:
+    def _build_retriever(self) -> Retriever:
+        """按固定消融档位构造检索器。"""
+        mode = self.config.retrieval_mode
+        if mode == "none":
+            return EmptyRetriever()
+        if mode == "ast":
+            return TreeSitterLocalRetriever()
+        return HybridRetriever(
+            index_cache_dir=self.config.index_cache_dir,
+            graph_enabled=True,
+            max_context_tokens=self.config.max_context_tokens,
+        )
+
+    def _build_reviewer(self, llm_client) -> SingleShotReviewer:
         prompt_builder = PromptBuilder(
             max_patch_tokens=self.config.max_patch_tokens,
             max_context_tokens=self.config.max_context_tokens,
         )
         output_parser = OutputParser()
         validator = FindingValidator(debug_sink=self.debug_sink)
-        if self.config.reviewer_mode == "single":
-            return SingleShotReviewer(
-                prompt_builder=prompt_builder,
-                llm_client=llm_client,
-                output_parser=output_parser,
-                validator=validator,
-                max_workers=self.config.max_workers,
-                aspect_timeout=self.config.aspect_timeout,
-                debug_sink=self.debug_sink,
-            )
-        return ReviewOrchestrator(
+        return SingleShotReviewer(
             prompt_builder=prompt_builder,
             llm_client=llm_client,
             output_parser=output_parser,
             validator=validator,
-            max_workers=self.config.max_workers,
-            aspect_timeout=self.config.aspect_timeout,
             debug_sink=self.debug_sink,
         )
 
@@ -339,8 +319,12 @@ class ReviewPipeline:
         return self.config.max_batch_tokens
 
     @property
-    def reviewer_mode(self) -> str:
-        return self.config.reviewer_mode
+    def ablation(self) -> Optional[str]:
+        return self.config.ablation
+
+    @property
+    def retrieval_mode(self) -> str:
+        return self.config.retrieval_mode
 
     @property
     def triage_enabled(self) -> bool:
@@ -377,14 +361,6 @@ class ReviewPipeline:
     @property
     def budget_seconds(self) -> float:
         return self.config.budget_seconds
-
-    @property
-    def hybrid_retrieval_enabled(self) -> bool:
-        return self.config.hybrid_retrieval_enabled
-
-    @property
-    def graph_retrieval_enabled(self) -> bool:
-        return self.config.graph_retrieval_enabled
 
     def close(self) -> None:
         self.gh_client.close()

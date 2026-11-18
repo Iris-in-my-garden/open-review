@@ -74,9 +74,10 @@ def test_review_cache_key_covers_output_affecting_config():
         ReviewConfig(max_context_tokens=100),
         ReviewConfig(static_tools=("ruff", "mypy")),
         ReviewConfig(verify_severities=("high",)),
-        ReviewConfig(max_workers=2),
-        ReviewConfig(aspect_timeout=10.0),
-        ReviewConfig(reviewer_mode="multi_aspect"),
+        ReviewConfig(ablation="diff"),
+        ReviewConfig(ablation="ast"),
+        ReviewConfig(retrieval_mode="none"),
+        ReviewConfig(triage_enabled=False),
         ReviewConfig(verifier_enabled=False),
     ]
 

@@ -118,10 +118,13 @@ uv run python -m evaluation.cli gate \
 - `graph_contexts_avg` / `graph_context_kinds`：每个样本由 import/call graph 实际注入的上下文数及类型
 - `patch_validation`：`suggested_patch` 有多少能通过 `git apply --check`
 
-做检索消融时组合以下开关，每次使用不同 `--run-id`，再比较 `retrieval_*.json`：
+做消融时使用 `--ablation` 固定四档，每次使用不同 `--run-id`，再比较
+`retrieval_*.json`：
 
-- `--no-hybrid-retrieval`：只保留 tree-sitter AST 检索
-- `--no-graph-retrieval`：保留 FTS5 符号索引，关闭 import/call graph
+- `--ablation diff`：纯 Diff，不注入检索上下文
+- `--ablation ast`：Diff + 单文件 AST 折叠上下文
+- `--ablation graph`：AST + 代码图谱（Qualifier + Import）
+- `--ablation verifier`：graph 基础 + 后置防幻觉校验
 
 ### 4. 真实模型（按需，消耗 token）
 
@@ -185,10 +188,10 @@ AACR OCR 兼容字段（`review.comments[].content`、`review.summary.input_toke
 
 ```bash
 uv run python -m evaluation.cli report \
+  --run diff=evaluation/metrics/aacr-pygo-v1/dev-diff \
   --run ast=evaluation/metrics/aacr-pygo-v1/dev-ast \
-  --run fts=evaluation/metrics/aacr-pygo-v1/dev-fts \
   --run graph=evaluation/metrics/aacr-pygo-v1/dev-graph \
-  --run multi_aspect=evaluation/metrics/aacr-pygo-v1/dev-multi \
+  --run verifier=evaluation/metrics/aacr-pygo-v1/dev-verifier \
   --out reports/eval_dev.md
 ```
 
@@ -269,11 +272,10 @@ overlap ≥ 0.8。它不是语义判断，只回答“引用的代码是否真�
 ### attribution
 
 - `coverage`：带 `source_aspects` 的 findings / 总 findings
-- `multi_aspect_rate`：被多个维度同时命中的 findings / 总 findings
 - `aspect_counts`：每个来源贡献了多少 findings
 
 单遍模式下没有独立维度，`source_aspects` 使用 finding 自己的 `category`
-归因；多维度模式下则是实际运行维度。跨模式下对比时请先看清 `reviewer_mode`。
+归因。
 
 ### retrieval
 
@@ -305,32 +307,21 @@ deduplicated`
 
 ## 消融开关
 
-`review` 子命令直接暴露了当前需要验证的开关：
+`review` 子命令只暴露一个固定消融开关：
 
 ```bash
-# reviewer 策略：默认单遍；multi_aspect 仅用于高召回/消融
---reviewer-mode single
---reviewer-mode multi_aspect
-
-# verifier on/off
---no-verifier
-
-# 跨文件 impact / tool-loop on/off
---no-impact
-
-# 规则 triage on/off
---no-triage
-
-# 检索消融：AST-only / +FTS / +graph
---no-hybrid-retrieval
---no-graph-retrieval
+# 四档消融，相邻档位只差一个变量
+--ablation diff      # 纯 Diff
+--ablation ast       # + AST Folding（单文件局部上下文）
+--ablation graph     # + 代码图谱（Qualifier + Import）
+--ablation verifier  # + Verifier（后置防幻觉校验）
 
 # 模型档位
 --model gpt-4o-mini
 ```
 
-建议保持三个主消融：**reviewer 策略、verifier、检索层（AST/FTS/graph）**，
-模型档位和 triage 作为补充。不要一次性展开太多维度，否则 43 个 PR 的样本量撑不住结论。
+建议按 `diff → ast → graph → verifier` 顺序逐档对照，每档使用同一份
+LLM record/replay 缓存。不要一次性展开太多维度，否则 43 个 PR 的样本量撑不住结论。
 
 ### 录制 / 回放，避免重复付费
 

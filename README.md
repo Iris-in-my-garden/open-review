@@ -9,7 +9,7 @@
 - 输入一个 PR URL，生成结构化 Review 报告；可选把问题作为 GitHub 行内评论发回 PR
 - 有界工作流：URL 解析 → PR 元数据 → review 缓存 → 仓库准备 → Diff 解析 → 规则 triage → 影响分析/静态分析/上下文检索 → 单遍审查 → 语义 verifier → 报告 → 可选行内评论。所有条件边由代码显式声明，不引入“自主 Agent”循环
 - **默认单遍审查（single-pass per batch）**：每个 batch 一次结构化 LLM 调用，覆盖 `clean_code` / `bugs` / `performance` / `security` 四类风险；大 PR 仍按 token 预算分批
-- **可选多维度并行审查**：`--reviewer-mode multi_aspect` 可切回四维度并行，作为高召回模式和消融配置，不作为默认路径
+- **固定四档消融**：`--ablation diff|ast|graph|verifier` 依次叠加 AST 折叠上下文、代码图谱与后置 verifier，保证相邻档位只差一个变量
 - **规则 triage（0 LLM 调用）**：文档/配置-only PR 直接跳过模型；纯测试变更收窄审查重点
 - **混合上下文检索**（默认启用）：tree-sitter AST 提供结构化主路径，SQLite FTS5 符号索引与 import/call graph 补充跨文件候选：
   - 只要改动了函数体，就能自动定位并抽取所属函数/类
@@ -19,7 +19,7 @@
   - base worktree 检索被删除符号的历史实现
   - 仅支持 Python / Go（刻意收窄范围）；其他语言只使用 diff，不注入结构上下文
 - **跨文件影响分析**：变更/删除的符号在其他文件中的引用会被抽成上下文；删除符号仍有残留调用时，reviewer 能看到调用点
-- **可选静态分析证据源**：对变更文件跑 ruff/mypy，只保留落在 diff 可见行上的信号（默认关闭；会执行本地工具，接入 CI 时需注意不可信代码的执行风险）
+- **可选静态分析证据源**：对变更文件跑 ruff/mypy，只保留落在 diff 可见行上的信号（默认关闭，仅通过 `ReviewPipeline(static_analysis_enabled=True)` 开启；会执行本地工具，接入 CI 时需注意不可信代码的执行风险）
 - **语义 verifier**：对 `critical` / `high` 结论做二次校验，过滤“看起来很像真的”的过度解读；最多回炉一次
 - **硬预算**：`--budget-calls` / `--budget-tokens` / `--budget-output-tokens` / `--budget-seconds` 限制 LLM 调用、输入 token、真实输出 token 与耗时；每次调用另有 `--max-completion-tokens` 输出上限，避免 verifier/retry 放大调用量
 - **评论噪声控制**：只有 `critical` / `high` 且落在 diff 行内的结论发为行内评论，最多 10 条；其余问题收进 Review body，避免 bot 刷屏
@@ -38,7 +38,7 @@
 - **GitHub API 重试/限流处理**，单维度失败不影响整体，失败信息写入报告
 - **仓库缓存并发安全**：仓库级 `FileLock` + blobless partial clone + 平台缓存目录 + 按 mtime 淘汰
 - **本地仓库模式**：输入 `repo_path + base_sha + head_sha` 即可离线 review，不依赖 GitHub API；用 detached worktree 隔离 head/base，结束后自动清理（评测/回放用）
-- **生产审查路径明确**：默认使用混合检索与单遍审查；AST-only 是检索消融开关，`multi_aspect` 是高召回/消融配置，不作为默认路径
+- **生产审查路径明确**：默认使用图谱检索 + triage + impact + verifier 与单遍审查；`--ablation` 只用于固定四档对照实验，不作为默认路径
 - **可观测性**：`logging` + 阶段耗时 / 批次 / LLM 调用次数 / 真实 token 用量 / 预算与缓存命中，统一写入报告 `Run Metrics`
 - **严重级别收口**：`critical|high|medium|low` 使用 `Literal` 校验，兼容 `HIGH`、`严重` 等别名后再归一化
 - **工程化**：ruff + mypy + pre-commit + GitHub Actions
@@ -87,7 +87,6 @@ GitHub PR URL
 │  每个 batch 1 次结构化调用    │
 │  timeout / retry / 失败可见   │
 │  Structured Output (Pydantic)│
-│  可选 multi_aspect 高召回模式 │
 └────────┬─────────────────────┘
          ▼
 ┌─────────────────┐
@@ -157,28 +156,18 @@ openreview review https://github.com/microsoft/typescript-go/pull/1354 --post-co
 openreview review https://github.com/microsoft/typescript-go/pull/1354 \
   --max-batch-tokens 40000
 
-# 高召回模式：切回四维度并行（默认 single，token 消耗更高）
-openreview review https://github.com/microsoft/typescript-go/pull/1354 \
-  --reviewer-mode multi_aspect \
-  --max-workers 2
+# 固定四档消融：纯 Diff / +AST Folding / +代码图谱 / +Verifier
+openreview review https://github.com/microsoft/typescript-go/pull/1354 --ablation diff
+openreview review https://github.com/microsoft/typescript-go/pull/1354 --ablation ast
+openreview review https://github.com/microsoft/typescript-go/pull/1354 --ablation graph
+openreview review https://github.com/microsoft/typescript-go/pull/1354 --ablation verifier
 
-# 检索消融：AST-only / +FTS / +graph
-openreview review https://github.com/microsoft/typescript-go/pull/1354 --no-hybrid-retrieval
-openreview review https://github.com/microsoft/typescript-go/pull/1354 --no-graph-retrieval
-
-# 用量控制：禁用 triage / 关闭 verifier / 设置硬预算
+# 用量控制：设置硬预算
 openreview review https://github.com/microsoft/typescript-go/pull/1354 \
-  --no-triage \
-  --no-verifier \
   --budget-calls 8 \
   --budget-output-tokens 16000 \
   --max-completion-tokens 2048 \
   --budget-seconds 120
-
-# 静态分析作为证据源（默认关闭；会在本地执行 ruff/mypy）
-openreview https://github.com/microsoft/typescript-go/pull/1354 \
-  --static-analysis \
-  --static-tools ruff
 
 # 复用同一 PR head 的 review 结果；LLM 响应可录制后离线回放
 openreview review https://github.com/microsoft/typescript-go/pull/1354 \
@@ -275,8 +264,9 @@ src/openreview/
 │   ├── triage.py              # 规则 triage（docs-only / test-only）
 │   ├── impact.py              # 跨文件符号引用分析
 │   ├── static_analysis.py     # ruff/mypy 证据源（默认关闭）
-│   ├── single_shot.py         # 默认单遍审查（每个 batch 1 次调用）
-│   ├── aspect_reviewer.py     # 可选多维度并行编排、超时/重试/失败上报
+│   ├── single_shot.py         # 单遍审查（每个 batch 1 次调用）
+│   ├── ablation.py            # 固定四档消融定义
+│   ├── finalize.py            # 审查结果收敛（validator / 测试缺口 / injection）
 │   ├── output_parser.py       # 结构化 Schema、严重级别校验与聚合
 │   ├── finding_validator.py   # 行号 / evidence 校验与结论重算
 │   ├── verifier.py            # critical/high 语义复核
@@ -304,14 +294,14 @@ tree-sitter AST 是结构化主路径，能定位变更行所属的函数/类；
 **为什么 triage 只用规则、不用模型？**
 triage 的目标是减少无效调用，不是做判断。用一次 LLM 调用决定“要不要调用 LLM”在调用量上不成立；docs-only / test-only 这类信号用文件后缀和 diff 元数据就能确定性判断，也更容易测试。
 
-**为什么默认单遍审查，而不是四维度并行？**
-四个维度共享同一份检索上下文、同一个模型和同一套输出结构，差异主要来自 persona prompt；在没有证据表明它能带来成比例收益之前，默认四倍调用不划算。单遍审查把四类风险放进同一份 checklist，大 PR 仍按 batch 拆分；`multi_aspect` 保留为高召回模式和消融配置，等评测证明收益后再决定是否默认启用。
+**为什么只保留单遍审查？**
+四维度并行共享同一份检索上下文、同一个模型和同一套输出结构，差异主要来自 persona prompt；在没有证据表明它能带来成比例收益之前，四倍调用不划算。单遍审查把四类风险放进同一份 checklist，大 PR 仍按 batch 拆分，评测维度也从“reviewer 模式”收敛为检索与 verifier 四档消融。
 
 **validator 已经校验了行号和 evidence，为什么还要 verifier？**
 validator 做的是确定性校验：文件是否存在、行号是否在 diff 内、evidence 能否定位。它拦不住“证据真实但结论过度解读”的问题。verifier 只处理 `critical` / `high`，最多回炉一次，并且所有调用都受 `ReviewBudget` 约束，避免二次校验变成调用量黑洞。
 
 **静态分析为什么默认关闭？**
-静态分析会在本地对 PR 代码执行 ruff/mypy，等于执行不可信输入。CLI 默认关闭；开启时只跑变更文件，并且只保留落在 diff 可见行上的信号。接入 CI 时应放在沙箱或受控 runner 中。它只作为证据源，最终结论仍由 LLM + validator 收敛。
+静态分析会在本地对 PR 代码执行 ruff/mypy，等于执行不可信输入。默认关闭，CLI 不暴露该开关；需要时通过 `ReviewPipeline` 参数开启，且只跑变更文件、只保留落在 diff 可见行上的信号。接入 CI 时应放在沙箱或受控 runner 中。它只作为证据源，最终结论仍由 LLM + validator 收敛。
 
 **为什么只改函数体也能检索到上下文？**
 `DiffParser` 会从 Hunk 中计算新增行在 head 文件中的行号；检索器再用 tree-sitter 反查这些行所属的函数/类。因此即使函数签名没变，也能拿到完整上下文。
@@ -384,51 +374,18 @@ uv run python -m evaluation.cli review \
   --budget-tokens 20000
 ```
 
-然后跑默认单遍与多维度消融：
+然后跑固定四档消融。建议使用同一份 LLM record/replay 缓存，保证差异来自检索与
+verifier，而不是采样：
 
 ```bash
-uv run python -m evaluation.cli review \
-  --split dev --run-id dev-single \
-  --model gpt-4o-mini \
-  --reviewer-mode single \
-  --llm-cache-dir evaluation/.cache/llm \
-  --budget-tokens 200000
-
-uv run python -m evaluation.cli review \
-  --split dev --run-id dev-multi \
-  --model gpt-4o-mini \
-  --reviewer-mode multi_aspect \
-  --llm-cache-dir evaluation/.cache/llm \
-  --budget-tokens 800000
-
-uv run python -m evaluation.cli metrics --split dev --run-id dev-single
-uv run python -m evaluation.cli metrics --split dev --run-id dev-multi
-```
-
-Phase 2 检索消融：固定模型与 reviewer mode，只切换检索开关。建议使用同一份 LLM
-record/replay 缓存，保证差异来自检索而不是采样：
-
-```bash
-# AST only
-uv run python -m evaluation.cli review \
-  --split dev --run-id dev-ast \
-  --model gpt-4o-mini --no-hybrid-retrieval \
-  --llm-cache-dir evaluation/.cache/llm --budget-tokens 200000
-
-# AST + FTS5 symbol index (graph off)
-uv run python -m evaluation.cli review \
-  --split dev --run-id dev-fts \
-  --model gpt-4o-mini --no-graph-retrieval \
-  --llm-cache-dir evaluation/.cache/llm --budget-tokens 200000
-
-# AST + FTS5 + graph（默认）
-uv run python -m evaluation.cli review \
-  --split dev --run-id dev-graph \
-  --model gpt-4o-mini \
-  --llm-cache-dir evaluation/.cache/llm --budget-tokens 200000
-
-for run in dev-ast dev-fts dev-graph; do
-  uv run python -m evaluation.cli metrics --split dev --run-id "$run"
+for level in diff ast graph verifier; do
+  uv run python -m evaluation.cli review \
+    --split dev --run-id "dev-$level" \
+    --model gpt-4o-mini \
+    --ablation "$level" \
+    --llm-cache-dir evaluation/.cache/llm \
+    --budget-tokens 200000
+  uv run python -m evaluation.cli metrics --split dev --run-id "dev-$level"
 done
 ```
 
@@ -444,11 +401,10 @@ uv run python -m evaluation.cli semantic \
 
 ```bash
 uv run python -m evaluation.cli report \
+  --run diff=evaluation/metrics/aacr-pygo-v1/dev-diff \
   --run ast=evaluation/metrics/aacr-pygo-v1/dev-ast \
-  --run fts=evaluation/metrics/aacr-pygo-v1/dev-fts \
   --run graph=evaluation/metrics/aacr-pygo-v1/dev-graph \
-  --run single=evaluation/metrics/aacr-pygo-v1/dev-single \
-  --run multi_aspect=evaluation/metrics/aacr-pygo-v1/dev-multi \
+  --run verifier=evaluation/metrics/aacr-pygo-v1/dev-verifier \
   --out reports/eval_dev.md
 ```
 
@@ -458,13 +414,12 @@ uv run python -m evaluation.cli report \
 
 | Config | N | Findings | Precision | Recall | Balanced | Invalid line | Evidence | File recall | Symbol cov | Citation | Graph ctx | Attribution | Calls/PR | Tokens | Latency |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| diff | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 | ast | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
-| fts | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 | graph | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
-| single | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
-| multi_aspect | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| verifier | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 
-解读时至少同时看四件事：**质量（P/R）是否提升、检索覆盖是否提升、token 是否成比例、证据是否仍然可定位**。只有 `multi_aspect` 或 graph 在高严重级别 findings 上有明显收益时，才值得考虑默认启用或做高风险升级；否则保持当前 `single + AST/FTS/graph` 默认。
+解读时至少同时看四件事：**质量（P/R）是否提升、检索覆盖是否提升、token 是否成比例、证据是否仍然可定位**。相邻档位只差一个变量，只有 graph 或 verifier 在高严重级别 findings 上有明显收益时，才值得保留对应成本；否则退回更轻的档位。
 
 ## 测试与工程化
 
@@ -486,12 +441,12 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 - [x] 大 PR token 预算、按文件分批、Prompt 层截断
 - [x] 测试文件关联与测试缺口分析
 - [x] base/head 双 worktree，支持查看被删除代码的上下文
-- [x] 并发维度可配置、超时、重试与失败上报
+- [x] 单遍审查的超时、重试与失败上报
 - [x] Prompt Injection 防护与红队测试
 - [x] RepoManager：FileLock、blobless clone、平台缓存目录、LRU 式缓存淘汰
 - [x] GitHub API 429/5xx/限流重试，CLI `finally` 关闭 HTTP 连接
 - [x] 默认混合检索：tree-sitter AST 主路径 + SQLite FTS5 符号索引 + import/call graph；支持 AST-only / +FTS / +graph 检索消融
-- [x] 默认采用单遍 Review（每个 batch 1 次调用）；multi-aspect 保留为高召回/消融配置
+- [x] 默认采用单遍 Review（每个 batch 1 次调用）；检索与 verifier 收敛为固定四档消融
 - [x] 有界工作流（`workflow.py`）：条件节点、`ReviewBudget`、trace
 - [x] 规则 triage：docs-only 跳过、test-only 收窄审查重点
 - [x] 跨文件影响分析（`impact.py`）
@@ -518,5 +473,5 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 - 行内评论只能落在 diff 可见行；不在 diff 行内或 severity 为 medium/low 的问题会写入 Review body，而不是行内评论
 - 单文件极大时会先按 hunk / symbol 切片；只有单个 hunk 仍超预算时才截断，可能漏掉该 hunk 后半部分的问题
 - 单遍审查的 findings 受单次输出 token 限制；大 PR 会按 batch 拆分，但单个 batch 仍可能截断
-- 静态分析默认关闭，且只覆盖 Python；开启时会在本地执行 ruff/mypy
+- 静态分析默认关闭、CLI 不暴露，且只覆盖 Python；通过 API 开启时会在本地执行 ruff/mypy
 - `--mock_llm` 仅验证流程与报告格式，不代表审查质量；仓库中的示例报告也是 mock 演示输出，不应作为真实漏洞发现或评测结果

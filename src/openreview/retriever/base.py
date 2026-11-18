@@ -41,6 +41,22 @@ class StatsReportingRetriever(Protocol):
     last_stats: Dict[str, float]
 
 
+class EmptyRetriever:
+    """消融 level 1（纯 Diff）使用的空检索器。"""
+
+    def __init__(self) -> None:
+        self.last_stats: Dict[str, float] = {}
+
+    def retrieve(
+        self,
+        repo_path: Path,
+        parsed_diff: ParsedDiff,
+        base_path: Optional[Path] = None,
+    ) -> List[CodeContext]:
+        self.last_stats = {}
+        return []
+
+
 class ScopedRetriever:
     """Serialize access to a shared retriever and snapshot per-run stats.
 

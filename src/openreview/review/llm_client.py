@@ -276,7 +276,7 @@ class MockLLMClient:
             "completion_tokens": 0,
             "total_tokens": 0,
         }
-        # 多维度模式会并发调用；未加锁的 ``+=`` 会丢计数。
+        # 并发调用时未加锁的 ``+=`` 会丢计数。
         self._usage_lock = threading.Lock()
 
     @staticmethod
@@ -327,7 +327,7 @@ class MockLLMClient:
                 ]
             )
 
-        # 2. 审查输出 Schema（single-pass 和 multi-aspect 共用）
+        # 2. 审查输出 Schema（single-pass）
         if "AspectReviewOutputSchema" in schema_name:
             # 从 User Prompt 的 Patch 区块中取出真实文件名，
             # 避免 Mock 问题因“文件不在 Diff 中”被校验器全部过滤掉。

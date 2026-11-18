@@ -15,10 +15,16 @@
     python -m evaluation.cli semantic --split dev --run-id dev \
         --aacr-eval-dir /path/to/aacr-bench/evaluation
 
-    # 5) 汇总多次 run 为 Markdown 表格
+    # 5) 固定四档消融
+    python -m evaluation.cli review --split dev --run-id dev-diff --ablation diff
+    python -m evaluation.cli review --split dev --run-id dev-ast --ablation ast
+    python -m evaluation.cli review --split dev --run-id dev-graph --ablation graph
+    python -m evaluation.cli review --split dev --run-id dev-verifier --ablation verifier
+
+    # 6) 汇总多次 run 为 Markdown 表格
     python -m evaluation.cli report \
-        --run single=evaluation/metrics/aacr-pygo-v1/dev-single \
-        --run multi_aspect=evaluation/metrics/aacr-pygo-v1/dev-multi
+        --run diff=evaluation/metrics/aacr-pygo-v1/dev-diff \
+        --run graph=evaluation/metrics/aacr-pygo-v1/dev-graph
 """
 
 from __future__ import annotations
@@ -126,29 +132,32 @@ def _restrict_to_actual_run(
 def _estimate_aacr_review(
     instances: list[dict],
     *,
-    verifier: bool = True,
-    reviewer_mode: str = "single",
+    ablation: str | None = None,
 ) -> dict:
     """AACR review 的保守 token preflight。
 
     不 clone 仓库，只看 manifest 里的 change_line_count / reference_comments。
     真实 prompt 还受上下文检索和 token 预算影响，因此这里明确标注为估算。
     """
-    calls_per_review = 4 if reviewer_mode == "multi_aspect" else 1
+    from openreview.review.ablation import resolve_ablation
+
+    spec = resolve_ablation(ablation) if ablation else None
+    verifier = spec.verifier_enabled if spec else True
+    mode_label = spec.label if spec else "production"
+
     prompt_tokens = 0
     completion_tokens = 0
     calls = 0
     for instance in instances:
         lines = max(1, int(instance.get("change_line_count") or 0))
         per_review_prompt = 5000 + lines * 12
-        prompt_tokens += per_review_prompt * calls_per_review
-        completion_tokens += 450 * calls_per_review
-        calls += calls_per_review
+        prompt_tokens += per_review_prompt
+        completion_tokens += 450
+        calls += 1
         if verifier:
             prompt_tokens += 1500 + int(instance.get("reference_comments") or 1) * 250
             completion_tokens += 300
             calls += 1
-    mode_label = "4 aspects" if reviewer_mode == "multi_aspect" else "single-pass"
     return {
         "instances": len(instances),
         "llm_calls": calls,
@@ -156,7 +165,7 @@ def _estimate_aacr_review(
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
         "assumption": (
-            f"{mode_label} + verifier; ~12 tokens/change line + base context"
+            f"{mode_label}; single-pass + ~12 tokens/change line + base context"
         ),
     }
 
@@ -194,8 +203,7 @@ def cmd_review(args: argparse.Namespace) -> int:
     if args.estimate_only or args.budget_tokens is not None:
         estimate = _estimate_aacr_review(
             instances,
-            verifier=not args.no_verifier,
-            reviewer_mode=args.reviewer_mode,
+            ablation=args.ablation,
         )
         print(
             "[estimate] instances={instances} calls={llm_calls} "
@@ -222,13 +230,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         mock_llm=args.mock_llm,
         llm_model=args.model,
         llm_base_url=args.base_url,
-        reviewer_mode=args.reviewer_mode,
-        max_workers=args.max_workers,
-        triage_enabled=not args.no_triage,
-        impact_enabled=not args.no_impact,
-        verifier_enabled=not args.no_verifier,
-        hybrid_retrieval_enabled=not args.no_hybrid_retrieval,
-        graph_retrieval_enabled=not args.no_graph_retrieval,
+        ablation=args.ablation,
         budget_calls=args.budget_calls,
         review_cache_enabled=bool(review_cache_dir),
         review_cache_dir=str(review_cache_dir) if review_cache_dir else None,
@@ -457,8 +459,7 @@ def cmd_synthetic(args: argparse.Namespace) -> int:
             resume=args.resume,
             keep_worktrees=args.keep_worktrees,
             budget_tokens=args.budget_tokens,
-            hybrid_retrieval_enabled=args.hybrid_retrieval,
-            verifier_enabled=not args.no_verifier,
+            ablation=args.ablation,
             fail_fast=args.fail_fast,
         )
         summaries.append(summary)
@@ -526,26 +527,15 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--model", default=None)
     review.add_argument("--base-url", default=None)
     review.add_argument(
-        "--reviewer-mode",
-        choices=["single", "multi_aspect"],
-        default="single",
-        help="single=每个 batch 一次调用；multi_aspect=四维度并行（高召回/消融）",
+        "--ablation",
+        choices=["diff", "ast", "graph", "verifier"],
+        default=None,
+        help=(
+            "固定消融档位：diff=纯 Diff；ast=+AST Folding；"
+            "graph=+代码图谱；verifier=+Verifier。缺省跑生产默认。"
+        ),
     )
-    review.add_argument("--max-workers", type=int, default=4)
     review.add_argument("--budget-calls", type=int, default=0)
-    review.add_argument("--no-triage", action="store_true")
-    review.add_argument("--no-impact", action="store_true")
-    review.add_argument("--no-verifier", action="store_true")
-    review.add_argument(
-        "--no-hybrid-retrieval",
-        action="store_true",
-        help="关闭 FTS5 符号索引，仅用 tree-sitter AST 检索（消融用）",
-    )
-    review.add_argument(
-        "--no-graph-retrieval",
-        action="store_true",
-        help="关闭 import/call graph 扩展，用于 +FTS vs +graph 消融",
-    )
     review.add_argument("--keep-worktrees", action="store_true")
     review.add_argument("--fail-fast", action="store_true")
     review.add_argument(
@@ -607,14 +597,12 @@ def build_parser() -> argparse.ArgumentParser:
     synthetic.add_argument("--keep-worktrees", action="store_true")
     synthetic.add_argument("--fail-fast", action="store_true")
     synthetic.add_argument(
-        "--hybrid-retrieval",
-        action="store_true",
-        help="启用 FTS5 符号索引；默认关闭以保持合成 benchmark 轻量",
-    )
-    synthetic.add_argument(
-        "--no-verifier",
-        action="store_true",
-        help="full 模式下关闭 verifier（消融用）",
+        "--ablation",
+        choices=["diff", "ast", "graph", "verifier"],
+        default=None,
+        help=(
+            "覆盖 full/baseline 的默认档位；缺省 full=verifier、baseline=ast。"
+        ),
     )
     synthetic.add_argument(
         "--estimate-only",

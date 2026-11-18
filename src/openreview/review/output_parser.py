@@ -250,7 +250,7 @@ class ReviewResultSchema(BaseModel):
 
 class OutputParser:
     def schema_for_aspect(self, aspect: str) -> Type[AspectReviewOutputSchema]:
-        """single-pass 和 multi-aspect 共用该 Schema，确保结构化输出稳定。"""
+        """single-pass 结构化输出 Schema，确保解析稳定。"""
         return AspectReviewOutputSchema
 
     def aggregate_aspects(self, all_aspect_results: List[AspectReviewTaskResult]) -> ReviewResultSchema:

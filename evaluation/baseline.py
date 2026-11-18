@@ -8,10 +8,9 @@
 - 同一个 ``ReviewResult`` 与结果 JSON 格式；
 - 同一个 single-pass reviewer。
 
-它只去掉 triage、impact 和 verifier。这样 full vs baseline 的差异主要来自
-证据增强和后处理，而不是落盘格式或 reviewer 实现。
-
-多维度并行审查（``reviewer_mode="multi_aspect"``）是另一条消融轴，默认不启用。
+baseline 固定为 ``ast`` 档：保留 AST 折叠上下文，但关闭 triage、impact、
+代码图谱和 verifier。这样 full vs baseline 的差异来自图谱检索与后处理，
+而不是落盘格式或 reviewer 实现。
 """
 
 from __future__ import annotations
@@ -34,10 +33,7 @@ def build_baseline_pipeline(
 ) -> ReviewPipeline:
     """构造 baseline pipeline，并保持 ``ReviewPipeline`` 的生命周期接口。
 
-    默认就是 single-pass，因此这里只需要关掉证据增强与后处理。
+    默认固定为 ``ast`` 档，调用方可以通过 ``ablation`` 覆盖。
     """
-    pipeline_kwargs.setdefault("reviewer_mode", "single")
-    pipeline_kwargs.setdefault("triage_enabled", False)
-    pipeline_kwargs.setdefault("impact_enabled", False)
-    pipeline_kwargs.setdefault("verifier_enabled", False)
+    pipeline_kwargs.setdefault("ablation", "ast")
     return ReviewPipeline(mock_llm=mock_llm, **pipeline_kwargs)

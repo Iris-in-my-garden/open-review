@@ -593,13 +593,13 @@ def estimate_synthetic_run(
         calls = count
         prompt_tokens = sum(per_case_prompt)
         completion_tokens = count * 600
-        assumption = "1 次 single-pass review / case（无 triage/impact/verifier）"
+        assumption = "ast 档：1 次 single-pass review / case（无图谱/verifier）"
     else:
         calls = count * 2
         # 单遍 review 发送一次 patch/context；verifier 只发送候选问题。
         prompt_tokens = sum(per_case_prompt) + count * 800
         completion_tokens = count * 1200
-        assumption = "1 次 single-pass review + 1 次 verifier（上界）/ case"
+        assumption = "verifier 档：1 次 single-pass review + 1 次 verifier / case"
 
     return {
         "mode": mode,
@@ -633,8 +633,7 @@ def run_synthetic_benchmark(
     resume: bool = False,
     keep_worktrees: bool = False,
     budget_tokens: Optional[int] = None,
-    hybrid_retrieval_enabled: bool = False,
-    verifier_enabled: bool = True,
+    ablation: Optional[str] = None,
     fail_fast: bool = False,
 ) -> Dict[str, Any]:
     if mode not in {"full", "baseline"}:
@@ -648,11 +647,13 @@ def run_synthetic_benchmark(
 
     pipeline_kwargs: Dict[str, Any] = {
         "mock_llm": mock_llm,
-        "hybrid_retrieval_enabled": hybrid_retrieval_enabled,
         "review_cache_enabled": False,
     }
-    if mode == "full":
-        pipeline_kwargs["verifier_enabled"] = verifier_enabled
+    if ablation is not None:
+        pipeline_kwargs["ablation"] = ablation
+    elif mode == "full":
+        # full 对照使用最高档：图谱检索 + verifier。
+        pipeline_kwargs["ablation"] = "verifier"
     pipeline = (
         build_baseline_pipeline(**pipeline_kwargs)
         if mode == "baseline"

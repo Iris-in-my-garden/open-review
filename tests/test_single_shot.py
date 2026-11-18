@@ -68,7 +68,7 @@ class CapturingLLM:
 
 def test_single_shot_uses_one_call_and_keeps_triage_focus():
     llm = CapturingLLM()
-    reviewer = SingleShotReviewer(llm_client=llm, aspect_timeout=5)
+    reviewer = SingleShotReviewer(llm_client=llm)
 
     result = reviewer.review(
         _pr(),

@@ -168,7 +168,8 @@ class ReportWriter:
                 for key, label in (
                     ("files", "Files"),
                     ("batches", "Batches"),
-                    ("reviewer_mode", "Reviewer Mode"),
+                    ("ablation", "Ablation"),
+                    ("retrieval_mode", "Retrieval Mode"),
                     ("aspects", "Focus Aspects"),
                     ("llm_calls", "LLM Calls"),
                     ("estimated_patch_tokens", "Estimated Patch Tokens"),

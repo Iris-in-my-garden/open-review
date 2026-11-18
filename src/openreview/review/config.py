@@ -6,6 +6,9 @@
 - ``ReviewPipeline`` 不再把 30+ 个参数散落在构造函数里；
 - review cache key 可以从同一份配置生成，避免“改了 batch/context/工具配置
   但缓存 key 没变”导致误命中。
+
+检索与后处理通过固定的四档消融配置控制（见 :mod:`openreview.review.ablation`），
+不再暴露多个重叠的检索 / 审查开关。
 """
 
 from __future__ import annotations
@@ -14,17 +17,22 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 from openreview.domain.versions import REVIEW_CACHE_SCHEMA_VERSION
+from openreview.review.ablation import (
+    ABLATION_LEVELS,
+    RETRIEVAL_MODES,
+    resolve_ablation,
+)
 from openreview.review.token_budget import (
     DEFAULT_HARD_PROMPT_TOKENS,
     DEFAULT_SOFT_PROMPT_TOKENS,
 )
 
-REVIEWER_MODES = frozenset({"single", "multi_aspect"})
 LLM_CACHE_MODES = frozenset({"auto", "record", "replay"})
 
 __all__ = [
+    "ABLATION_LEVELS",
     "LLM_CACHE_MODES",
-    "REVIEWER_MODES",
+    "RETRIEVAL_MODES",
     "REVIEW_CACHE_SCHEMA_VERSION",
     "ReviewConfig",
 ]
@@ -61,14 +69,12 @@ class ReviewConfig:
     soft_prompt_tokens: int = DEFAULT_SOFT_PROMPT_TOKENS
     hard_prompt_tokens: int = DEFAULT_HARD_PROMPT_TOKENS
 
-    # reviewer / 并发
-    reviewer_mode: str = "single"
-    max_workers: int = 4
-    aspect_timeout: float = 90.0
+    # 固定消融阶梯；None 表示生产默认（图谱检索 + triage + impact + verifier）。
+    ablation: Optional[str] = None
+    # none | ast | graph
+    retrieval_mode: str = "graph"
 
     # 检索与证据增强
-    hybrid_retrieval_enabled: bool = True
-    graph_retrieval_enabled: bool = True
     index_cache_dir: Optional[str] = None
     triage_enabled: bool = True
     impact_enabled: bool = True
@@ -95,13 +101,25 @@ class ReviewConfig:
     cache_schema_version: int = REVIEW_CACHE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        normalized_mode = self.reviewer_mode.strip().lower().replace("-", "_")
-        if normalized_mode not in REVIEWER_MODES:
-            raise ValueError(
-                "reviewer_mode must be 'single' or 'multi_aspect', "
-                f"got {self.reviewer_mode!r}"
+        if self.ablation is not None:
+            spec = resolve_ablation(self.ablation)
+            object.__setattr__(self, "ablation", spec.name)
+            object.__setattr__(self, "retrieval_mode", spec.retrieval_mode)
+            object.__setattr__(self, "verifier_enabled", spec.verifier_enabled)
+            object.__setattr__(self, "triage_enabled", spec.triage_enabled)
+            object.__setattr__(self, "impact_enabled", spec.impact_enabled)
+            object.__setattr__(
+                self, "static_analysis_enabled", spec.static_analysis_enabled
             )
-        object.__setattr__(self, "reviewer_mode", normalized_mode)
+
+        normalized_retrieval = self.retrieval_mode.strip().lower()
+        if normalized_retrieval not in RETRIEVAL_MODES:
+            choices = ", ".join(RETRIEVAL_MODES)
+            raise ValueError(
+                f"retrieval_mode must be one of {choices}, "
+                f"got {self.retrieval_mode!r}"
+            )
+        object.__setattr__(self, "retrieval_mode", normalized_retrieval)
 
         if self.soft_prompt_tokens <= 0 or self.hard_prompt_tokens <= 0:
             raise ValueError(
@@ -148,23 +166,20 @@ class ReviewConfig:
         """
         return [
             f"schema={self.cache_schema_version}",
-            f"reviewer={self.reviewer_mode}",
+            f"ablation={self.ablation or 'custom'}",
+            f"retrieval={self.retrieval_mode}",
             f"triage={int(self.triage_enabled)}",
             f"impact={int(self.impact_enabled)}",
             f"static={int(self.static_analysis_enabled)}",
             f"static_tools={','.join(self.static_tools)}",
             f"verifier={int(self.verifier_enabled)}",
             f"verify_severities={','.join(self.verify_severities)}",
-            f"hybrid={int(self.hybrid_retrieval_enabled)}",
-            f"graph={int(self.graph_retrieval_enabled)}",
             f"max_batch_tokens={self.max_batch_tokens}",
             f"max_patch_tokens={self.max_patch_tokens}",
             f"hard_patch_tokens={self.hard_patch_tokens}",
             f"max_context_tokens={self.max_context_tokens}",
             f"soft_prompt_tokens={self.soft_prompt_tokens}",
             f"hard_prompt_tokens={self.hard_prompt_tokens}",
-            f"max_workers={self.max_workers}",
-            f"aspect_timeout={self.aspect_timeout}",
             f"llm_timeout={self.llm_timeout}",
             f"llm_max_retries={self.llm_max_retries}",
             f"max_completion_tokens={self.max_completion_tokens}",

@@ -520,7 +520,7 @@ class ReviewExecutor:
                 aspects = state.selected_aspects or list(ALL_ASPECTS)
                 calls_per_batch = self._reviewer_call_count(aspects)
                 # 先用“剩余调用数”收窄维度，再检查 token / 时间预算。
-                # 多维度模式可以只跑部分维度；单遍模式无法拆分，只能整批跳过。
+                # 自定义 reviewer 可以只跑部分维度；单遍模式无法拆分，只能整批跳过。
                 remaining_calls = state.budget.remaining_calls()
                 if (
                     remaining_calls is not None
@@ -824,8 +824,8 @@ class ReviewExecutor:
     def _reviewer_call_count(self, aspects: Sequence[str]) -> int:
         """每个 batch 预计消耗的 LLM 调用数。
 
-        single-pass reviewer 显式声明 ``calls_per_review=1``；多维度模式和
-        测试里的自定义 reviewer 没有这个属性，按 aspect 数量计算。
+        single-pass reviewer 显式声明 ``calls_per_review=1``；测试里的自定义
+        reviewer 没有这个属性，按 aspect 数量计算。
         """
         explicit = getattr(self.reviewer, "calls_per_review", None)
         if explicit is not None:

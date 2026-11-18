@@ -39,7 +39,7 @@ class FileLLMCacheClient:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.hits = 0
         self.misses = 0
-        # 多维度 reviewer 会在线程池里并发调用同一个 wrapper；计数和
+        # 并发 review 会共享同一个 wrapper；计数和
         # “读 cache + 调 provider + 写 cache”都需要保护。
         self._counter_lock = threading.Lock()
         self._key_locks_lock = threading.Lock()

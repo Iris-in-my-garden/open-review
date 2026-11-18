@@ -73,50 +73,14 @@ def review(
             "0 removes this cap, but the internal prompt budget still applies"
         ),
     ),
-    reviewer_mode: str = typer.Option(
-        "single",
-        "--reviewer-mode",
-        help="Reviewer strategy: single (default, 1 call/batch) | multi_aspect (high recall)",
-    ),
-    max_workers: int = typer.Option(
-        4,
-        "--max-workers",
-        help="Max parallel aspect reviewers (multi_aspect mode only)",
-    ),
-    triage_enabled: bool = typer.Option(
-        True,
-        "--triage/--no-triage",
-        help="Enable rule-based triage (skip docs-only PRs, narrow review focus)",
-    ),
-    impact_enabled: bool = typer.Option(
-        True,
-        "--impact/--no-impact",
-        help="Inject cross-file references of changed symbols as context",
-    ),
-    static_analysis_enabled: bool = typer.Option(
-        False,
-        "--static-analysis/--no-static-analysis",
-        help="Run ruff/mypy on changed files and inject findings (executes local tools)",
-    ),
-    static_tools: str = typer.Option(
-        "ruff",
-        "--static-tools",
-        help="Comma separated static analysis tools: ruff,mypy",
-    ),
-    verifier_enabled: bool = typer.Option(
-        True,
-        "--verifier/--no-verifier",
-        help="Run a second-pass semantic verifier on critical/high findings",
-    ),
-    hybrid_retrieval_enabled: bool = typer.Option(
-        True,
-        "--hybrid-retrieval/--no-hybrid-retrieval",
-        help="Enable FTS5 symbol index on top of tree-sitter AST retrieval",
-    ),
-    graph_retrieval_enabled: bool = typer.Option(
-        True,
-        "--graph-retrieval/--no-graph-retrieval",
-        help="Enable import/call graph expansion for changed symbols",
+    ablation: Optional[str] = typer.Option(
+        None,
+        "--ablation",
+        help=(
+            "Fixed ablation level: diff (patch only) | ast (+AST folding) | "
+            "graph (+code graph) | verifier (+post-hoc verifier). "
+            "Omit to run the production pipeline."
+        ),
     ),
     budget_calls: int = typer.Option(
         0,
@@ -207,17 +171,7 @@ def review(
             llm_base_url=llm_base_url,
             mock_llm=mock_llm,
             max_batch_tokens=max_batch_tokens,
-            reviewer_mode=reviewer_mode,
-            max_workers=max_workers,
-            triage_enabled=triage_enabled,
-            impact_enabled=impact_enabled,
-            static_analysis_enabled=static_analysis_enabled,
-            static_tools=tuple(
-                tool.strip() for tool in static_tools.split(",") if tool.strip()
-            ),
-            verifier_enabled=verifier_enabled,
-            hybrid_retrieval_enabled=hybrid_retrieval_enabled,
-            graph_retrieval_enabled=graph_retrieval_enabled,
+            ablation=ablation,
             budget_calls=budget_calls,
             budget_tokens=budget_tokens,
             budget_output_tokens=budget_output_tokens,

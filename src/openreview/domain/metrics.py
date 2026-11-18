@@ -60,7 +60,7 @@ class RetrievalMetrics(TypedDict, total=False):
     index_context_files: int
     context_file_list: List[str]
     index_context_file_list: List[str]
-    hybrid_enabled: bool
+    retrieval_mode: str
     graph_enabled: bool
     graph_contexts: int
     graph_context_kinds: Dict[str, int]
@@ -109,7 +109,8 @@ class RunMetrics(TypedDict, total=False):
     diff: DiffMetrics
     retrieval: RetrievalMetrics
     batches: int
-    reviewer_mode: str
+    ablation: str
+    retrieval_mode: str
     aspects: int
     llm_calls: int
     llm_calls_detail: List[Dict[str, object]]

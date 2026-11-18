@@ -3,7 +3,7 @@
 图工作流的第一个条件边：不是所有 PR 都值得跑完整的 LLM 审查。
 这里只用确定性规则，不调用模型，因此 triage 本身没有成本。
 
-单遍模式下 ``aspects`` 表示“审查重点”，多维度模式下表示实际运行的维度。
+单遍模式下 ``aspects`` 表示“审查重点”，用于在 prompt 中收窄注意力。
 """
 
 from __future__ import annotations

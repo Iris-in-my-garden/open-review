@@ -1,10 +1,11 @@
 """单遍审查（single-pass）实现。
 
-默认生产路径使用一次结构化 LLM 调用覆盖四类风险；大 PR 仍由
+每个 batch 用一次结构化 LLM 调用覆盖五类风险；大 PR 仍由
 ``plan_review_batches`` 按内部 prompt 预算拆成多个 batch，因此
 “single-shot”指每个 batch 一次调用，而不是整个 PR 只调用一次。
 
-多维度并行审查保留在 ``aspect_reviewer.py``，作为高召回模式和消融配置。
+原 multi-aspect 并行审查已移除：在没有证据表明四倍调用能带来成比例收益前，
+只保留单遍路径，降低成本和评测维度。
 """
 
 from __future__ import annotations
@@ -14,11 +15,15 @@ from typing import List, Optional
 from openreview.domain.models import PullRequestInfo, ReviewResult
 from openreview.repo.diff_parser import ParsedDiff
 from openreview.retriever.code_context import CodeContext
-from openreview.review.aspect_reviewer import ReviewOrchestrator, finalize_review_result
+from openreview.review.finalize import finalize_review_result
+from openreview.review.finding_validator import FindingValidator
+from openreview.review.llm_client import AbstractLLMClient, LLMClient
 from openreview.review.output_parser import (
     AspectReviewOutputSchema,
     AspectReviewTaskResult,
+    OutputParser,
 )
+from openreview.review.prompt_builder import PromptBuilder
 
 SINGLE_SHOT_INSTRUCTION = """### 【一次性审查任务】
 请在一次输出中覆盖以下五类风险，并在每个 issue 的 category 中标明类别：
@@ -38,17 +43,27 @@ SINGLE_SHOT_INSTRUCTION = """### 【一次性审查任务】
 """
 
 
-class SingleShotReviewer(ReviewOrchestrator):
-    """每个 batch 用一次 LLM 调用完成审查。
-
-    继续继承 ``ReviewOrchestrator``，是为了复用同一套 prompt、schema、
-    validator 和结果聚合逻辑；区别只在于不创建 4 个 aspect worker。
-    """
+class SingleShotReviewer:
+    """每个 batch 用一次 LLM 调用完成审查。"""
 
     # 供 ReviewPipeline 做预算预检：单遍审查每个 batch 固定 1 次调用。
     calls_per_review = 1
-    # 单遍审查不能像多维度那样“只跑剩余的几个维度”，预算不足时整批跳过。
+    # 预算不足时整批跳过，不存在“只跑部分维度”的中间态。
     supports_aspect_narrowing = False
+
+    def __init__(
+        self,
+        prompt_builder: Optional[PromptBuilder] = None,
+        llm_client: Optional[AbstractLLMClient] = None,
+        output_parser: Optional[OutputParser] = None,
+        validator: Optional[FindingValidator] = None,
+        debug_sink=None,
+    ):
+        self.prompt_builder = prompt_builder or PromptBuilder()
+        self.llm_client = llm_client or LLMClient()
+        self.output_parser = output_parser or OutputParser()
+        self.validator = validator or FindingValidator()
+        self.debug_sink = debug_sink
 
     def review(
         self,
@@ -58,7 +73,7 @@ class SingleShotReviewer(ReviewOrchestrator):
         repo_path=None,
         aspects: Optional[List[str]] = None,
     ) -> ReviewResult:
-        # aspects 在单遍模式下是 triage 给出的“审查重点”，不是调用次数。
+        # aspects 是 triage 给出的“审查重点”，不是调用次数。
         focus = self._focus_instruction(aspects)
         system_prompt = self.prompt_builder.build_system_prompt()
         user_prompt = self.prompt_builder.build_user_prompt(

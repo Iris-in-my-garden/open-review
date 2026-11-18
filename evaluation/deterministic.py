@@ -102,7 +102,6 @@ def compute_deterministic_metrics(
         "evidence_ungrounded": 0,
         "triage_skipped": 0,
         "attributed_issues": 0,
-        "multi_aspect_issues": 0,
         "grounding_unavailable": 0,
     }
     triage_reasons: Counter[str] = Counter()
@@ -227,8 +226,6 @@ def compute_deterministic_metrics(
 
             if aspects:
                 counters["attributed_issues"] += 1
-                if len(aspects) > 1:
-                    counters["multi_aspect_issues"] += 1
                 for aspect in aspects:
                     aspect_counts[str(aspect)] += 1
 
@@ -327,9 +324,7 @@ def compute_deterministic_metrics(
         },
         "attribution": {
             "attributed_issues": counters["attributed_issues"],
-            "multi_aspect_issues": counters["multi_aspect_issues"],
             "coverage": _rate(counters["attributed_issues"], issues),
-            "multi_aspect_rate": _rate(counters["multi_aspect_issues"], issues),
             "aspect_counts": dict(aspect_counts.most_common()),
         },
         "retrieval": {
@@ -394,7 +389,6 @@ def print_summary(metrics: Dict[str, Any]) -> None:
     )
     print(
         f"attribution: coverage={metrics['attribution']['coverage']} "
-        f"multi_aspect_rate={metrics['attribution']['multi_aspect_rate']} "
         f"counts={metrics['attribution']['aspect_counts']}"
     )
     print(

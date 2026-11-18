@@ -157,7 +157,6 @@ def test_deterministic_metrics_aggregate(tmp_path: Path, monkeypatch):
     assert metrics["triage"]["skip_rate"] == 1.0
     assert metrics["triage"]["reasons"] == {"docs-only": 1}
     assert metrics["attribution"]["coverage"] == 0.667
-    assert metrics["attribution"]["multi_aspect_rate"] == 0.333
     assert metrics["attribution"]["aspect_counts"] == {"bugs": 2, "security": 1}
     assert metrics["retrieval"]["contexts"] == 5
     assert metrics["retrieval"]["mean_changed_file_coverage"] == 0.5
