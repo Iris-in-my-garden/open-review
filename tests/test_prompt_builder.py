@@ -133,6 +133,16 @@ def test_all_aspects_share_system_prefix_and_persona_is_at_end():
     assert bugs.index("QA") > bugs.index(UNTRUSTED_START)
 
 
+def test_clean_code_persona_rejects_subjective_maintenance_claims():
+    prompt = PromptBuilder().build_user_prompt_for_aspect(
+        "clean_code", _pr(), _diff(), []
+    )
+
+    assert "直接影响 bug 修复" in prompt
+    assert "禁止报告纯风格偏好" in prompt
+    assert "缺少具体维护影响" in prompt
+
+
 def test_context_ids_are_rendered_and_injected_next_to_matching_file():
     same_file = CodeContext(
         file_path="src/utils.py",
@@ -179,8 +189,15 @@ def test_output_constraints_cover_evidence_threshold_and_scope():
 
     # evidence 不能带行号/`|` 前缀，否则 validator 无法精确匹配。
     assert "不要包含行号" in prompt
-    # 模型必须知道系统真实的置信度阈值。
+    # 模型必须知道系统真实的置信度阈值和分档。
     assert "低于 0.6 会被直接丢弃" in prompt
+    assert "0.90–1.00" in prompt
+    assert "0.75–0.89" in prompt
+    assert "0.60–0.74" in prompt
+    assert "禁止因风险类别或潜在影响而上调置信度" in prompt
+    # Finding Gate 和预算截断边界必须可见。
+    assert "触发条件、执行路径、实际结果、可观察影响" in prompt
+    assert "不得推测被省略代码的行为" in prompt
     # 默认只报本次 diff 引入的问题；历史问题需要显式 scope 且默认被过滤。
     assert "本次 diff 引入" in prompt
     assert "pre_existing" in prompt
@@ -212,7 +229,7 @@ def test_task_instruction_is_placed_before_output_constraints():
 
     assert prompt.index("### 【任务】") < prompt.index("### 【输出约束】")
     # 输出约束仍然是 prompt 的最后一段，模型最后读到的是格式要求。
-    assert prompt.rstrip().endswith("禁止编造不存在的 ID。")
+    assert prompt.rstrip().endswith("直接省略该 finding。")
 
 
 def test_prompt_redacts_credentials_before_leaving_process():

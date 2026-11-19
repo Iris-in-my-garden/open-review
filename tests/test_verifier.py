@@ -4,7 +4,11 @@ from pydantic import BaseModel
 
 from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
 from openreview.review.report_writer import PotentialIssue, ReviewResult
-from openreview.review.verifier import FindingVerifier, VerifierResult
+from openreview.review.verifier import (
+    VERIFIER_SYSTEM_PROMPT,
+    FindingVerifier,
+    VerifierResult,
+)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -37,6 +41,15 @@ class ScriptedVerifierLLM:
                 for issue_id, verdict in self.verdicts.items()
             ]
         )
+
+
+def test_verifier_prompt_requires_evidence_gate_and_category_rules():
+    assert "完整因果链" in VERIFIER_SYSTEM_PROMPT
+    assert "test_gap" in VERIFIER_SYSTEM_PROMPT
+    assert "clean_code" in VERIFIER_SYSTEM_PROMPT
+    assert "环境变量、配置、跨文件调用" in VERIFIER_SYSTEM_PROMPT
+    assert "不能只有“可能无风险”" in VERIFIER_SYSTEM_PROMPT
+    assert "medium 级别也必须经过同一套证据门槛" in VERIFIER_SYSTEM_PROMPT
 
 
 def _issue(line: int, severity: str = "high", confidence: float = 0.8) -> PotentialIssue:

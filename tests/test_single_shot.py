@@ -5,7 +5,10 @@ from pydantic import BaseModel
 from openreview.github.client import PullRequestInfo
 from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
 from openreview.review.output_parser import PotentialIssueSchema
-from openreview.review.single_shot import SingleShotReviewer
+from openreview.review.single_shot import (
+    SINGLE_SHOT_INSTRUCTION,
+    SingleShotReviewer,
+)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -84,3 +87,10 @@ def test_single_shot_uses_one_call_and_keeps_triage_focus():
     assert len(result.potential_issues) == 1
     # single_shot 没有独立维度，用 finding 的 category 做归因。
     assert result.potential_issues[0].source_aspects == ["bugs"]
+
+
+def test_single_shot_instruction_contains_finding_gate_and_category_rules():
+    assert "触发条件、执行路径、实际结果、可观察影响" in SINGLE_SHOT_INSTRUCTION
+    assert "缺失的具体分支或输入" in SINGLE_SHOT_INSTRUCTION
+    assert "禁止纯风格偏好" in SINGLE_SHOT_INSTRUCTION
+    assert "不得因潜在影响严重而上调置信度" in SINGLE_SHOT_INSTRUCTION
