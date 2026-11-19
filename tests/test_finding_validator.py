@@ -191,6 +191,64 @@ def test_validate_invalid_line_is_dropped_instead_of_becoming_file_level():
     assert result.risk_level == "LOW"
 
 
+def test_validate_relocates_nearby_invalid_line_from_unique_evidence():
+    issue = PotentialIssue(
+        file="src/auth.py",
+        severity="High",
+        category="Security",
+        confidence=0.7,
+        reasoning="Hardcoded password.",
+        suggestion="Use env vars.",
+        line=3,
+        end_line=3,
+        evidence='password = "123"',
+    )
+    validator = FindingValidator()
+
+    result = validator.validate(_result([issue]), _diff_with_patch())
+
+    assert len(result.potential_issues) == 1
+    assert result.potential_issues[0].line == 1
+    assert result.potential_issues[0].end_line == 1
+    assert validator.last_stats["line_relocated"] == 1
+    assert validator.last_stats["invalid_line"] == 0
+
+
+def test_validate_does_not_relocate_ambiguous_evidence():
+    issue = PotentialIssue(
+        file="src/auth.py",
+        severity="High",
+        category="Security",
+        confidence=0.9,
+        reasoning="Ambiguous evidence.",
+        suggestion="Check it.",
+        line=4,
+        evidence="return password",
+    )
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="src/auth.py",
+                status="modified",
+                patch=(
+                    "@@ -0,0 +1,3 @@\n"
+                    "+return password\n"
+                    "+password = '123'\n"
+                    "+return password\n"
+                ),
+                visible_lines=[1, 2, 3],
+            )
+        ]
+    )
+    validator = FindingValidator()
+
+    result = validator.validate(_result([issue]), diff)
+
+    assert result.potential_issues == []
+    assert validator.last_stats["line_relocated"] == 0
+    assert validator.last_stats["invalid_line"] == 1
+
+
 def test_validate_drops_pre_existing_issues_by_default():
     issue = PotentialIssue(
         file="src/auth.py",
@@ -338,6 +396,7 @@ def test_validate_records_counters_for_eval():
         "dropped_unknown_file": 1,
         "dropped_pre_existing": 0,
         "invalid_line": 1,
+        "line_relocated": 0,
         "missing_line": 0,
         "missing_evidence": 0,
         "ungrounded_evidence": 0,
@@ -417,9 +476,47 @@ def test_validate_checks_suggested_patch_with_git_apply(tmp_path: Path):
     assert by_reason["Hardcoded password."].suggested_patch_valid is True
     assert by_reason["Another issue on the same line."].suggested_patch_valid is False
     assert by_reason["Another issue on the same line."].suggested_patch_error
+    assert by_reason["Another issue on the same line."].suggested_patch is None
+    assert by_reason["Another issue on the same line."].confidence == 0.95
     assert validator.last_stats["patch_checked"] == 2
     assert validator.last_stats["patch_valid"] == 1
     assert validator.last_stats["patch_invalid"] == 1
+
+
+def test_validate_retries_malformed_suggested_patch_with_recount(tmp_path: Path):
+    root = _git_repo_with_auth(tmp_path)
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="src/auth.py",
+                status="modified",
+                patch='@@ -1 +1 @@\n-password = "123"\n+password = "456"\n',
+                changed_lines=[1],
+                visible_lines=[1],
+            )
+        ]
+    )
+    issue = PotentialIssue(
+        file="src/auth.py",
+        severity="high",
+        category="security",
+        confidence=0.9,
+        reasoning="Hardcoded password.",
+        suggestion="Change the password.",
+        line=1,
+        evidence='password = "123"',
+        suggested_patch=(
+            '@@ -1 +1,2 @@\n-password = "123"\n+password = "456"\n'
+        ),
+    )
+
+    result = FindingValidator().validate(
+        _result([issue]), diff, repo_path=root
+    )
+
+    assert len(result.potential_issues) == 1
+    assert result.potential_issues[0].suggested_patch_valid is True
+    assert result.potential_issues[0].suggested_patch is not None
 
 
 def test_validate_redacts_secrets_but_still_grounds_evidence():

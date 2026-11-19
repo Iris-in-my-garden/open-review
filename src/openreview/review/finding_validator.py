@@ -132,6 +132,7 @@ class FindingValidator:
             "dropped_unknown_file": 0,
             "dropped_pre_existing": 0,
             "invalid_line": 0,
+            "line_relocated": 0,
             "missing_line": 0,
             "missing_evidence": 0,
             "ungrounded_evidence": 0,
@@ -166,6 +167,7 @@ class FindingValidator:
                 "status": "kept",
                 "drop_reason": None,
                 "evidence_method": None,
+                "line_relocated": False,
                 "patch_valid": None,
                 "patch_error": None,
             }
@@ -207,6 +209,23 @@ class FindingValidator:
                     if issue.side == "LEFT"
                     else file_diff.visible_lines
                 )
+                if visible and issue.line not in visible:
+                    relocated_line = _relocate_line_from_evidence(
+                        file_diff.patch or "",
+                        issue.line,
+                        issue.side,
+                        issue.evidence,
+                        visible,
+                    )
+                    if relocated_line is not None:
+                        line_delta = relocated_line - issue.line
+                        issue.line = relocated_line
+                        if issue.end_line is not None:
+                            issue.end_line += line_delta
+                        record["line"] = issue.line
+                        record["end_line"] = issue.end_line
+                        record["line_relocated"] = True
+                        stats["line_relocated"] += 1
                 if visible:
                     if issue.line not in visible:
                         stats["invalid_line"] += 1
@@ -267,6 +286,9 @@ class FindingValidator:
                     stats["patch_valid"] += 1
                 else:
                     stats["patch_invalid"] += 1
+                    # A patch is optional remediation detail; a malformed or
+                    # stale patch must not suppress an otherwise valid finding.
+                    issue.suggested_patch = None
 
             issue.confidence = round(max(0.0, min(1.0, confidence)), 2)
             record["confidence_after"] = issue.confidence
@@ -415,21 +437,40 @@ class FindingValidator:
             patch += "\n"
 
         try:
+            command = [
+                "git",
+                "-C",
+                str(repo_path),
+                "apply",
+                "--check",
+                "--whitespace=nowarn",
+                "-",
+            ]
             completed = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(repo_path),
-                    "apply",
-                    "--check",
-                    "--whitespace=nowarn",
-                    "-",
-                ],
+                command,
                 input=patch.encode("utf-8", errors="ignore"),
                 capture_output=True,
                 timeout=10,
                 check=False,
             )
+            if completed.returncode != 0:
+                completed = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repo_path),
+                        "apply",
+                        "--check",
+                        "--recount",
+                        "-C1",
+                        "--whitespace=nowarn",
+                        "-",
+                    ],
+                    input=patch.encode("utf-8", errors="ignore"),
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
         except (OSError, subprocess.TimeoutExpired) as exc:
             return False, f"git apply failed: {type(exc).__name__}"
 
@@ -573,6 +614,63 @@ def _extract_patch_window(
             old_line += 1
             new_line += 1
     return "\n".join(selected)
+
+
+def _relocate_line_from_evidence(
+    patch: str,
+    reported_line: int,
+    side: str,
+    evidence: Optional[str],
+    visible_lines: Sequence[int],
+) -> Optional[int]:
+    """Relocate a nearby invalid line only when evidence has one exact anchor."""
+    normalized_evidence = _normalize_text(redact_text(evidence or "")[0])
+    if not normalized_evidence:
+        return None
+
+    side_lines: Dict[int, str] = {}
+    old_line: Optional[int] = None
+    new_line: Optional[int] = None
+    for raw_line in patch.splitlines():
+        header = HUNK_RANGE_PATTERN.match(raw_line)
+        if header:
+            old_line = int(header.group(1))
+            new_line = int(header.group(3))
+            continue
+        if old_line is None or new_line is None:
+            continue
+        if raw_line.startswith("+"):
+            if side != "LEFT":
+                side_lines[new_line] = raw_line[1:]
+            new_line += 1
+        elif raw_line.startswith("-"):
+            if side == "LEFT":
+                side_lines[old_line] = raw_line[1:]
+            old_line += 1
+        elif raw_line.startswith(" "):
+            side_lines[old_line if side == "LEFT" else new_line] = raw_line[1:]
+            old_line += 1
+            new_line += 1
+
+    visible = set(visible_lines)
+    evidence_line_count = max(1, len(evidence.splitlines()))
+    matches: List[int] = []
+    for candidate in sorted(visible):
+        if abs(candidate - reported_line) > 3:
+            continue
+        selected = [
+            side_lines.get(line)
+            for line in range(candidate, candidate + evidence_line_count)
+        ]
+        if any(line is None for line in selected):
+            continue
+        snippet = redact_text(
+            "\n".join(line for line in selected if line is not None)
+        )[0]
+        if normalized_evidence in _normalize_text(snippet):
+            matches.append(candidate)
+
+    return matches[0] if len(matches) == 1 else None
 
 
 def _normalize_text(text: str) -> str:
