@@ -825,6 +825,7 @@ def test_review_cache_key_includes_output_affecting_config(tmp_path: Path):
     assert key_for(hard_prompt_tokens=15_000) != base
     assert key_for(static_tools=("ruff", "mypy")) != base
     assert key_for(verify_severities=("high",)) != base
+    assert key_for(verify_confidence_threshold=0.8) != base
     assert key_for(ablation="diff") != base
     assert key_for(ablation="graph") != base
 

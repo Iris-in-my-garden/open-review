@@ -28,6 +28,11 @@ class ScriptedVerifierLLM:
                     verdict=verdict,
                     confidence=0.9 if verdict == "verified" else 0.5,
                     reason=f"{verdict} reason",
+                    counter_argument=(
+                        "The surrounding code validates the value."
+                        if verdict == "verified"
+                        else ""
+                    ),
                 )
                 for issue_id, verdict in self.verdicts.items()
             ]
@@ -127,6 +132,7 @@ class LowConfidenceVerifiedLLM:
                     verdict="verified",
                     confidence=0.2,
                     reason="looks plausible",
+                    counter_argument="The surrounding code validates the value.",
                 )
             ]
         )
@@ -155,3 +161,161 @@ def test_verifier_treats_unknown_verdict_as_needs_more_context():
     assert stats.verified == 0
     assert stats.needs_more_context == 1
     assert result.potential_issues[0].confidence == 0.7
+
+
+def test_verifier_includes_low_confidence_medium_findings():
+    llm = ScriptedVerifierLLM(
+        {
+            "issue-1": "verified",
+            "issue-3": "verified",
+            "issue-4": "verified",
+        }
+    )
+    issues = [
+        _issue(1, severity="medium", confidence=0.74),
+        _issue(2, severity="medium", confidence=0.75),
+        _issue(3, severity="low", confidence=0.7),
+        _issue(4, severity="critical", confidence=0.9),
+    ]
+
+    result, stats = FindingVerifier(llm).verify(_result(issues), _diff(), [])
+
+    assert stats.candidates == 3
+    assert stats.verified == 3
+    assert len(result.potential_issues) == 4
+
+
+def test_verifier_requires_counter_argument_for_verified_result():
+    class MissingCounterArgumentLLM:
+        def generate_structured(self, system_prompt, user_prompt, response_schema):
+            return response_schema(
+                results=[
+                    VerifierResult(
+                        issue_id="issue-1",
+                        verdict="verified",
+                        confidence=0.9,
+                        reason="supported",
+                    )
+                ]
+            )
+
+    result, stats = FindingVerifier(MissingCounterArgumentLLM()).verify(
+        _result([_issue(1)]), _diff(), []
+    )
+
+    assert stats.missing_counter_arguments == 2
+    assert stats.verified == 0
+    assert stats.needs_more_context == 1
+    assert result.potential_issues[0].confidence == 0.7
+
+
+def test_verifier_prompt_uses_short_claim_not_reviewer_reasoning():
+    issue = _issue(1)
+    issue.reasoning = "A concise claim. " + ("Long reviewer chain. " * 30)
+    verifier = FindingVerifier(ScriptedVerifierLLM({}))
+
+    prompt = verifier._build_prompt(
+        [("issue-1", issue)],
+        _diff(),
+        [],
+        None,
+        expanded=False,
+    )
+
+    assert '"claim": "A concise claim.' in prompt
+    assert '"reasoning"' not in prompt
+    assert '"suggestion"' not in prompt
+    assert "Long reviewer chain." not in prompt
+
+
+def test_verifier_retrieves_missing_symbol_before_expanding_source(tmp_path):
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "a.py").write_text("value = 1\n", encoding="utf-8")
+    (source_dir / "helper.py").write_text(
+        "def load_user(user_id):\n"
+        "    return lookup(user_id)\n",
+        encoding="utf-8",
+    )
+
+    class MissingSymbolLLM:
+        def __init__(self):
+            self.prompts = []
+
+        def generate_structured(self, system_prompt, user_prompt, response_schema):
+            self.prompts.append(user_prompt)
+            if len(self.prompts) == 1:
+                return response_schema(
+                    results=[
+                        VerifierResult(
+                            issue_id="issue-1",
+                            verdict="needs_more_context",
+                            confidence=0.5,
+                            missing_symbol="load_user",
+                        )
+                    ]
+                )
+            return response_schema(
+                results=[
+                    VerifierResult(
+                        issue_id="issue-1",
+                        verdict="verified",
+                        confidence=0.9,
+                        counter_argument=(
+                            "The helper receives a validated user identifier."
+                        ),
+                    )
+                ]
+            )
+
+    llm = MissingSymbolLLM()
+    result, stats = FindingVerifier(llm).verify(
+        _result([_issue(1)]), _diff(), [], repo_path=tmp_path
+    )
+
+    assert stats.symbol_searches == 1
+    assert stats.symbol_contexts == 1
+    assert "symbol search: src/helper.py:1" in llm.prompts[1]
+    assert "def load_user(user_id):" in llm.prompts[1]
+    assert len(result.potential_issues) == 1
+
+
+def test_verifier_expands_source_when_missing_symbol_has_no_definition(tmp_path):
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    source_lines = ["value = 1"] + [f"value_{i} = {i}" for i in range(2, 20)]
+    (source_dir / "a.py").write_text(
+        "\n".join(source_lines) + "\n", encoding="utf-8"
+    )
+
+    class MissingSymbolLLM:
+        def __init__(self):
+            self.prompts = []
+
+        def generate_structured(self, system_prompt, user_prompt, response_schema):
+            self.prompts.append(user_prompt)
+            verdict = "needs_more_context" if len(self.prompts) == 1 else "rejected"
+            return response_schema(
+                results=[
+                    VerifierResult(
+                        issue_id="issue-1",
+                        verdict=verdict,
+                        confidence=0.8,
+                        missing_symbol="not_defined_anywhere",
+                    )
+                ]
+            )
+
+    llm = MissingSymbolLLM()
+    FindingVerifier(llm).verify(
+        _result([_issue(1)]), _diff(), [], repo_path=tmp_path
+    )
+
+    assert "8: value_8 = 8" not in llm.prompts[0]
+    assert "8: value_8 = 8" in llm.prompts[1]
+
+
+def test_verifier_rejects_unsafe_missing_symbol_names(tmp_path):
+    assert FindingVerifier._search_symbol_contexts(
+        tmp_path, "name; touch /tmp/pwned", deadline=10**10
+    ) == []

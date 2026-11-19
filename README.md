@@ -94,7 +94,7 @@ GitHub PR URL
 └────────┬────────┘
          ▼
 ┌─────────────────┐
-│ FindingVerifier │  critical/high 语义复核（受 ReviewBudget 限制）
+│ FindingVerifier │  critical/high 或低置信度语义复核（有界检索与预算）
 └────────┬────────┘
          ▼
 ┌─────────────────┐     ┌──────────────────────┐

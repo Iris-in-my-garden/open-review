@@ -87,6 +87,7 @@ class ReviewPipeline:
         static_tools: Sequence[str] = ("ruff",),
         verifier_enabled: bool = True,
         verify_severities: Sequence[str] = ("critical", "high"),
+        verify_confidence_threshold: float = 0.75,
         budget_calls: int = 0,
         budget_tokens: int = 0,
         budget_output_tokens: int = 0,
@@ -126,6 +127,7 @@ class ReviewPipeline:
             static_tools=static_tools,
             verifier_enabled=verifier_enabled,
             verify_severities=verify_severities,
+            verify_confidence_threshold=verify_confidence_threshold,
             budget_calls=budget_calls,
             budget_tokens=budget_tokens,
             budget_output_tokens=budget_output_tokens,
@@ -231,6 +233,9 @@ class ReviewPipeline:
         return FindingVerifier(
             llm_client,
             verify_severities=self.config.verify_severities,
+            candidate_confidence_threshold=(
+                self.config.verify_confidence_threshold
+            ),
             debug_sink=self.debug_sink,
         )
 

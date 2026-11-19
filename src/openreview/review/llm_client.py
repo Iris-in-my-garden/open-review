@@ -322,6 +322,7 @@ class MockLLMClient:
                         "confidence": 0.8,
                         "reason": "[MOCK] 证据可定位。",
                         "evidence": "",
+                        "counter_argument": "[MOCK] 周边代码不存在可绕过的校验路径。",
                     }
                     for issue_id in issue_ids
                 ]

@@ -82,6 +82,7 @@ class ReviewConfig:
     static_tools: Sequence[str] = ("ruff",)
     verifier_enabled: bool = True
     verify_severities: Sequence[str] = ("critical", "high")
+    verify_confidence_threshold: float = 0.75
 
     # 预算
     budget_calls: int = 0
@@ -157,6 +158,10 @@ class ReviewConfig:
                 if str(severity).strip()
             ),
         )
+        if not 0.0 <= self.verify_confidence_threshold <= 1.0:
+            raise ValueError(
+                "verify_confidence_threshold must be between 0 and 1"
+            )
 
     def cache_key_parts(self) -> List[str]:
         """所有会影响 review 输出的配置。
@@ -174,6 +179,7 @@ class ReviewConfig:
             f"static_tools={','.join(self.static_tools)}",
             f"verifier={int(self.verifier_enabled)}",
             f"verify_severities={','.join(self.verify_severities)}",
+            f"verify_confidence_threshold={self.verify_confidence_threshold}",
             f"max_batch_tokens={self.max_batch_tokens}",
             f"max_patch_tokens={self.max_patch_tokens}",
             f"hard_patch_tokens={self.hard_patch_tokens}",
