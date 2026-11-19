@@ -965,6 +965,8 @@ def test_metrics_carry_run_identity_versions_and_error_taxonomy(tmp_path: Path):
 
         assert metrics["schema_version"] == METRICS_SCHEMA_VERSION
         assert metrics["run_id"] == pipeline.last_state.run_id
+        assert metrics["verification"]["schema_version"] == 1
+        assert metrics["verification"]["available"] is False
         assert {"prompt", "validator", "retriever"} <= set(metrics["versions"])
         assert metrics["errors"][0]["category"] == "internal"
         assert metrics["errors"][0]["batch"] == 1

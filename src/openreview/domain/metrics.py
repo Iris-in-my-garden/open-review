@@ -99,6 +99,59 @@ class OutcomeMetrics(TypedDict):
     errors: List[ErrorRecord]
 
 
+class VerificationStages(TypedDict):
+    raw_count: int
+    validator_kept: int
+    verifier_candidates: int
+    final_count: int
+
+
+class ValidatorDrops(TypedDict):
+    by_diff_scope: int
+    by_evidence_mismatch: int
+    by_low_confidence: int
+    deduplicated: int
+
+
+class VerifierDrops(TypedDict):
+    rejected: int
+    dropped_by_low_confidence: int
+
+
+class VerificationDrops(TypedDict):
+    validator: ValidatorDrops
+    verifier: VerifierDrops
+
+
+class VerificationEvents(TypedDict):
+    stripped_invalid_patch: int
+    ungrounded_evidence: int
+    missing_evidence: int
+    line_relocated: int
+    needs_more_context: int
+    not_checked_by_verifier: int
+
+
+class VerificationConservation(TypedDict):
+    validator_balanced: bool | None
+    verifier_balanced: bool | None
+
+
+class VerificationMetrics(TypedDict):
+    """Finding funnel counts, drop causes, and non-exclusive diagnostics.
+
+    Drop causes are mutually exclusive per finding within each stage.
+    Events may overlap with drops and must not be used for conservation checks.
+    """
+
+    schema_version: int
+    available: bool
+    stages: VerificationStages
+    drops: VerificationDrops
+    events: VerificationEvents
+    conservation: VerificationConservation
+
+
 class RunMetrics(TypedDict, total=False):
     schema_version: int
     run_id: str
@@ -121,6 +174,7 @@ class RunMetrics(TypedDict, total=False):
     static_analysis: Dict[str, object]
     validation: Dict[str, int]
     verifier: Dict[str, int]
+    verification: VerificationMetrics
     cache: CacheMetrics
     budget: BudgetMetrics
     llm_usage: Dict[str, int]

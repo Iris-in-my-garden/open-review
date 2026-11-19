@@ -10,7 +10,7 @@
 
 评测分两层：
 
-1. **无需 LLM 调用的确定性指标**（每次 CI 都能跑）：行号合法性、证据可定位性、triage 跳过、维度归因、validator 统计、token 用量。
+1. **无需 LLM 调用的确定性指标**（每次 CI 都能跑）：行号合法性、证据可定位性、triage 跳过、维度归因、Validator/Verifier 漏斗、token 用量。
 2. **可选语义指标**（调用 LLM judge，消耗 token）：复用 AACR-Bench 官方的文件级语义 P/R / balanced score。
 
 ---
@@ -295,6 +295,27 @@ missing_evidence / ungrounded_evidence / grounded_evidence / low_confidence /
 deduplicated`
 
 多批次 review 会逐批累加，不会只保留最后一批。
+
+### verification
+
+`metrics.verification` 是每次 review 的结构化拦截漏斗，并带有独立的
+`schema_version`。其 `stages` 记录 `raw_count`、`validator_kept`、
+`verifier_candidates` 和 `final_count`；`drops` 记录 Validator 与 Verifier
+各阶段互斥的淘汰原因；`events` 记录无效 patch 被剥离、证据未匹配、行号修正等
+可能不淘汰 finding 的事件。Verifier 未选中的 finding 仍会保留，因此
+`verifier_candidates` 是 `validator_kept` 的子集，不是阶段差额。
+`conservation` 报告 Validator 与 Verifier 阶段数量关系是否守恒；无法采集完整
+Validator 计数时 `available=false`，不计算阶段守恒。
+`by_diff_scope` 汇总未知文件、diff 外行号和默认过滤的历史 finding；
+`deduplicated` 包含 Validator 内及跨 batch 去重。当前 evidence 不匹配会降低置信度，
+并非独立淘汰规则，因此相关淘汰计入 `by_low_confidence`，而
+`by_evidence_mismatch` 暂为 0；`ungrounded_evidence` 保留为诊断事件。
+
+确定性评测按样本保留该对象，并在整体层面对计数先求和、再计算留存率和拒绝率。
+只有 `available=true` 且嵌套 schema 版本受支持的样本才参与整体汇总；旧结果若没有
+此字段、或自定义 Reviewer 未提供 Validator 计数，不会被假定为零值。不同的嵌套
+schema 版本会分开标记，避免混合统计口径。根级 `metrics.schema_version` 用于标识
+整份 review metrics 的 schema。
 
 ### cost（token / 调用量，不含价格）
 

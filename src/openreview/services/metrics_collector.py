@@ -15,9 +15,15 @@ from openreview.domain.metrics import (
     ErrorRecord,
     OutcomeMetrics,
     RunMetrics,
+    ValidatorDrops,
+    VerificationMetrics,
+    VerifierDrops,
     metric_schema_version,
 )
-from openreview.domain.versions import ARTIFACT_VERSIONS
+from openreview.domain.versions import (
+    ARTIFACT_VERSIONS,
+    VERIFICATION_METRICS_SCHEMA_VERSION,
+)
 from openreview.review.config import ReviewConfig
 from openreview.review.token_budget import estimate_tokens
 from openreview.review.workflow import ReviewOutcome, ReviewState
@@ -216,6 +222,7 @@ class MetricsCollector:
             },
             "validation": dict(state.validation_stats),
             "verifier": dict(state.verifier_stats),
+            "verification": self._verification_metrics(state),
             "cache": self._cache_metrics(state, llm_client),
             "budget": {
                 "max_llm_calls": state.budget.max_llm_calls,
@@ -264,6 +271,95 @@ class MetricsCollector:
         metrics["versions"] = ARTIFACT_VERSIONS.as_dict()
         metrics.update(self.outcome_metrics(state, outcome))
         return metrics  # type: ignore[return-value]
+
+    @staticmethod
+    def _verification_metrics(state: Any) -> VerificationMetrics:
+        validation = getattr(state, "validation_stats", {}) or {}
+        verifier = getattr(state, "verifier_stats", {}) or {}
+
+        def count(source: Dict[str, Any], key: str) -> int:
+            return max(0, int(source.get(key, 0) or 0))
+
+        raw_count = count(validation, "candidates")
+        available = "candidates" in validation
+        validator_kept = (
+            count(validation, "validator_kept")
+            if "validator_kept" in validation
+            else count(validation, "kept")
+        )
+        verifier_candidates = count(verifier, "candidates")
+        result = getattr(state, "review_result", None)
+        final_count = len(result.potential_issues) if result is not None else 0
+
+        verified = count(verifier, "verified")
+        rejected = count(verifier, "rejected")
+        needs_more_context = count(verifier, "needs_more_context")
+        verifier_decided = verified + rejected + needs_more_context
+        validation_drops: ValidatorDrops = {
+            "by_diff_scope": (
+                count(validation, "dropped_unknown_file")
+                + count(validation, "dropped_pre_existing")
+                + count(validation, "invalid_line")
+            ),
+            # Evidence mismatch currently lowers confidence; only actual
+            # finding removals belong in this mutually exclusive drop bucket.
+            "by_evidence_mismatch": 0,
+            "by_low_confidence": count(validation, "low_confidence"),
+            "deduplicated": (
+                count(validation, "deduplicated")
+                + count(validation, "cross_batch_deduplicated")
+            ),
+        }
+        verifier_drops: VerifierDrops = {
+            "rejected": rejected,
+            "dropped_by_low_confidence": count(
+                verifier, "dropped_low_confidence"
+            ),
+        }
+        validator_balanced: bool | None = None
+        verifier_balanced: bool | None = None
+        if available:
+            validator_balanced = raw_count == (
+                validator_kept
+                + validation_drops["by_diff_scope"]
+                + validation_drops["by_evidence_mismatch"]
+                + validation_drops["by_low_confidence"]
+                + validation_drops["deduplicated"]
+            )
+            verifier_balanced = validator_kept == (
+                final_count
+                + verifier_drops["rejected"]
+                + verifier_drops["dropped_by_low_confidence"]
+            )
+
+        return {
+            "schema_version": VERIFICATION_METRICS_SCHEMA_VERSION,
+            "available": available,
+            "stages": {
+                "raw_count": raw_count,
+                "validator_kept": validator_kept,
+                "verifier_candidates": verifier_candidates,
+                "final_count": final_count,
+            },
+            "drops": {
+                "validator": validation_drops,
+                "verifier": verifier_drops,
+            },
+            "events": {
+                "stripped_invalid_patch": count(validation, "patch_invalid"),
+                "ungrounded_evidence": count(validation, "ungrounded_evidence"),
+                "missing_evidence": count(validation, "missing_evidence"),
+                "line_relocated": count(validation, "line_relocated"),
+                "needs_more_context": needs_more_context,
+                "not_checked_by_verifier": max(
+                    0, verifier_candidates - verifier_decided
+                ),
+            },
+            "conservation": {
+                "validator_balanced": validator_balanced,
+                "verifier_balanced": verifier_balanced,
+            },
+        }
 
     @staticmethod
     def _call_details(state: ReviewState, llm_client: Any) -> list[Dict[str, Any]]:

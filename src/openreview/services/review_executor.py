@@ -651,6 +651,15 @@ class ReviewExecutor:
             if len(batch_results) == 1
             else merge_review_results(batch_results)
         )
+        batch_validator_kept = sum(
+            len(result.potential_issues) for result in batch_results
+        )
+        state.validation_stats["cross_batch_deduplicated"] = (
+            batch_validator_kept - len(review_result.potential_issues)
+        )
+        state.validation_stats["validator_kept"] = len(
+            review_result.potential_issues
+        )
         if len(batches) > 1:
             review_result.review_notes.append(
                 f"PR 较大，已按 token 预算拆分为 {len(batches)} 个批次审查。"

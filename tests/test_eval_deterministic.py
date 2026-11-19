@@ -102,6 +102,40 @@ def _write_result(results_dir: Path, instance_id: str, base: str, head: str) -> 
                     "kept": 2,
                     "invalid_line": 1,
                 },
+                "verification": {
+                    "schema_version": 1,
+                    "available": True,
+                    "stages": {
+                        "raw_count": 3,
+                        "validator_kept": 2,
+                        "verifier_candidates": 1,
+                        "final_count": 1,
+                    },
+                    "drops": {
+                        "validator": {
+                            "by_diff_scope": 1,
+                            "by_evidence_mismatch": 0,
+                            "by_low_confidence": 0,
+                            "deduplicated": 0,
+                        },
+                        "verifier": {
+                            "rejected": 1,
+                            "dropped_by_low_confidence": 0,
+                        },
+                    },
+                    "events": {
+                        "stripped_invalid_patch": 1,
+                        "ungrounded_evidence": 1,
+                        "missing_evidence": 0,
+                        "line_relocated": 0,
+                        "needs_more_context": 0,
+                        "not_checked_by_verifier": 0,
+                    },
+                    "conservation": {
+                        "validator_balanced": True,
+                        "verifier_balanced": True,
+                    },
+                },
             },
         },
     }
@@ -162,6 +196,15 @@ def test_deterministic_metrics_aggregate(tmp_path: Path, monkeypatch):
     assert metrics["retrieval"]["mean_changed_file_coverage"] == 0.5
     assert metrics["validator"]["candidates"] == 3
     assert metrics["validator"]["invalid_line"] == 1
+    assert metrics["verification"]["samples"] == 1
+    assert metrics["verification"]["stages"]["raw_count"] == 3
+    assert metrics["verification"]["stages"]["final_count"] == 1
+    assert metrics["verification"]["drops"]["validator"]["by_diff_scope"] == 1
+    assert metrics["verification"]["drops"]["verifier"]["rejected"] == 1
+    assert metrics["verification"]["events"]["stripped_invalid_patch"] == 1
+    assert metrics["verification"]["rates"]["final_retention"] == 0.333
+    assert metrics["verification"]["conservation"]["unbalanced_samples"] == 0
+    assert metrics["per_instance"][0]["verification"]["schema_version"] == 1
     assert metrics["cost"]["llm_calls"] == 4
     assert metrics["cost"]["input_tokens"] == 100
     assert metrics["cost"]["duration_seconds"] == 1.5

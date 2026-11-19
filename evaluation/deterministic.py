@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from evaluation.repos import read_file_at_commit, repo_cache_path
 from evaluation.results import result_path
+from openreview.domain.versions import VERIFICATION_METRICS_SCHEMA_VERSION
 from openreview.repo.diff_parser import DiffParser, ParsedChangedFile
 from openreview.repo.local import collect_local_changes
 
@@ -107,6 +108,54 @@ def compute_deterministic_metrics(
     triage_reasons: Counter[str] = Counter()
     aspect_counts: Counter[str] = Counter()
     validator_totals: Counter[str] = Counter()
+    verification_stages: Counter[str] = Counter(
+        {
+            key: 0
+            for key in (
+                "raw_count",
+                "validator_kept",
+                "verifier_candidates",
+                "final_count",
+            )
+        }
+    )
+    verification_validator_drops: Counter[str] = Counter(
+        {
+            key: 0
+            for key in (
+                "by_diff_scope",
+                "by_evidence_mismatch",
+                "by_low_confidence",
+                "deduplicated",
+            )
+        }
+    )
+    verification_verifier_drops: Counter[str] = Counter(
+        {"rejected": 0, "dropped_by_low_confidence": 0}
+    )
+    verification_events: Counter[str] = Counter(
+        {
+            key: 0
+            for key in (
+                "stripped_invalid_patch",
+                "ungrounded_evidence",
+                "missing_evidence",
+                "line_relocated",
+                "needs_more_context",
+                "not_checked_by_verifier",
+            )
+        }
+    )
+    verification_conservation: Counter[str] = Counter(
+        {
+            "validator_balanced": 0,
+            "verifier_balanced": 0,
+            "unbalanced_samples": 0,
+        }
+    )
+    verification_schema_versions: Counter[str] = Counter()
+    verification_samples = 0
+    verification_unavailable_samples = 0
     retrieval_coverages: List[float] = []
     retrieval_contexts = 0
     cost = {
@@ -150,6 +199,91 @@ def compute_deterministic_metrics(
         metrics = review.get("metrics") or {}
         row["issues"] = len(comments)
         counters["issues"] += len(comments)
+
+        verification = metrics.get("verification")
+        if isinstance(verification, dict):
+            row["verification"] = verification
+            version = verification.get("schema_version")
+            version_key = str(version) if version is not None else "unknown"
+            verification_schema_versions[version_key] += 1
+            if version == VERIFICATION_METRICS_SCHEMA_VERSION:
+                if verification.get("available") is not True:
+                    verification_unavailable_samples += 1
+                    continue_verification_aggregation = False
+                else:
+                    verification_samples += 1
+                    continue_verification_aggregation = True
+            else:
+                continue_verification_aggregation = False
+            if continue_verification_aggregation:
+                stages = verification.get("stages") or {}
+                drops = verification.get("drops") or {}
+                events = verification.get("events") or {}
+                if isinstance(stages, dict):
+                    verification_stages.update(
+                        {
+                            key: int(stages.get(key, 0) or 0)
+                            for key in (
+                                "raw_count",
+                                "validator_kept",
+                                "verifier_candidates",
+                                "final_count",
+                            )
+                        }
+                    )
+                validator_drops = (
+                    drops.get("validator", {})
+                    if isinstance(drops, dict)
+                    else {}
+                )
+                if isinstance(validator_drops, dict):
+                    verification_validator_drops.update(
+                        {
+                            key: int(validator_drops.get(key, 0) or 0)
+                            for key in (
+                                "by_diff_scope",
+                                "by_evidence_mismatch",
+                                "by_low_confidence",
+                                "deduplicated",
+                            )
+                        }
+                    )
+                verifier_drops = (
+                    drops.get("verifier", {})
+                    if isinstance(drops, dict)
+                    else {}
+                )
+                if isinstance(verifier_drops, dict):
+                    verification_verifier_drops.update(
+                        {
+                            key: int(verifier_drops.get(key, 0) or 0)
+                            for key in ("rejected", "dropped_by_low_confidence")
+                        }
+                    )
+                if isinstance(events, dict):
+                    verification_events.update(
+                        {
+                            key: int(events.get(key, 0) or 0)
+                            for key in (
+                                "stripped_invalid_patch",
+                                "ungrounded_evidence",
+                                "missing_evidence",
+                                "line_relocated",
+                                "needs_more_context",
+                                "not_checked_by_verifier",
+                            )
+                        }
+                    )
+                conservation = verification.get("conservation") or {}
+                if isinstance(conservation, dict):
+                    validator_balanced = conservation.get("validator_balanced")
+                    verifier_balanced = conservation.get("verifier_balanced")
+                    if validator_balanced is True:
+                        verification_conservation["validator_balanced"] += 1
+                    if verifier_balanced is True:
+                        verification_conservation["verifier_balanced"] += 1
+                    if validator_balanced is False or verifier_balanced is False:
+                        verification_conservation["unbalanced_samples"] += 1
 
         triage = metrics.get("triage") or {}
         if triage.get("skipped_llm"):
@@ -336,6 +470,33 @@ def compute_deterministic_metrics(
             ),
         },
         "validator": dict(validator_totals),
+        "verification": {
+            "schema_version": VERIFICATION_METRICS_SCHEMA_VERSION,
+            "schema_versions": dict(verification_schema_versions),
+            "samples": verification_samples,
+            "unavailable_samples": verification_unavailable_samples,
+            "stages": dict(verification_stages),
+            "drops": {
+                "validator": dict(verification_validator_drops),
+                "verifier": dict(verification_verifier_drops),
+            },
+            "events": dict(verification_events),
+            "conservation": dict(verification_conservation),
+            "rates": {
+                "validator_retention": _rate(
+                    verification_stages["validator_kept"],
+                    verification_stages["raw_count"],
+                ),
+                "final_retention": _rate(
+                    verification_stages["final_count"],
+                    verification_stages["raw_count"],
+                ),
+                "verifier_rejection": _rate(
+                    verification_verifier_drops["rejected"],
+                    verification_stages["verifier_candidates"],
+                ),
+            },
+        },
         "cost": {
             **cost,
             "llm_calls_avg": _rate(int(cost["llm_calls"]), triage_base),
