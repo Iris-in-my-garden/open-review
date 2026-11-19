@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 from openreview.domain.models import PullRequestInfo
 from openreview.repo.diff_parser import HUNK_RANGE_PATTERN, ParsedDiff
 from openreview.retriever.code_context import CodeContext
+from openreview.retriever.context_planner import DEFAULT_PRIORITY_TOKEN_CAPS
 from openreview.review.redaction import redact_text
 from openreview.review.token_budget import estimate_tokens, truncate_to_tokens
 
@@ -244,19 +245,22 @@ class PromptBuilder:
     @staticmethod
     def _render_context(ctx: CodeContext) -> str:
         context_id = ctx.ensure_context_id()
-        meta = [f"Priority: P{ctx.priority}", f"Kind: {ctx.kind}"]
-        if ctx.symbol:
-            meta.append(f"Symbol: {ctx.symbol}")
-        if ctx.start_line is not None and ctx.end_line is not None:
-            meta.append(f"Lines: {ctx.start_line}-{ctx.end_line}")
-        if ctx.revision:
-            meta.append(f"Revision: {ctx.revision}")
-        if ctx.folded:
-            meta.append("Folded: true (changed lines preserved)")
-        meta.append(f"Score: {ctx.score}")
+        location = ctx.file_path
+        if ctx.start_line is not None:
+            if ctx.end_line is not None and ctx.end_line != ctx.start_line:
+                location += f":{ctx.start_line}-{ctx.end_line}"
+            else:
+                location += f":{ctx.start_line}"
+        # 紧凑 header：保留 ctx-id（context_refs 校验依赖它），只保留定位所需
+        # 的 priority/kind/symbol，去掉 Score/Reason 等噪声字段。
+        meta = f"P{ctx.priority} {ctx.kind}"
+        extras = [ctx.symbol] if ctx.symbol else []
+        if ctx.revision and ctx.revision != "head":
+            extras.append(ctx.revision)
+        if extras:
+            meta += f", {', '.join(extras)}"
         return (
-            f"### [{context_id}] File: {ctx.file_path} "
-            f"({' , '.join(meta)}, Reason: {ctx.reason})\n"
+            f"### [{context_id}] {location} ({meta})\n"
             f"```\n{ctx.snippet}\n```"
         )
 
@@ -279,8 +283,9 @@ class PromptBuilder:
         omitted_tokens = 0
         used = 0
         used_tokens = 0
+        used_by_priority: Dict[int, int] = {}
         # 严格按 priority 填充：P2 enclosing > P3 callee > P4 caller > P5 field
-        # > P6 其他。planner 已经做过一次预算，这里是渲染层的最终兜底。
+        # > P6 其他。planner 已经做过一次预算和低优先级 cap，这里再做最终兜底。
         ordered = sorted(
             contexts, key=lambda item: (item.priority, -item.score)
         )
@@ -292,6 +297,14 @@ class PromptBuilder:
                 omitted += 1
                 omitted_tokens += cost
                 continue
+            cap = DEFAULT_PRIORITY_TOKEN_CAPS.get(ctx.priority)
+            if (
+                cap is not None
+                and used_by_priority.get(ctx.priority, 0) + cost > cap
+            ):
+                omitted += 1
+                omitted_tokens += cost
+                continue
             if ctx.file_path in block_files:
                 by_file.setdefault(ctx.file_path, []).append(rendered)
             else:
@@ -299,6 +312,9 @@ class PromptBuilder:
             remaining -= cost
             used += 1
             used_tokens += cost
+            used_by_priority[ctx.priority] = (
+                used_by_priority.get(ctx.priority, 0) + cost
+            )
 
         rendered_blocks: List[str] = []
         for filename, block in patch_blocks:

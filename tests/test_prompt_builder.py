@@ -138,6 +138,7 @@ def test_context_ids_are_rendered_and_injected_next_to_matching_file():
         snippet="def new_func():\n    return 1",
         score=0.9,
         kind="enclosing",
+        priority=2,
         symbol="new_func",
         start_line=10,
         end_line=11,
@@ -148,6 +149,7 @@ def test_context_ids_are_rendered_and_injected_next_to_matching_file():
         snippet="def helper():\n    return 2",
         score=0.6,
         kind="dependency",
+        priority=6,
         symbol="helper",
         start_line=1,
         end_line=2,
@@ -157,6 +159,13 @@ def test_context_ids_are_rendered_and_injected_next_to_matching_file():
 
     assert "[ctx-" in prompt
     assert same_file.context_id in prompt
+    assert (
+        f"### [{same_file.context_id}] src/utils.py:10-11 "
+        f"(P2 enclosing, new_func)"
+    ) in prompt
+    assert "Priority:" not in prompt
+    assert "Reason:" not in prompt
+    assert "Score:" not in prompt
     assert "Related context（同文件" in prompt
     assert "src/other.py" in prompt
     # 同文件 context 必须出现在 patch 块和“其他文件”section 之间。

@@ -16,13 +16,21 @@ P2/P3 采用按文件 Round-Robin：先给每个变更文件的第一个变更�
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
 from openreview.retriever.code_context import CodeContext, context_identity
 from openreview.review.token_budget import estimate_tokens
 
 CONTEXT_OVERHEAD_TOKENS = 24
 ROUND_ROBIN_PRIORITIES = {2, 3}
+# 低优先级上下文不能自动吃满剩余预算。P5/P6 是补充证据，设置软上限
+# 是为了避免 Lost in the Middle；超限部分仍会保留在 state/metrics 中。
+P5_MAX_TOKENS = 1000
+P6_MAX_TOKENS = 2000
+DEFAULT_PRIORITY_TOKEN_CAPS: Dict[int, int] = {
+    5: P5_MAX_TOKENS,
+    6: P6_MAX_TOKENS,
+}
 
 
 def plan_contexts(
@@ -30,6 +38,7 @@ def plan_contexts(
     max_tokens: int,
     *,
     stats: Optional[Dict[str, float]] = None,
+    priority_caps: Optional[Mapping[int, int]] = None,
 ) -> List[CodeContext]:
     """按 priority 顺序填充预算，返回最终注入 prompt 的上下文列表。"""
     stats = stats if stats is not None else {}
@@ -38,8 +47,14 @@ def plan_contexts(
         "context_tokens_by_priority",
         "contexts_omitted_by_priority",
         "context_tokens_omitted_by_priority",
+        "contexts_omitted_by_cap",
+        "context_tokens_omitted_by_cap",
     ):
         stats.setdefault(key, 0)
+
+    caps = dict(DEFAULT_PRIORITY_TOKEN_CAPS)
+    if priority_caps:
+        caps.update(priority_caps)
 
     deduped = _dedupe_by_priority(contexts)
     buckets: Dict[int, List[CodeContext]] = {}
@@ -57,6 +72,7 @@ def plan_contexts(
             if priority in ROUND_ROBIN_PRIORITIES
             else candidates
         )
+        cap = caps.get(priority)
         for context in ordered:
             cost = estimate_tokens(context.snippet) + CONTEXT_OVERHEAD_TOKENS
             context.token_cost = cost
@@ -66,6 +82,14 @@ def plan_contexts(
                 ) + 1
                 stats["context_tokens_omitted_by_priority"] = int(
                     stats.get("context_tokens_omitted_by_priority", 0)
+                ) + cost
+                continue
+            if cap is not None and priority_tokens.get(priority, 0) + cost > cap:
+                stats["contexts_omitted_by_cap"] = int(
+                    stats.get("contexts_omitted_by_cap", 0)
+                ) + 1
+                stats["context_tokens_omitted_by_cap"] = int(
+                    stats.get("context_tokens_omitted_by_cap", 0)
                 ) + cost
                 continue
             selected.append(context)

@@ -133,12 +133,35 @@ class HybridRetriever:
                 logger.warning("Graph retrieval failed: %s", exc)
 
         contexts = [*ast_contexts, *graph_contexts]
+        contexts = self._drop_test_file_p4_contexts(parsed_diff, contexts)
         self._merge_ast_stats(stats)
         stats.update(graph_stats)
 
         ranked = self._plan(contexts, stats)
         self.last_stats = stats
         return ranked
+
+    @staticmethod
+    def _drop_test_file_p4_contexts(
+        parsed_diff: ParsedDiff,
+        contexts: Sequence[CodeContext],
+    ) -> List[CodeContext]:
+        """P0：测试文件不注入 P4 caller。
+
+        caller 上下文只在签名变更时产生，本质是跨文件拓扑证据。测试文件里
+        的调用点既多又和线上行为无关，整类跳过可以显著降低噪声。
+        """
+        only_tests = bool(parsed_diff.files) and all(
+            file.is_test_file for file in parsed_diff.files
+        )
+        result: List[CodeContext] = []
+        for context in contexts:
+            if context.priority == 4 and (
+                only_tests or DiffParser.is_test_path(context.file_path)
+            ):
+                continue
+            result.append(context)
+        return result
 
     def related_files(
         self,

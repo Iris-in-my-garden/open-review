@@ -82,10 +82,35 @@ def test_plan_contexts_records_omission_stats():
     ]
     stats: dict[str, float] = {}
 
-    selected = plan_contexts(contexts, _cost(contexts[0]), stats=stats)
+    selected = plan_contexts([*contexts], _cost(contexts[0]), stats=stats)
 
     assert [item.priority for item in selected] == [2]
     assert stats["contexts_by_priority"] == 1
     assert stats["contexts_omitted_by_priority"] == 1
     assert stats["context_tokens_omitted_by_priority"] == _cost(contexts[1])
     assert stats["context_tokens_by_priority_detail"] == {"P2": _cost(contexts[0])}
+
+
+def test_plan_contexts_caps_low_priority_buckets():
+    from openreview.retriever.context_planner import (
+        P5_MAX_TOKENS,
+        P6_MAX_TOKENS,
+    )
+
+    p5 = [
+        _context("src/a.py", priority=5, start_line=index, end_line=index)
+        for index in range(1, 20)
+    ]
+    p6 = [
+        _context("src/b.py", priority=6, start_line=index, end_line=index)
+        for index in range(1, 30)
+    ]
+    stats: dict[str, float] = {}
+
+    selected = plan_contexts([*p5, *p6], 100_000, stats=stats)
+
+    p5_tokens = sum(_cost(item) for item in selected if item.priority == 5)
+    p6_tokens = sum(_cost(item) for item in selected if item.priority == 6)
+    assert p5_tokens <= P5_MAX_TOKENS
+    assert p6_tokens <= P6_MAX_TOKENS
+    assert stats["contexts_omitted_by_cap"] > 0

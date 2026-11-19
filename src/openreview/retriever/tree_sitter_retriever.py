@@ -15,7 +15,7 @@
 import logging
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from tree_sitter import Language, Node, Parser, Tree
 
@@ -23,7 +23,11 @@ from openreview.repo.diff_parser import ParsedDiff
 from openreview.retriever import ast_utils
 from openreview.retriever.code_context import CodeContext, make_context_id
 from openreview.retriever.folding import fold_snippet
-from openreview.retriever.globals import collect_referenced_fields_from_tree
+from openreview.retriever.globals import (
+    DEFAULT_FIELD_WINDOW_RADIUS,
+    FieldDefinition,
+    collect_referenced_fields_from_tree,
+)
 from openreview.retriever.grep import search_symbols
 from openreview.retriever.pathing import is_source_file
 from openreview.review.token_budget import estimate_tokens
@@ -249,12 +253,20 @@ class TreeSitterLocalRetriever:
         parsed_diff: ParsedDiff,
         file_cache: Dict[Path, Optional[LoadedFile]],
     ) -> List[CodeContext]:
-        """P5：收集被变更方法引用的类/结构体字段与模块常量。"""
+        """P5：收集变更行窗口内引用到的类/结构体字段与模块常量。
+
+        P0 起 P5 不再扫描整个变更函数：
+        - 测试文件直接跳过；
+        - 只扫描 changed line 附近的窗口；
+        - 同一 struct 的多个字段合并成一个 context。
+        """
         contexts: List[CodeContext] = []
-        seen: Set[Tuple[str, int, int]] = set()
 
         for file_diff in parsed_diff.files:
             if not file_diff.changed_lines or file_diff.status == "removed":
+                continue
+            # 测试文件的 P5 价值极低，且很容易把整张测试表带进 prompt。
+            if file_diff.is_test_file:
                 continue
             suffix = Path(file_diff.filename).suffix
             if suffix not in self.parsers:
@@ -266,46 +278,115 @@ class TreeSitterLocalRetriever:
             if loaded is None:
                 continue
 
-            text, lines, source, tree = loaded
-            method_spans: Set[Tuple[int, int]] = set()
+            text, _, source, tree = loaded
+            fields: List[FieldDefinition] = []
+            seen_fields: Set[Tuple[str, str, int, int]] = set()
             for line_number in file_diff.changed_lines:
-                node = self._find_enclosing_definition(tree.root_node, line_number - 1)
-                if node is None:
-                    continue
-                method_spans.add((node.start_point[0] + 1, node.end_point[0] + 1))
-
-            for start_line, end_line in sorted(method_spans):
                 for field in collect_referenced_fields_from_tree(
-                    text, source, tree, suffix, start_line, end_line
+                    text,
+                    source,
+                    tree,
+                    suffix,
+                    line_number,
+                    line_number,
+                    changed_lines=[line_number],
+                    window_radius=DEFAULT_FIELD_WINDOW_RADIUS,
                 ):
-                    key = (file_diff.filename, field.start_line, field.end_line)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    contexts.append(
-                        CodeContext(
-                            file_path=file_diff.filename,
-                            reason=(
-                                f"field `{field.name}` referenced by "
-                                f"changed method"
-                            ),
-                            snippet=field.source,
-                            score=0.4,
-                            kind="field",
-                            priority=5,
-                            symbol=field.name,
-                            start_line=field.start_line,
-                            end_line=field.end_line,
-                            context_id=make_context_id(
-                                file_diff.filename,
-                                field.start_line,
-                                field.end_line,
-                                "field",
-                                fallback=field.name,
-                            ),
-                        )
+                    key = (
+                        field.parent_type,
+                        field.name,
+                        field.start_line,
+                        field.end_line,
                     )
+                    if key in seen_fields:
+                        continue
+                    seen_fields.add(key)
+                    fields.append(field)
+
+            contexts.extend(
+                self._build_field_contexts(file_diff.filename, fields)
+            )
         return contexts
+
+    @staticmethod
+    def _build_field_contexts(
+        file_path: str,
+        fields: Sequence[FieldDefinition],
+    ) -> List[CodeContext]:
+        """把同一 struct 的分散字段合并为一个 P5 context。"""
+        if not fields:
+            return []
+
+        contexts: List[CodeContext] = []
+        by_parent: Dict[str, List[FieldDefinition]] = {}
+        for field in fields:
+            if field.parent_type:
+                by_parent.setdefault(field.parent_type, []).append(field)
+            else:
+                contexts.append(
+                    TreeSitterLocalRetriever._field_context(
+                        file_path, field, field.name, field.source
+                    )
+                )
+
+        for parent_type, group in by_parent.items():
+            group.sort(key=lambda item: item.start_line)
+            if len(group) == 1:
+                field = group[0]
+                snippet = field.source
+                reason = (
+                    f"field `{field.name}` of `{parent_type}` referenced "
+                    f"by changed function"
+                )
+            else:
+                snippet = (
+                    f"type {parent_type} struct {{\n"
+                    + "\n".join(field.source for field in group)
+                    + "\n}"
+                )
+                reason = (
+                    f"fields of `{parent_type}` referenced by changed function"
+                )
+            contexts.append(
+                TreeSitterLocalRetriever._field_context(
+                    file_path,
+                    group[0],
+                    parent_type,
+                    snippet,
+                    reason=reason,
+                    end_line=max(field.end_line for field in group),
+                )
+            )
+        return contexts
+
+    @staticmethod
+    def _field_context(
+        file_path: str,
+        field: FieldDefinition,
+        symbol: str,
+        snippet: str,
+        *,
+        reason: str = "",
+        end_line: Optional[int] = None,
+    ) -> CodeContext:
+        return CodeContext(
+            file_path=file_path,
+            reason=reason or f"field `{field.name}` referenced by changed function",
+            snippet=snippet,
+            score=0.4,
+            kind="field",
+            priority=5,
+            symbol=symbol,
+            start_line=field.start_line,
+            end_line=end_line or field.end_line,
+            context_id=make_context_id(
+                file_path,
+                field.start_line,
+                end_line or field.end_line,
+                "field",
+                fallback=symbol,
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Base revision (same file only)

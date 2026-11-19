@@ -278,3 +278,78 @@ def test_reference_contexts_are_capped(tmp_path: Path):
     assert len(contexts) <= MAX_REFERENCE_CONTEXTS
     assert retriever.last_stats["reference_contexts_truncated"] > 0
     assert retriever.last_stats["grep_timeouts"] == 0
+
+
+def test_test_files_skip_p5_field_contexts(tmp_path: Path):
+    """P0：测试文件不注入结构体字段，避免把测试表整段带进 prompt。"""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "program_test.go").write_text(
+        "package pkg\n"
+        "\n"
+        "type testFile struct {\n"
+        "    fileName string\n"
+        "}\n"
+        "\n"
+        "func TestProgram() {\n"
+        "    file := testFile{fileName: \"a\"}\n"
+        "    _ = file.fileName\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    _init_repo(tmp_path)
+
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="pkg/program_test.go",
+                status="modified",
+                changed_lines=[9],
+                is_test_file=True,
+            )
+        ]
+    )
+
+    contexts = TreeSitterLocalRetriever().retrieve(tmp_path, diff)
+
+    assert not any(context.priority == 5 for context in contexts)
+
+
+def test_p5_fields_from_same_struct_are_grouped(tmp_path: Path):
+    """P2：同一 struct 的分散字段合并成一个带 type 包裹的 context。"""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "mod.go").write_text(
+        "package pkg\n"
+        "\n"
+        "type Service struct {\n"
+        "    timeout int\n"
+        "    retries int\n"
+        "}\n"
+        "\n"
+        "func Run() int {\n"
+        "    svc := Service{timeout: 1, retries: 2}\n"
+        "    return svc.timeout + svc.retries\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    _init_repo(tmp_path)
+
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="pkg/mod.go",
+                status="modified",
+                changed_lines=[10],
+            )
+        ]
+    )
+
+    contexts = TreeSitterLocalRetriever().retrieve(tmp_path, diff)
+    field_contexts = [context for context in contexts if context.priority == 5]
+
+    assert len(field_contexts) == 1
+    assert field_contexts[0].symbol == "Service"
+    assert "type Service struct {" in field_contexts[0].snippet
+    assert "timeout int" in field_contexts[0].snippet
+    assert "retries int" in field_contexts[0].snippet
