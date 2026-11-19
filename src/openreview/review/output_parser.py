@@ -127,6 +127,13 @@ class PotentialIssueSchema(BaseModel):
         )
     )
     reasoning: str = Field(description="问题的原理解释与上下文背景")
+    short_claim: Optional[str] = Field(
+        default=None,
+        description=(
+            "单句、独立、可验证的缺陷断言，最多 180 个字符；只描述可观察的问题，"
+            "不要写背景推理或修复建议。"
+        ),
+    )
     suggestion: str = Field(description="具体的修复或重构建议代码")
     line: Optional[int] = Field(
         default=None,
@@ -331,6 +338,7 @@ class OutputParser:
                     category=issue.category,
                     confidence=issue.confidence,
                     reasoning=issue.reasoning,
+                    short_claim=issue.short_claim,
                     suggestion=issue.suggestion,
                     line=issue.line,
                     end_line=issue.end_line,

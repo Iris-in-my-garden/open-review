@@ -95,6 +95,7 @@ class PotentialIssue(BaseModel):
     confidence: float
     reasoning: str
     suggestion: str
+    short_claim: Optional[str] = None
     line: Optional[int] = None
     end_line: Optional[int] = None
     evidence: Optional[str] = None

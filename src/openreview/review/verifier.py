@@ -20,7 +20,7 @@ from typing import Dict, List, Literal, Optional, Sequence, Tuple
 from pydantic import BaseModel, Field, field_validator
 
 from openreview.domain.models import PotentialIssue, ReviewResult
-from openreview.repo.diff_parser import ParsedDiff
+from openreview.repo.diff_parser import DiffParser, ParsedDiff
 from openreview.retriever.code_context import CodeContext
 from openreview.retriever.grep import search_symbols
 from openreview.review.assessment import (
@@ -48,9 +48,31 @@ VERIFIER_SYSTEM_PROMPT = """你是一个严格的 Code Review Verifier。你的�
 VERIFIER_MAX_SYMBOL_SEARCHES = 8
 VERIFIER_SYMBOL_SEARCH_BUDGET_SECONDS = 5.0
 VERIFIER_SYMBOL_SEARCH_TIMEOUT_SECONDS = 2.0
-VERIFIER_SYMBOL_MAX_HITS = 40
+VERIFIER_SYMBOL_MAX_HITS = 2000
 VERIFIER_SYMBOL_CONTEXTS_PER_ISSUE = 2
-VERIFIER_SYMBOL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,99}$")
+VERIFIER_SYMBOL_IDENTIFIER = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]{0,99}(?:\.[A-Za-z_][A-Za-z0-9_]{0,99})?$"
+)
+VERIFIER_SOURCE_SUFFIXES = (
+    ".py",
+    ".pyi",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".cs",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".c",
+    ".rb",
+    ".php",
+    ".swift",
+)
 
 
 Verdict = Literal["verified", "rejected", "needs_more_context"]
@@ -155,8 +177,14 @@ class FindingVerifier:
             (f"issue-{index + 1}", issue)
             for index, issue in enumerate(result.potential_issues)
             if (
-                issue.severity in self.verify_severities
-                or issue.confidence < self.candidate_confidence_threshold
+                (
+                    issue.severity in {"critical", "high"}
+                    and issue.severity in self.verify_severities
+                )
+                or (
+                    issue.severity == "medium"
+                    and issue.confidence < self.candidate_confidence_threshold
+                )
             )
         ]
         stats.candidates = len(candidates)
@@ -165,6 +193,7 @@ class FindingVerifier:
             return result, stats
 
         decisions: Dict[str, VerifierResult] = {}
+        retry_modes: Dict[str, Literal["format", "context"]] = {}
         pending = candidates
         symbol_search_deadline: Optional[float] = None
         # 流水线里 client 是 BudgetedLLMClient，预算已经在调用层扣过；
@@ -185,7 +214,11 @@ class FindingVerifier:
                         if stats.symbol_searches >= VERIFIER_MAX_SYMBOL_SEARCHES:
                             break
                         previous = decisions.get(issue_id)
-                        if previous is None or not previous.missing_symbol:
+                        if (
+                            previous is None
+                            or retry_modes.get(issue_id) != "context"
+                            or not previous.missing_symbol
+                        ):
                             continue
                         missing_symbol = previous.missing_symbol.strip()
                         if (
@@ -199,6 +232,7 @@ class FindingVerifier:
                         snippets = self._search_symbol_contexts(
                             repo_path,
                             missing_symbol,
+                            target_file=_issue.file,
                             deadline=symbol_search_deadline,
                         )
                         if snippets:
@@ -211,6 +245,11 @@ class FindingVerifier:
                     repo_path,
                     expanded=attempt > 0,
                     symbol_contexts=symbol_contexts,
+                    format_retry_ids={
+                        issue_id
+                        for issue_id, _issue in chunk
+                        if retry_modes.get(issue_id) == "format"
+                    },
                 )
                 estimated = estimate_tokens(prompt) + 200
                 if budget is not None and not budgeted_client:
@@ -241,6 +280,11 @@ class FindingVerifier:
                                     ),
                                 }
                             )
+                            retry_modes[item.issue_id] = "format"
+                        elif item.verdict == "needs_more_context":
+                            retry_modes[item.issue_id] = "context"
+                        else:
+                            retry_modes.pop(item.issue_id, None)
                         decisions[item.issue_id] = item
                 except BudgetExceeded:
                     stats.skipped_by_budget += len(chunk)
@@ -408,8 +452,10 @@ class FindingVerifier:
         repo_path: Optional[Path],
         expanded: bool,
         symbol_contexts: Optional[Dict[str, List[str]]] = None,
+        format_retry_ids: Optional[set[str]] = None,
     ) -> str:
         symbol_contexts = symbol_contexts or {}
+        format_retry_ids = format_retry_ids or set()
         files = {item.filename: item for item in parsed_diff.files}
         context_map: Dict[str, List[str]] = {}
         for context in contexts:
@@ -417,7 +463,10 @@ class FindingVerifier:
 
         payload = []
         for issue_id, issue in candidates:
-            claim = _concise_claim(issue.reasoning)
+            claim = _concise_claim(
+                issue.short_claim or issue.reasoning,
+                max_chars=180 if issue.short_claim else 350,
+            )
             item = {
                 "id": issue_id,
                 "file": issue.file,
@@ -433,6 +482,13 @@ class FindingVerifier:
             + json.dumps(payload, ensure_ascii=False, indent=2)
             + "\n</untrusted_input>",
         ]
+        if format_retry_ids:
+            blocks.append(
+                "上次对以下 finding 返回 verified，但 counter_argument 不足 12 个字符。"
+                "这是输出格式问题，不代表缺少代码上下文；请勿索取新上下文或符号，"
+                "只基于现有证据给出具体、实质性的反驳假设，再独立判断 verdict："
+                + ", ".join(sorted(format_retry_ids))
+            )
         for issue_id, issue in candidates:
             found_symbol_contexts = symbol_contexts.get(issue_id, [])
             snippet_parts = list(context_map.get(issue.file, []))
@@ -445,7 +501,11 @@ class FindingVerifier:
                     repo_path,
                     issue.file,
                     issue.line,
-                    expanded=expanded and not found_symbol_contexts,
+                    expanded=(
+                        expanded
+                        and issue_id not in format_retry_ids
+                        and not found_symbol_contexts
+                    ),
                 )
                 if source:
                     snippet_parts.append(source)
@@ -460,18 +520,23 @@ class FindingVerifier:
 
     @staticmethod
     def _search_symbol_contexts(
-        repo_path: Path, symbol: str, *, deadline: float
+        repo_path: Path,
+        symbol: str,
+        *,
+        target_file: str,
+        deadline: float,
     ) -> List[str]:
         if not VERIFIER_SYMBOL_IDENTIFIER.fullmatch(symbol):
             return []
+        symbols = symbol.split(".")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return []
         try:
             result = search_symbols(
                 repo_path,
-                [symbol],
-                suffixes=None,
+                symbols,
+                suffixes=VERIFIER_SOURCE_SUFFIXES,
                 timeout=min(VERIFIER_SYMBOL_SEARCH_TIMEOUT_SECONDS, remaining),
                 max_hits=VERIFIER_SYMBOL_MAX_HITS,
             )
@@ -480,10 +545,13 @@ class FindingVerifier:
             return []
 
         root = Path(repo_path).resolve()
+        target_parent = Path(target_file).parent.parts
         hits = sorted(
             result.hits,
             key=lambda hit: (
-                not _looks_like_symbol_definition(hit[2], symbol),
+                _definition_rank(hit[2], symbols),
+                _directory_distance(target_parent, Path(hit[0]).parent.parts),
+                _is_test_path(hit[0]),
                 hit[0],
                 hit[1],
             ),
@@ -491,7 +559,10 @@ class FindingVerifier:
         snippets: List[str] = []
         seen: set[Tuple[str, int]] = set()
         for relative_path, line_number, hit_line in hits:
-            if not _looks_like_symbol_definition(hit_line, symbol):
+            if not any(
+                _looks_like_symbol_definition(hit_line, candidate)
+                for candidate in symbols
+            ):
                 continue
             if (relative_path, line_number) in seen:
                 continue
@@ -557,11 +628,32 @@ def _looks_like_symbol_definition(line: str, symbol: str) -> bool:
     return bool(named_declaration or typed_declaration)
 
 
-def _concise_claim(reasoning: str) -> str:
-    claim = " ".join(reasoning.split())
-    sentence = re.match(r"^(.{1,240}?[.!?。！？])(?:\s|$)", claim)
+def _definition_rank(line: str, symbols: Sequence[str]) -> int:
+    if symbols and _looks_like_symbol_definition(line, symbols[-1]):
+        return 0
+    if symbols and _looks_like_symbol_definition(line, symbols[0]):
+        return 1
+    return 2
+
+
+def _directory_distance(left: Sequence[str], right: Sequence[str]) -> int:
+    common = 0
+    for left_part, right_part in zip(left, right, strict=False):
+        if left_part != right_part:
+            break
+        common += 1
+    return len(left) + len(right) - 2 * common
+
+
+def _is_test_path(path: str) -> bool:
+    return DiffParser.is_test_path(path)
+
+
+def _concise_claim(text: str, *, max_chars: int = 180) -> str:
+    claim = " ".join(text.split())
+    sentence = re.match(r"^(.{1,350}?[.!?。！？;；])(?:\s|$)", claim)
     if sentence:
-        return sentence.group(1)
-    if len(claim) > 240:
-        return claim[:237].rsplit(" ", 1)[0] + "..."
+        claim = sentence.group(1)
+    if len(claim) > max_chars:
+        claim = claim[: max_chars - 3].rsplit(" ", 1)[0] + "..."
     return claim

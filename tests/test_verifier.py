@@ -167,7 +167,6 @@ def test_verifier_includes_low_confidence_medium_findings():
     llm = ScriptedVerifierLLM(
         {
             "issue-1": "verified",
-            "issue-3": "verified",
             "issue-4": "verified",
         }
     )
@@ -180,14 +179,25 @@ def test_verifier_includes_low_confidence_medium_findings():
 
     result, stats = FindingVerifier(llm).verify(_result(issues), _diff(), [])
 
-    assert stats.candidates == 3
-    assert stats.verified == 3
+    assert stats.candidates == 2
+    assert stats.verified == 2
     assert len(result.potential_issues) == 4
 
 
-def test_verifier_requires_counter_argument_for_verified_result():
+def test_verifier_requires_counter_argument_for_verified_result(tmp_path):
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.py").write_text(
+        "\n".join(f"value_{index} = {index}" for index in range(1, 21)),
+        encoding="utf-8",
+    )
+
     class MissingCounterArgumentLLM:
+        def __init__(self):
+            self.prompts = []
+
         def generate_structured(self, system_prompt, user_prompt, response_schema):
+            self.prompts.append(user_prompt)
             return response_schema(
                 results=[
                     VerifierResult(
@@ -199,19 +209,24 @@ def test_verifier_requires_counter_argument_for_verified_result():
                 ]
             )
 
-    result, stats = FindingVerifier(MissingCounterArgumentLLM()).verify(
-        _result([_issue(1)]), _diff(), []
+    llm = MissingCounterArgumentLLM()
+    result, stats = FindingVerifier(llm).verify(
+        _result([_issue(1)]), _diff(), [], repo_path=tmp_path
     )
 
     assert stats.missing_counter_arguments == 2
     assert stats.verified == 0
     assert stats.needs_more_context == 1
+    assert stats.symbol_searches == 0
+    assert "counter_argument 不足" in llm.prompts[1]
+    assert "16: " not in llm.prompts[1]
     assert result.potential_issues[0].confidence == 0.7
 
 
-def test_verifier_prompt_uses_short_claim_not_reviewer_reasoning():
+def test_verifier_prompt_prefers_short_claim_not_reviewer_reasoning():
     issue = _issue(1)
     issue.reasoning = "A concise claim. " + ("Long reviewer chain. " * 30)
+    issue.short_claim = "Expired tokens are accepted without signature validation."
     verifier = FindingVerifier(ScriptedVerifierLLM({}))
 
     prompt = verifier._build_prompt(
@@ -222,7 +237,10 @@ def test_verifier_prompt_uses_short_claim_not_reviewer_reasoning():
         expanded=False,
     )
 
-    assert '"claim": "A concise claim.' in prompt
+    assert (
+        '"claim": "Expired tokens are accepted without signature validation."'
+        in prompt
+    )
     assert '"reasoning"' not in prompt
     assert '"suggestion"' not in prompt
     assert "Long reviewer chain." not in prompt
@@ -317,5 +335,55 @@ def test_verifier_expands_source_when_missing_symbol_has_no_definition(tmp_path)
 
 def test_verifier_rejects_unsafe_missing_symbol_names(tmp_path):
     assert FindingVerifier._search_symbol_contexts(
-        tmp_path, "name; touch /tmp/pwned", deadline=10**10
+        tmp_path,
+        "name; touch /tmp/pwned",
+        target_file="src/a.py",
+        deadline=10**10,
     ) == []
+
+
+def test_verifier_symbol_search_ranks_local_source_definitions(tmp_path):
+    local = tmp_path / "src" / "feature"
+    local.mkdir(parents=True)
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (local / "helper.py").write_text(
+        "def load_user(user_id):\n    return user_id\n",
+        encoding="utf-8",
+    )
+    (tests / "mock.py").write_text(
+        "def load_user(user_id):\n    return None\n",
+        encoding="utf-8",
+    )
+
+    snippets = FindingVerifier._search_symbol_contexts(
+        tmp_path,
+        "load_user",
+        target_file="src/feature/review.py",
+        deadline=10**10,
+    )
+
+    assert snippets
+    assert "src/feature/helper.py" in snippets[0]
+
+
+def test_verifier_symbol_search_accepts_one_level_qualified_name(tmp_path):
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "service.py").write_text(
+        "class UserService:\n"
+        "    def update(self, user):\n"
+        "        return user\n",
+        encoding="utf-8",
+    )
+
+    snippets = FindingVerifier._search_symbol_contexts(
+        tmp_path,
+        "UserService.update",
+        target_file="src/review.py",
+        deadline=10**10,
+    )
+
+    assert snippets
+    assert "src/service.py" in snippets[0]
+    assert "def update(self, user):" in snippets[0]

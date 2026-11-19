@@ -343,6 +343,8 @@ class FindingValidator:
             return redact_text(value)[0]
 
         issue.reasoning = redact_text(issue.reasoning)[0]
+        if issue.short_claim is not None:
+            issue.short_claim = redact_text(issue.short_claim)[0]
         issue.suggestion = redact_text(issue.suggestion)[0]
         issue.evidence = redact_optional(issue.evidence)
         issue.suggested_patch = redact_optional(issue.suggested_patch)

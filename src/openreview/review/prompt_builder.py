@@ -35,7 +35,7 @@ OUTPUT_CONSTRAINTS = """### 【输出约束】（必须遵守）
 5. `confidence` 是系统过滤依据：低于 0.6 会被直接丢弃。如果问题真实但证据只覆盖部分路径，给 0.6–0.7 并在 `reasoning` 中说明缺少哪段上下文；不要因为不确定就给 0.5。
 6. 最多报告 8 个问题，按 `severity` 从高到低排序；超过时只保留最严重的。
 7. `category` 必须是 `bugs`、`security`、`performance`、`clean_code`、`test_gap` 之一。
-8. 如果结论依赖 `Context`，把对应上下文的 `[ctx-xxxxxxxx]` 写入 `context_refs`；禁止编造不存在的 ID。
+8. 每个问题提供 `short_claim`：一句独立、可验证的缺陷断言，最多 180 个字符；不要复述推理过程、背景或修复建议。如果结论依赖 `Context`，把对应上下文的 `[ctx-xxxxxxxx]` 写入 `context_refs`；禁止编造不存在的 ID。
 """
 
 # Prompt Injection 检测规则：命中后仅作为“风险提示”，不会阻断审查
