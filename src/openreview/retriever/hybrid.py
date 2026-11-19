@@ -20,7 +20,11 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
 
 from openreview.repo.diff_parser import DiffParser, ParsedDiff
 from openreview.retriever.base import Retriever
-from openreview.retriever.code_context import CodeContext, dedupe_contexts
+from openreview.retriever.code_context import (
+    CodeContext,
+    ContextPriority,
+    dedupe_contexts,
+)
 from openreview.retriever.context_planner import plan_contexts
 from openreview.retriever.graph import GraphRetriever
 from openreview.retriever.index import RepoIndex, module_name
@@ -97,20 +101,25 @@ class HybridRetriever:
                 stats["index_error"] = 1
                 logger.warning("Failed to build retrieval query: %s", exc)
 
+        graph_available = (
+            index is not None and query is not None and self.graph_enabled
+        )
+        fallback_enabled = not graph_available
         graph_stats: Dict[str, float] = {}
         ast_contexts: List[CodeContext] = []
         graph_contexts: List[CodeContext] = []
 
         def _run_ast() -> List[CodeContext]:
+            # grep 兜底只在索引或图不可用时启用，避免正常路径重复检索。
             return self._retrieve_ast(
                 repo_path,
                 parsed_diff,
                 base_path,
-                allow_global_fallback=index is None,
+                allow_global_fallback=fallback_enabled,
             )
 
         def _run_graph() -> List[CodeContext]:
-            if index is None or query is None or not self.graph_enabled:
+            if not graph_available:
                 return []
             return list(
                 self.graph_retriever.retrieve(
@@ -118,6 +127,7 @@ class HybridRetriever:
                 )
             )
 
+        graph_failed = False
         with ThreadPoolExecutor(max_workers=2) as executor:
             ast_future = executor.submit(_run_ast)
             graph_future = executor.submit(_run_graph)
@@ -130,11 +140,26 @@ class HybridRetriever:
                 graph_contexts = graph_future.result()
             except Exception as exc:  # noqa: BLE001 - 图检索失败不能阻断 AST
                 stats["graph_error"] = 1
+                graph_failed = True
                 logger.warning("Graph retrieval failed: %s", exc)
+
+        self._merge_ast_stats(stats)
+        # 图在运行时失败时，索引/图链路实际不可用，补一次 grep 兜底。
+        if graph_failed and graph_available:
+            try:
+                fallback_contexts = self._retrieve_ast(
+                    repo_path,
+                    parsed_diff,
+                    base_path,
+                    allow_global_fallback=True,
+                )
+                ast_contexts = [*ast_contexts, *fallback_contexts]
+                self._merge_ast_stats(stats, accumulate=True)
+            except Exception as exc:  # noqa: BLE001 - 兜底失败保持原结果
+                logger.warning("AST fallback retrieval failed: %s", exc)
 
         contexts = [*ast_contexts, *graph_contexts]
         contexts = self._drop_test_file_p4_contexts(parsed_diff, contexts)
-        self._merge_ast_stats(stats)
         stats.update(graph_stats)
 
         ranked = self._plan(contexts, stats)
@@ -146,7 +171,7 @@ class HybridRetriever:
         parsed_diff: ParsedDiff,
         contexts: Sequence[CodeContext],
     ) -> List[CodeContext]:
-        """P0：测试文件不注入 P4 caller。
+        """P0：测试文件不注入 P4 引用（当前主要是 caller）。
 
         caller 上下文只在签名变更时产生，本质是跨文件拓扑证据。测试文件里
         的调用点既多又和线上行为无关，整类跳过可以显著降低噪声。
@@ -156,7 +181,7 @@ class HybridRetriever:
         )
         result: List[CodeContext] = []
         for context in contexts:
-            if context.priority == 4 and (
+            if context.priority == ContextPriority.REFERENCE and (
                 only_tests or DiffParser.is_test_path(context.file_path)
             ):
                 continue
@@ -237,16 +262,19 @@ class HybridRetriever:
             kwargs["allow_global_fallback"] = allow_global_fallback
         return list(self.ast_retriever.retrieve(repo_path, parsed_diff, **kwargs))
 
-    def _merge_ast_stats(self, stats: Dict[str, float]) -> None:
+    def _merge_ast_stats(
+        self, stats: Dict[str, float], *, accumulate: bool = False
+    ) -> None:
         ast_stats = getattr(self.ast_retriever, "last_stats", None)
-        if isinstance(ast_stats, dict):
-            stats.update(
-                {
-                    key: value
-                    for key, value in ast_stats.items()
-                    if isinstance(value, (int, float))
-                }
-            )
+        if not isinstance(ast_stats, dict):
+            return
+        for key, value in ast_stats.items():
+            if not isinstance(value, (int, float)):
+                continue
+            if accumulate:
+                stats[key] = stats.get(key, 0) + value
+            else:
+                stats[key] = value
 
     def _get_index(
         self, repo_path: Path, stats: Dict[str, float]

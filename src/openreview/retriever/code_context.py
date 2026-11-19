@@ -1,9 +1,25 @@
 from __future__ import annotations
 
 import hashlib
+from enum import IntEnum
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from pydantic import BaseModel
+
+
+class ContextPriority(IntEnum):
+    """上下文优先级。数字越小，越先进入 prompt。
+
+    这个字段是必填的，没有隐式默认值：新增证据源必须明确声明自己属于
+    哪一层，避免又悄悄退回 catch-all。
+    """
+
+    STATIC = 1      # 确定性静态分析（只看 changed lines）
+    ENCLOSING = 2   # 变更行所在的函数/类
+    DEFINITION = 3  # callee / dependency / base revision 被删除定义
+    REFERENCE = 4   # caller / impact / grep 兜底引用
+    FIELD = 5       # 被引用的类/结构体字段与模块常量
+    TEST = 6        # 引用变更符号的关联测试函数
 
 
 def make_context_id(
@@ -46,9 +62,10 @@ class CodeContext(BaseModel):
     start_line: Optional[int] = None
     end_line: Optional[int] = None
 
-    # 上下文扩展优先级：1=Diff，2=变更方法，3=Callee 签名，4=Caller 调用点，
-    # 5=类/文件级字段，6=其他补充证据（impact/static/reference/test）。
-    priority: int = 6
+    # 上下文扩展优先级（必填）：1=确定性静态证据，2=变更方法/类，
+    # 3=定义（callee/dependency/base），4=引用（caller/impact/grep 兜底），
+    # 5=类/文件级字段，6=关联测试。数字越大优先级越低。
+    priority: ContextPriority
     # 是否做过 AST 分支折叠；折叠时 changed lines 必须被保留。
     folded: bool = False
     # 装配时计算的估算成本，便于 metrics / 调试。

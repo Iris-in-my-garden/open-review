@@ -16,12 +16,16 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Iterable, List, Literal, Optional
+from typing import Iterable, List, Literal, Mapping, Optional
 
 from pydantic import BaseModel, Field
 
 from openreview.repo.diff_parser import ParsedDiff
-from openreview.retriever.code_context import CodeContext, make_context_id
+from openreview.retriever.code_context import (
+    CodeContext,
+    ContextPriority,
+    make_context_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +64,30 @@ class StaticAnalysisReport(BaseModel):
         return notes
 
     def to_contexts(
-        self, repo_path: Path, filenames: Optional[Iterable[str]] = None
+        self,
+        repo_path: Path,
+        filenames: Optional[Iterable[str]] = None,
+        changed_lines: Optional[Mapping[str, Iterable[int]]] = None,
     ) -> List[CodeContext]:
+        """把静态信号转成 P1 上下文。
+
+        ``changed_lines`` 是第二道保险：即使调用方传入的是未过滤的 report，
+        也只保留落在本次新增/修改行上的 finding。
+        """
         allowed = set(filenames) if filenames is not None else None
+        allowed_lines = (
+            {name: set(lines) for name, lines in changed_lines.items()}
+            if changed_lines is not None
+            else None
+        )
         contexts: List[CodeContext] = []
         for item in self.findings[:MAX_STATIC_CONTEXTS]:
             if allowed is not None and item.file not in allowed:
                 continue
+            if allowed_lines is not None:
+                lines = allowed_lines.get(item.file)
+                if lines is None or item.line not in lines:
+                    continue
             snippet = _read_snippet(repo_path, item.file, item.line)
             if not snippet:
                 continue
@@ -77,6 +98,7 @@ class StaticAnalysisReport(BaseModel):
                     snippet=snippet,
                     score=0.6,
                     kind="static",
+                    priority=ContextPriority.STATIC,
                     start_line=max(1, item.line - 4),
                     end_line=item.line + 4,
                     context_id=make_context_id(

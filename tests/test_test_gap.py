@@ -1,5 +1,5 @@
 from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
-from openreview.retriever.code_context import CodeContext
+from openreview.retriever.code_context import CodeContext, ContextPriority
 from openreview.review.test_gap import analyze_test_gaps
 
 
@@ -30,6 +30,7 @@ def test_linked_test_with_changed_symbol_produces_no_suggestion():
             reason="Linked test file",
             snippet="from pkg.service import create_user\n\ndef test_create():\n    create_user()",
             score=0.85,
+            priority=ContextPriority.TEST,
         )
     ]
 
@@ -43,6 +44,7 @@ def test_linked_test_without_changed_symbol_is_reported():
             reason="Linked test file",
             snippet="def test_unrelated():\n    assert True",
             score=0.85,
+            priority=ContextPriority.TEST,
         )
     ]
 

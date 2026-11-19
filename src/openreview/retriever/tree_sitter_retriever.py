@@ -3,13 +3,13 @@
 职责边界刻意收窄：
 
 - P2：变更行所属函数/类的完整 AST 片段（超长时折叠，保留 changed lines）
+- P3：删除符号在 base revision 同文件中的历史定义
 - P5：被变更方法引用的类/结构体字段与模块常量
-- Base：删除符号在 base revision 同文件中的历史定义
-- Test：按需提取真正引用变更符号的单个测试函数
+- P6：按需提取真正引用变更符号的关联测试函数（最多 2 个）
 
 跨文件引用、import/call graph 由 ``HybridRetriever`` + ``GraphRetriever``
-负责。这里的全局 grep 只在 ``allow_global_fallback=True``（索引崩溃）时启用，
-作为最后兜底，而不是正常路径。
+负责。这里的全局 grep 只在索引或图不可用（``allow_global_fallback=True``）
+时启用，作为最后兜底，而不是正常路径。
 """
 
 import logging
@@ -21,7 +21,11 @@ from tree_sitter import Language, Node, Parser, Tree
 
 from openreview.repo.diff_parser import ParsedDiff
 from openreview.retriever import ast_utils
-from openreview.retriever.code_context import CodeContext, make_context_id
+from openreview.retriever.code_context import (
+    CodeContext,
+    ContextPriority,
+    make_context_id,
+)
 from openreview.retriever.folding import fold_snippet
 from openreview.retriever.globals import (
     DEFAULT_FIELD_WINDOW_RADIUS,
@@ -38,7 +42,7 @@ MAX_FILE_SIZE = 500 * 1024  # 500 KB 限制
 # 仅用于索引崩溃时的全局 grep 兜底。
 MAX_SEARCH_TARGETS = 50
 MAX_REFERENCE_CONTEXTS = 200
-MAX_TEST_FUNCTION_CONTEXTS = 12
+MAX_TEST_FUNCTION_CONTEXTS = 2
 # 单个 enclosing 方法超过该 token 数时做 AST 折叠；折叠会保留全部变更行。
 MAX_ENCLOSING_SNIPPET_TOKENS = 1600
 
@@ -228,7 +232,7 @@ class TreeSitterLocalRetriever:
                         snippet=snippet,
                         score=SCORE_ENCLOSING,
                         kind="enclosing",
-                        priority=2,
+                        priority=ContextPriority.ENCLOSING,
                         folded=folded,
                         symbol=display_name if name else "",
                         start_line=start_row + 1,
@@ -375,7 +379,7 @@ class TreeSitterLocalRetriever:
             snippet=snippet,
             score=0.4,
             kind="field",
-            priority=5,
+            priority=ContextPriority.FIELD,
             symbol=symbol,
             start_line=field.start_line,
             end_line=end_line or field.end_line,
@@ -452,7 +456,7 @@ class TreeSitterLocalRetriever:
                         score=SCORE_BASE_DEFINITION,
                         revision="base",
                         kind="base_definition",
-                        priority=6,
+                        priority=ContextPriority.DEFINITION,
                         symbol=name,
                         start_line=start_row + 1,
                         end_line=end_row + 1,
@@ -531,7 +535,7 @@ class TreeSitterLocalRetriever:
                             score=SCORE_TEST_FUNCTION,
                             revision="head",
                             kind="test",
-                            priority=6,
+                            priority=ContextPriority.TEST,
                             symbol=name,
                             start_line=start_row + 1,
                             end_line=end_row + 1,
@@ -759,7 +763,11 @@ class TreeSitterLocalRetriever:
                         score=score,
                         revision=revision,
                         kind=kind,
-                        priority=6,
+                        priority=(
+                            ContextPriority.DEFINITION
+                            if is_def
+                            else ContextPriority.REFERENCE
+                        ),
                         symbol=matched_symbol,
                         start_line=node_range[0] + 1,
                         end_line=node_range[1] + 1,

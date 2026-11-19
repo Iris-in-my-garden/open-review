@@ -62,7 +62,7 @@ class ReviewConfig:
     max_batch_tokens: int = 12000
     max_patch_tokens: int = 8192
     hard_patch_tokens: int = 48000
-    # P2-P5 共享的上下文扩展预算。
+    # P2-P6 共享的上下文扩展预算。
     max_context_tokens: int = 8192
     # 内部 prompt 预算策略（不暴露 CLI）：
     # soft 用于把超限内容打包成多个调用，hard 是触发拆分的上限。

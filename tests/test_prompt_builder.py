@@ -1,6 +1,6 @@
 from openreview.github.client import PullRequestInfo
 from openreview.repo.diff_parser import DiffParser
-from openreview.retriever.code_context import CodeContext
+from openreview.retriever.code_context import CodeContext, ContextPriority
 from openreview.review.prompt_builder import (
     UNTRUSTED_END,
     UNTRUSTED_START,
@@ -97,12 +97,14 @@ def test_patch_and_context_budgets_are_enforced():
             reason="small",
             snippet="x = 1",
             score=0.9,
+            priority=ContextPriority.ENCLOSING,
         ),
         CodeContext(
             file_path="src/large_context.py",
             reason="large",
             snippet="y = 2\n" * 500,
             score=0.8,
+            priority=ContextPriority.ENCLOSING,
         ),
     ]
     builder = PromptBuilder(max_patch_tokens=600, max_context_tokens=80)
@@ -138,7 +140,7 @@ def test_context_ids_are_rendered_and_injected_next_to_matching_file():
         snippet="def new_func():\n    return 1",
         score=0.9,
         kind="enclosing",
-        priority=2,
+        priority=ContextPriority.ENCLOSING,
         symbol="new_func",
         start_line=10,
         end_line=11,
@@ -149,7 +151,7 @@ def test_context_ids_are_rendered_and_injected_next_to_matching_file():
         snippet="def helper():\n    return 2",
         score=0.6,
         kind="dependency",
-        priority=6,
+        priority=ContextPriority.TEST,
         symbol="helper",
         start_line=1,
         end_line=2,
@@ -245,12 +247,14 @@ def test_prompt_builder_records_used_and_omitted_context_stats():
             reason="small",
             snippet="x = 1",
             score=0.9,
+            priority=ContextPriority.ENCLOSING,
         ),
         CodeContext(
             file_path="src/large.py",
             reason="large",
             snippet="y = 2\n" * 500,
             score=0.8,
+            priority=ContextPriority.ENCLOSING,
         ),
     ]
     builder = PromptBuilder(max_context_tokens=80)

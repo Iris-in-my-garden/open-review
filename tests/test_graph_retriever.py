@@ -3,7 +3,11 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from openreview.retriever.code_context import CodeContext, dedupe_contexts
+from openreview.retriever.code_context import (
+    CodeContext,
+    ContextPriority,
+    dedupe_contexts,
+)
 from openreview.retriever.graph import GraphRetriever
 from openreview.retriever.index import IndexedSymbol, RepoIndex
 from openreview.retriever.query import RetrievalQuery
@@ -89,6 +93,7 @@ def test_graph_retriever_expands_callers_callees_and_dependencies(tmp_path: Path
         )
         assert dependency.file_path == "pkg/models.py"
         assert dependency.symbol == "User"
+        assert dependency.priority == ContextPriority.DEFINITION
 
         assert stats["graph_caller_hits"] == 1
         assert stats["graph_callee_hits"] == 1
@@ -311,6 +316,7 @@ def test_context_dedupe_uses_range_identity_across_kinds():
             snippet="def login():\n    pass",
             score=0.95,
             kind="enclosing",
+            priority=ContextPriority.ENCLOSING,
             start_line=10,
             end_line=11,
         ),
@@ -320,6 +326,7 @@ def test_context_dedupe_uses_range_identity_across_kinds():
             snippet="def login():\n    pass",
             score=0.90,
             kind="definition",
+            priority=ContextPriority.DEFINITION,
             start_line=10,
             end_line=11,
         ),
@@ -329,6 +336,7 @@ def test_context_dedupe_uses_range_identity_across_kinds():
             snippet="login()",
             score=0.60,
             kind="reference",
+            priority=ContextPriority.REFERENCE,
             start_line=3,
             end_line=3,
         ),

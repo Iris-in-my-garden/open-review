@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
+from openreview.retriever.code_context import ContextPriority
 from openreview.review.impact import ImpactAnalyzer
 
 
@@ -36,6 +37,7 @@ def test_impact_finds_cross_file_references(tmp_path: Path):
     assert any(item.file == "src/caller.py" for item in report.findings)
     contexts = report.to_contexts(tmp_path)
     assert contexts
+    assert contexts[0].priority == ContextPriority.REFERENCE
     assert "helper" in contexts[0].snippet
     assert contexts[0].reason.startswith("impact:")
 

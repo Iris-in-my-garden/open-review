@@ -97,7 +97,7 @@ class ReviewPipeline:
         llm_cache_mode: str = "auto",
         debug_dir: Optional[str] = None,
     ):
-        # Diff 使用独立预算，P2-P5 共享 max_context_tokens；hard_patch 只做
+        # Diff 使用独立预算，P2-P6 共享 max_context_tokens；hard_patch 只做
         # 单个无法拆分文件的硬熔断，不参与正常分批。
         effective_context_tokens = max_context_tokens
         effective_patch_tokens = min(max_patch_tokens, hard_patch_tokens)

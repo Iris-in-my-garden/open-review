@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from openreview.retriever.code_context import CodeContext
+from openreview.retriever.code_context import CodeContext, ContextPriority
 from openreview.services.evidence_pipeline import (
     MAX_GLOBAL_IMPACT_FALLBACK,
     MAX_IMPACT_PER_BATCH,
@@ -30,6 +30,7 @@ def _impact(symbol: str, score: float = 0.7) -> CodeContext:
         snippet=f"{symbol}()",
         score=score,
         kind="impact",
+        priority=ContextPriority.REFERENCE,
         symbol=symbol,
         start_line=1,
         end_line=1,
@@ -76,6 +77,7 @@ def test_static_contexts_stay_batch_scoped():
             snippet="x = 1",
             score=0.6,
             kind="static",
+            priority=ContextPriority.STATIC,
         ),
         CodeContext(
             file_path="src/b.py",
@@ -83,6 +85,7 @@ def test_static_contexts_stay_batch_scoped():
             snippet="y = 1",
             score=0.6,
             kind="static",
+            priority=ContextPriority.STATIC,
         ),
     ]
 

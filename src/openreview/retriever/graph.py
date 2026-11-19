@@ -21,6 +21,7 @@ from openreview.retriever import ast_utils
 from openreview.retriever.ast_utils import read_line_range
 from openreview.retriever.code_context import (
     CodeContext,
+    ContextPriority,
     dedupe_contexts,
     make_context_id,
 )
@@ -162,7 +163,7 @@ class GraphRetriever:
                     snippet=snippet,
                     score=0.58,
                     kind="caller",
-                    priority=4,
+                    priority=ContextPriority.REFERENCE,
                     symbol=symbol,
                     start_line=start,
                     end_line=end,
@@ -281,7 +282,7 @@ class GraphRetriever:
                     snippet=snippet,
                     score=0.72,
                     kind="callee",
-                    priority=3,
+                    priority=ContextPriority.DEFINITION,
                     symbol=definition.name,
                     start_line=definition.start_line,
                     end_line=definition.end_line,
@@ -419,7 +420,7 @@ class GraphRetriever:
                     snippet=snippet,
                     score=0.62,
                     kind="dependency",
-                    priority=6,
+                    priority=ContextPriority.DEFINITION,
                     symbol=symbol.name,
                     start_line=symbol.start_line,
                     end_line=symbol.end_line,

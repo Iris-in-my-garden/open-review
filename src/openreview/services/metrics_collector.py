@@ -53,7 +53,7 @@ class MetricsCollector:
         folded_contexts = 0
         for context in state.all_contexts:
             context_kinds[context.kind] = context_kinds.get(context.kind, 0) + 1
-            key = f"P{context.priority}"
+            key = f"P{int(context.priority)}"
             priority_counts[key] = priority_counts.get(key, 0) + 1
             priority_tokens[key] = priority_tokens.get(key, 0) + estimate_tokens(
                 context.snippet

@@ -6,7 +6,10 @@ from typing import Dict, List, Optional, Tuple
 from openreview.domain.models import PullRequestInfo
 from openreview.repo.diff_parser import HUNK_RANGE_PATTERN, ParsedDiff
 from openreview.retriever.code_context import CodeContext
-from openreview.retriever.context_planner import DEFAULT_PRIORITY_TOKEN_CAPS
+from openreview.retriever.context_planner import (
+    kind_token_cap,
+    priority_token_cap,
+)
 from openreview.review.redaction import redact_text
 from openreview.review.token_budget import estimate_tokens, truncate_to_tokens
 
@@ -284,8 +287,9 @@ class PromptBuilder:
         used = 0
         used_tokens = 0
         used_by_priority: Dict[int, int] = {}
-        # 严格按 priority 填充：P2 enclosing > P3 callee > P4 caller > P5 field
-        # > P6 其他。planner 已经做过一次预算和低优先级 cap，这里再做最终兜底。
+        used_by_kind: Dict[str, int] = {}
+        # 严格按 priority 填充：P1 static > P2 enclosing > P3 定义 > P4 引用
+        # > P5 field > P6 test。planner 已经做过一次预算和 cap，这里再做最终兜底。
         ordered = sorted(
             contexts, key=lambda item: (item.priority, -item.score)
         )
@@ -297,11 +301,13 @@ class PromptBuilder:
                 omitted += 1
                 omitted_tokens += cost
                 continue
-            cap = DEFAULT_PRIORITY_TOKEN_CAPS.get(ctx.priority)
+            usage_priority = used_by_priority.get(ctx.priority, 0) + cost
+            usage_kind = used_by_kind.get(ctx.kind, 0) + cost
+            priority_cap = priority_token_cap(ctx.priority)
+            kind_cap = kind_token_cap(ctx.kind)
             if (
-                cap is not None
-                and used_by_priority.get(ctx.priority, 0) + cost > cap
-            ):
+                priority_cap is not None and usage_priority > priority_cap
+            ) or (kind_cap is not None and usage_kind > kind_cap):
                 omitted += 1
                 omitted_tokens += cost
                 continue
@@ -312,9 +318,8 @@ class PromptBuilder:
             remaining -= cost
             used += 1
             used_tokens += cost
-            used_by_priority[ctx.priority] = (
-                used_by_priority.get(ctx.priority, 0) + cost
-            )
+            used_by_priority[ctx.priority] = usage_priority
+            used_by_kind[ctx.kind] = usage_kind
 
         rendered_blocks: List[str] = []
         for filename, block in patch_blocks:

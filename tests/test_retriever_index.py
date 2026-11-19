@@ -288,7 +288,7 @@ def test_hybrid_retriever_adds_index_contexts_with_ids(tmp_path: Path):
 
 def test_hybrid_enables_grep_fallback_only_without_index(tmp_path: Path):
     """只有索引不可用时，AST 才被允许现场 grep 兜底。"""
-    from openreview.retriever.code_context import CodeContext
+    from openreview.retriever.code_context import CodeContext, ContextPriority
 
     class _RecordingAstRetriever:
         last_stats = {"ast_contexts": 0}
@@ -312,6 +312,7 @@ def test_hybrid_enables_grep_fallback_only_without_index(tmp_path: Path):
                     snippet="def f(): pass",
                     score=0.9,
                     kind="enclosing",
+                    priority=ContextPriority.ENCLOSING,
                 )
             ]
 
@@ -426,7 +427,7 @@ def test_retrieval_mechanisms_share_path_filters(tmp_path: Path):
 
 def test_hybrid_reports_candidates_deduped_and_truncated(tmp_path: Path):
     """Token 预算造成的丢失必须可观测，而不是静默截断。"""
-    from openreview.retriever.code_context import CodeContext
+    from openreview.retriever.code_context import CodeContext, ContextPriority
 
     class _FakeAstRetriever:
         last_stats = {"ast_contexts": 4, "ast_contexts_truncated": 1}
@@ -439,6 +440,7 @@ def test_hybrid_reports_candidates_deduped_and_truncated(tmp_path: Path):
                     snippet=f"def f{line}(): pass",
                     score=0.9 - line / 100,
                     kind="definition",
+                    priority=ContextPriority.DEFINITION,
                     start_line=line,
                     end_line=line,
                 )

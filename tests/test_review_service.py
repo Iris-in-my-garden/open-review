@@ -5,7 +5,7 @@ import pytest
 
 from openreview.domain.versions import METRICS_SCHEMA_VERSION
 from openreview.github.client import ChangedFile, PullRequestInfo
-from openreview.retriever.code_context import CodeContext
+from openreview.retriever.code_context import CodeContext, ContextPriority
 from openreview.review.report_writer import PotentialIssue, ReviewResult
 from openreview.review.single_shot import SingleShotReviewer
 from openreview.review.token_budget import (
@@ -151,6 +151,7 @@ class FakeContextRetriever:
                 snippet="def x(): ...",
                 score=0.9,
                 kind="definition",
+                priority=ContextPriority.DEFINITION,
                 symbol="x",
                 start_line=1,
                 end_line=1,
@@ -172,6 +173,7 @@ class FakeRepeatedContextRetriever:
                 snippet="def shared(): ...",
                 score=0.9,
                 kind="definition",
+                priority=ContextPriority.DEFINITION,
                 symbol="shared",
                 start_line=1,
                 end_line=1,
@@ -193,6 +195,7 @@ class HugeContextRetriever:
                 snippet="x = 1\n" * 5000,
                 score=0.9,
                 kind="definition",
+                priority=ContextPriority.DEFINITION,
                 symbol="huge",
                 start_line=1,
                 end_line=5000,
@@ -213,6 +216,7 @@ class FakeGraphContextRetriever(FakeContextRetriever):
                 snippet="def x(): ...",
                 score=0.9,
                 kind="definition",
+                priority=ContextPriority.DEFINITION,
                 symbol="x",
                 start_line=1,
                 end_line=1,
@@ -223,6 +227,7 @@ class FakeGraphContextRetriever(FakeContextRetriever):
                 snippet="def handle():\n    x()",
                 score=0.58,
                 kind="caller",
+                priority=ContextPriority.REFERENCE,
                 symbol="handle",
                 start_line=1,
                 end_line=2,
@@ -233,6 +238,7 @@ class FakeGraphContextRetriever(FakeContextRetriever):
                 snippet="from src.file_0 import x",
                 score=0.6,
                 kind="import",
+                priority=ContextPriority.DEFINITION,
                 symbol="x",
                 start_line=1,
                 end_line=1,
@@ -478,7 +484,7 @@ def test_pipeline_surfaces_retrieval_metrics_and_context_refs(tmp_path: Path):
     assert retrieval["stats"]["graph_callee_hits"] == 2
     assert retrieval["stats"]["contexts_by_priority"] == 2
     assert retrieval["stats"]["context_tokens_remaining"] > 0
-    assert retrieval["context_priorities"] == {"P6": 2}
+    assert retrieval["context_priorities"] == {"P3": 2}
     assert retrieval["symbol_coverage"] == 1.0
 
     # context_refs 从 prompt 上下文 -> finding -> validator -> result 全链路保留。

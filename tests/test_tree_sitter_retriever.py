@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
+from openreview.retriever.code_context import ContextPriority
 from openreview.retriever.tree_sitter_retriever import (
     SCORE_BASE_DEFINITION,
     SCORE_DEFINITION,
@@ -168,6 +169,7 @@ def test_linked_test_file_is_retrieved(sample_repo: Path):
 
     assert test_contexts
     assert test_contexts[0].score == SCORE_TEST_FILE
+    assert test_contexts[0].priority == ContextPriority.TEST
     assert "def test_target" in test_contexts[0].snippet
 
 
@@ -233,6 +235,10 @@ def test_base_revision_context_is_used_for_removed_symbols(tmp_path: Path):
     assert base_contexts
     assert any("def gone():" in context.snippet for context in base_contexts)
     assert all(
+        context.priority == ContextPriority.DEFINITION
+        for context in base_contexts
+    )
+    assert all(
         context.score <= SCORE_BASE_DEFINITION for context in base_contexts
     )
 
@@ -276,6 +282,14 @@ def test_reference_contexts_are_capped(tmp_path: Path):
     contexts = retriever._search_references(tmp_path, {"target"}, set(), {})
 
     assert len(contexts) <= MAX_REFERENCE_CONTEXTS
+    # grep 兜底：定义属于 P3，引用属于 P4。
+    for context in contexts:
+        expected = (
+            ContextPriority.DEFINITION
+            if context.kind == "definition"
+            else ContextPriority.REFERENCE
+        )
+        assert context.priority == expected
     assert retriever.last_stats["reference_contexts_truncated"] > 0
     assert retriever.last_stats["grep_timeouts"] == 0
 
@@ -312,7 +326,9 @@ def test_test_files_skip_p5_field_contexts(tmp_path: Path):
 
     contexts = TreeSitterLocalRetriever().retrieve(tmp_path, diff)
 
-    assert not any(context.priority == 5 for context in contexts)
+    assert not any(
+        context.priority == ContextPriority.FIELD for context in contexts
+    )
 
 
 def test_p5_fields_from_same_struct_are_grouped(tmp_path: Path):
@@ -346,7 +362,11 @@ def test_p5_fields_from_same_struct_are_grouped(tmp_path: Path):
     )
 
     contexts = TreeSitterLocalRetriever().retrieve(tmp_path, diff)
-    field_contexts = [context for context in contexts if context.priority == 5]
+    field_contexts = [
+        context
+        for context in contexts
+        if context.priority == ContextPriority.FIELD
+    ]
 
     assert len(field_contexts) == 1
     assert field_contexts[0].symbol == "Service"

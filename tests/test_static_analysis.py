@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from openreview.retriever.code_context import ContextPriority
 from openreview.review.static_analysis import (
     StaticAnalysisReport,
     StaticAnalysisRunner,
@@ -23,8 +24,25 @@ def test_static_report_contexts_are_filtered_by_file(tmp_path: Path):
 
     assert len(contexts) == 1
     assert contexts[0].file_path == "a.py"
+    assert contexts[0].priority == ContextPriority.STATIC
     assert contexts[0].reason == "static:ruff:F841"
     assert "2: y = 2" in contexts[0].snippet
+
+
+def test_static_report_contexts_are_filtered_by_changed_lines(tmp_path: Path):
+    """to_contexts 自身也按 changed lines 过滤，不能只依赖调用方预过滤。"""
+    (tmp_path / "a.py").write_text("x = 1\ny = 2\nz = 3\n", encoding="utf-8")
+    report = StaticAnalysisReport(
+        findings=[
+            StaticFinding(tool="ruff", file="a.py", line=1, code="F841", message="new"),
+            StaticFinding(tool="ruff", file="a.py", line=3, code="F401", message="old"),
+        ]
+    )
+
+    contexts = report.to_contexts(tmp_path, changed_lines={"a.py": {1}})
+
+    assert [context.start_line for context in contexts] == [1]
+    assert "1: x = 1" in contexts[0].snippet
 
 
 def test_static_report_notes_are_capped(tmp_path: Path):

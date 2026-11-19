@@ -1,6 +1,6 @@
-"""P2-P5 上下文预算装配的行为约束。"""
+"""P1-P6 上下文预算装配的行为约束。"""
 
-from openreview.retriever.code_context import CodeContext
+from openreview.retriever.code_context import CodeContext, ContextPriority
 from openreview.retriever.context_planner import CONTEXT_OVERHEAD_TOKENS, plan_contexts
 from openreview.review.token_budget import estimate_tokens
 
@@ -8,7 +8,8 @@ from openreview.review.token_budget import estimate_tokens
 def _context(
     file_path: str,
     *,
-    priority: int,
+    priority: ContextPriority,
+    kind: str = "snippet",
     snippet: str = "x" * 300,
     start_line: int = 1,
     end_line: int = 1,
@@ -19,6 +20,7 @@ def _context(
         reason="test",
         snippet=snippet,
         score=score,
+        kind=kind,
         priority=priority,
         start_line=start_line,
         end_line=end_line,
@@ -30,33 +32,54 @@ def _cost(context: CodeContext) -> int:
 
 
 def test_plan_contexts_fills_in_strict_priority_order():
-    p2 = _context("src/a.py", priority=2)
-    p3 = _context("src/b.py", priority=3, snippet="y" * 300)
+    p2 = _context("src/a.py", priority=ContextPriority.ENCLOSING)
+    p3 = _context(
+        "src/b.py",
+        priority=ContextPriority.DEFINITION,
+        snippet="y" * 300,
+    )
     # 只够 P2 + 一小段 P3：P2 必须先被完整保留。
     budget = _cost(p2) + 10
 
     selected = plan_contexts([p3, p2], budget)
 
-    assert [item.priority for item in selected] == [2]
+    assert [item.priority for item in selected] == [ContextPriority.ENCLOSING]
 
 
 def test_plan_contexts_uses_leftover_budget_for_lower_priority():
-    p2 = _context("src/a.py", priority=2)
-    p3 = _context("src/b.py", priority=3, snippet="z")
+    p2 = _context("src/a.py", priority=ContextPriority.ENCLOSING)
+    p3 = _context(
+        "src/b.py", priority=ContextPriority.DEFINITION, snippet="z"
+    )
     budget = _cost(p2) + _cost(p3)
 
     selected = plan_contexts([p3, p2], budget)
 
-    assert [item.priority for item in selected] == [2, 3]
+    assert [item.priority for item in selected] == [
+        ContextPriority.ENCLOSING,
+        ContextPriority.DEFINITION,
+    ]
 
 
 def test_plan_contexts_round_robin_keeps_every_file_represented():
     # src/a.py 有三个变更点，src/b.py 只有一个；预算只够两份。
     contexts = [
-        _context("src/a.py", priority=2, start_line=index, end_line=index)
+        _context(
+            "src/a.py",
+            priority=ContextPriority.ENCLOSING,
+            start_line=index,
+            end_line=index,
+        )
         for index in range(1, 4)
     ]
-    contexts.append(_context("src/b.py", priority=2, start_line=1, end_line=1))
+    contexts.append(
+        _context(
+            "src/b.py",
+            priority=ContextPriority.ENCLOSING,
+            start_line=1,
+            end_line=1,
+        )
+    )
     budget = _cost(contexts[0]) * 2 + 5
 
     selected = plan_contexts(contexts, budget)
@@ -66,51 +89,187 @@ def test_plan_contexts_round_robin_keeps_every_file_represented():
 
 
 def test_plan_contexts_dedupes_same_range_by_priority():
-    low_priority = _context("src/a.py", priority=6, score=0.99)
-    high_priority = _context("src/a.py", priority=2, score=0.1)
+    low_priority = _context(
+        "src/a.py", priority=ContextPriority.TEST, score=0.99
+    )
+    high_priority = _context(
+        "src/a.py", priority=ContextPriority.ENCLOSING, score=0.1
+    )
 
     selected = plan_contexts([low_priority, high_priority], 10_000)
 
     assert len(selected) == 1
-    assert selected[0].priority == 2
+    assert selected[0].priority == ContextPriority.ENCLOSING
+
+
+def test_impact_and_caller_share_p4_and_dedupe():
+    """impact 与 caller 同为 P4；同一代码范围只保留一条。"""
+    caller = _context(
+        "src/a.py",
+        priority=ContextPriority.REFERENCE,
+        kind="caller",
+        start_line=10,
+        end_line=12,
+        score=0.6,
+    )
+    impact = _context(
+        "src/a.py",
+        priority=ContextPriority.REFERENCE,
+        kind="impact",
+        start_line=10,
+        end_line=12,
+        score=0.9,
+    )
+
+    selected = plan_contexts([caller, impact], 10_000)
+
+    assert len(selected) == 1
+    assert selected[0].kind == "impact"
 
 
 def test_plan_contexts_records_omission_stats():
     contexts = [
-        _context("src/a.py", priority=2, start_line=1, end_line=1),
-        _context("src/a.py", priority=4, start_line=2, end_line=2),
+        _context(
+            "src/a.py",
+            priority=ContextPriority.ENCLOSING,
+            start_line=1,
+            end_line=1,
+        ),
+        _context(
+            "src/a.py",
+            priority=ContextPriority.REFERENCE,
+            start_line=2,
+            end_line=2,
+        ),
     ]
     stats: dict[str, float] = {}
 
     selected = plan_contexts([*contexts], _cost(contexts[0]), stats=stats)
 
-    assert [item.priority for item in selected] == [2]
+    assert [item.priority for item in selected] == [ContextPriority.ENCLOSING]
     assert stats["contexts_by_priority"] == 1
     assert stats["contexts_omitted_by_priority"] == 1
     assert stats["context_tokens_omitted_by_priority"] == _cost(contexts[1])
-    assert stats["context_tokens_by_priority_detail"] == {"P2": _cost(contexts[0])}
+    assert stats["context_tokens_by_priority_detail"] == {
+        "P2": _cost(contexts[0])
+    }
 
 
-def test_plan_contexts_caps_low_priority_buckets():
+def test_plan_contexts_caps_static_field_and_test_buckets():
     from openreview.retriever.context_planner import (
+        P1_MAX_TOKENS,
         P5_MAX_TOKENS,
         P6_MAX_TOKENS,
     )
 
-    p5 = [
-        _context("src/a.py", priority=5, start_line=index, end_line=index)
-        for index in range(1, 20)
-    ]
-    p6 = [
-        _context("src/b.py", priority=6, start_line=index, end_line=index)
-        for index in range(1, 30)
-    ]
+    buckets = {
+        ContextPriority.STATIC: [
+            _context(
+                f"src/s{index}.py",
+                priority=ContextPriority.STATIC,
+                kind="static",
+                start_line=index,
+                end_line=index,
+            )
+            for index in range(1, 30)
+        ],
+        ContextPriority.FIELD: [
+            _context(
+                f"src/f{index}.py",
+                priority=ContextPriority.FIELD,
+                kind="field",
+                start_line=index,
+                end_line=index,
+            )
+            for index in range(1, 30)
+        ],
+        ContextPriority.TEST: [
+            _context(
+                f"src/t{index}.py",
+                priority=ContextPriority.TEST,
+                kind="test",
+                start_line=index,
+                end_line=index,
+            )
+            for index in range(1, 30)
+        ],
+    }
     stats: dict[str, float] = {}
 
-    selected = plan_contexts([*p5, *p6], 100_000, stats=stats)
+    selected = plan_contexts(
+        [item for group in buckets.values() for item in group],
+        100_000,
+        stats=stats,
+    )
 
-    p5_tokens = sum(_cost(item) for item in selected if item.priority == 5)
-    p6_tokens = sum(_cost(item) for item in selected if item.priority == 6)
-    assert p5_tokens <= P5_MAX_TOKENS
-    assert p6_tokens <= P6_MAX_TOKENS
+    used = {
+        priority: sum(
+            _cost(item) for item in selected if item.priority == priority
+        )
+        for priority in buckets
+    }
+    assert used[ContextPriority.STATIC] <= P1_MAX_TOKENS
+    assert used[ContextPriority.FIELD] <= P5_MAX_TOKENS
+    assert used[ContextPriority.TEST] <= P6_MAX_TOKENS
     assert stats["contexts_omitted_by_cap"] > 0
+
+
+def test_dependency_has_separate_cap_inside_p3():
+    """dependency 与 callee/base 同为 P3，但只限制 dependency 自己。"""
+    from openreview.retriever.context_planner import DEPENDENCY_MAX_TOKENS
+
+    dependencies = [
+        _context(
+            f"src/dep{index}.py",
+            priority=ContextPriority.DEFINITION,
+            kind="dependency",
+            start_line=index,
+            end_line=index,
+        )
+        for index in range(1, 30)
+    ]
+    callees = [
+        _context(
+            f"src/callee{index}.py",
+            priority=ContextPriority.DEFINITION,
+            kind="callee",
+            snippet="z" * 300,
+            start_line=index,
+            end_line=index,
+        )
+        for index in range(1, 30)
+    ]
+
+    selected = plan_contexts([*dependencies, *callees], 100_000)
+
+    dependency_tokens = sum(
+        _cost(item) for item in selected if item.kind == "dependency"
+    )
+    callee_tokens = sum(
+        _cost(item) for item in selected if item.kind == "callee"
+    )
+    assert dependency_tokens <= DEPENDENCY_MAX_TOKENS
+    assert callee_tokens > DEPENDENCY_MAX_TOKENS
+
+
+def test_context_priorities_follow_agreed_hierarchy():
+    """P1 static → P2 enclosing → P3 definition → P4 reference → P5 field → P6 test。"""
+    contexts = [
+        _context("src/s.py", priority=ContextPriority.STATIC, kind="static"),
+        _context("src/e.py", priority=ContextPriority.ENCLOSING, kind="enclosing"),
+        _context("src/d.py", priority=ContextPriority.DEFINITION, kind="callee"),
+        _context("src/r.py", priority=ContextPriority.REFERENCE, kind="impact"),
+        _context("src/f.py", priority=ContextPriority.FIELD, kind="field"),
+        _context("src/t.py", priority=ContextPriority.TEST, kind="test"),
+    ]
+
+    selected = plan_contexts(list(reversed(contexts)), 100_000)
+
+    assert [item.priority for item in selected] == [
+        ContextPriority.STATIC,
+        ContextPriority.ENCLOSING,
+        ContextPriority.DEFINITION,
+        ContextPriority.REFERENCE,
+        ContextPriority.FIELD,
+        ContextPriority.TEST,
+    ]

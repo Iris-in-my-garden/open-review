@@ -18,7 +18,11 @@ from typing import Iterable, List, Optional
 from pydantic import BaseModel, Field
 
 from openreview.repo.diff_parser import ParsedDiff
-from openreview.retriever.code_context import CodeContext, make_context_id
+from openreview.retriever.code_context import (
+    CodeContext,
+    ContextPriority,
+    make_context_id,
+)
 from openreview.retriever.grep import search_symbols
 
 logger = logging.getLogger(__name__)
@@ -82,6 +86,7 @@ class ImpactReport(BaseModel):
                     snippet=snippet,
                     score=item.confidence,
                     kind="impact",
+                    priority=ContextPriority.REFERENCE,
                     symbol=item.symbol,
                     start_line=max(1, item.line - 6),
                     end_line=item.line + 6,

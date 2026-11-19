@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from typing import List
 
+from openreview.repo.diff_parser import DiffParser
 from openreview.retriever.code_context import CodeContext
 from openreview.review.config import ReviewConfig
 from openreview.review.workflow import ReviewState
@@ -72,7 +73,14 @@ class EvidencePipeline:
                     f"[static] 发现 {len(report.findings)} 个静态分析信号，"
                     "已作为上下文注入。"
                 )
-            return report.to_contexts(state.local_repo_path)
+            changed_lines = {
+                file.filename: set(file.changed_lines or file.visible_lines or [])
+                for file in state.parsed_diff.files
+                if file.changed_lines or file.visible_lines
+            }
+            return report.to_contexts(
+                state.local_repo_path, changed_lines=changed_lines
+            )
         finally:
             state.stages["static_analysis"] = round(
                 time.perf_counter() - started, 3
@@ -105,7 +113,11 @@ class EvidencePipeline:
         relevant = [
             context
             for context in impact_contexts
-            if context.symbol in batch_symbols or context.file_path in batch_files
+            if (
+                context.symbol in batch_symbols
+                or context.file_path in batch_files
+            )
+            and not DiffParser.is_test_path(context.file_path)
         ]
         if not relevant and include_global_impact:
             relevant = sorted(
