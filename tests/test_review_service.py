@@ -758,6 +758,15 @@ def test_pipeline_raises_when_every_batch_fails(tmp_path: Path):
         assert pipeline.last_outcome is not None
         assert pipeline.last_outcome.status == ReviewStatus.FAILED
         assert pipeline.last_outcome.failed_batches == 2
+        state = pipeline.last_state
+        assert state is not None
+        metrics_path = (
+            tmp_path / "reports" / f"run_{state.run_id}_metrics.json"
+        )
+        assert metrics_path.exists()
+        failure_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        assert failure_metrics["outcome"]["status"] == "failed"
+        assert failure_metrics["errors"]
     finally:
         pipeline.close()
 

@@ -247,7 +247,7 @@ class ReviewPipeline:
         and retrieval stats are recreated for each run.
         """
         run_id = ReviewSession.new_run_id()
-        budgeted_client = BudgetedLLMClient(self._base_client)
+        budgeted_client = BudgetedLLMClient(self._base_client, run_id=run_id)
         llm_client = self._wrap_llm_client(budgeted_client)
 
         # 测试/调用方可能在构造后替换组件；只有仍指向默认原型时才重建，

@@ -80,7 +80,7 @@ def test_budgeted_client_can_be_rebound_per_run():
     assert second.used_llm_calls == 1
 
 
-def test_budgeted_client_refunds_budget_when_inner_call_fails():
+def test_budgeted_client_charges_unknown_provider_failure_conservatively():
     class FailingClient(FakeClient):
         def generate_structured(self, system_prompt, user_prompt, response_schema):
             self.calls += 1
@@ -93,10 +93,32 @@ def test_budgeted_client_refunds_budget_when_inner_call_fails():
     with pytest.raises(RuntimeError, match="provider timeout"):
         client.generate_structured("system prompt", "user prompt", Output)
 
-    # 失败的调用不占用预算，后续重试仍然可以通过。
-    assert budget.used_llm_calls == 0
-    assert budget.used_input_tokens == 0
-    assert budget.allow(calls=1)
+    # 连接失败可能发生在 provider 已接受请求之后，不能默认假设请求免费。
+    assert budget.used_llm_calls == 1
+    assert budget.used_input_tokens > 0
+    assert not budget.allow(calls=1)
+
+
+def test_provider_retry_attempts_consume_budget_individually(monkeypatch):
+    class RetryingClient(FakeClient):
+        max_retries = 1
+
+        def generate_structured(self, system_prompt, user_prompt, response_schema):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("provider timeout")
+            return response_schema(value=2)  # type: ignore[call-arg]
+
+    inner = RetryingClient()
+    budget = ReviewBudget(max_llm_calls=2, max_input_tokens=10_000)
+    client = BudgetedLLMClient(inner, budget, run_id="retry-run")
+    monkeypatch.setattr("openreview.review.llm_client.time.sleep", lambda _: None)
+
+    result = client.generate_structured("sys", "user", Output)
+
+    assert result.value == 2
+    assert inner.calls == 2
+    assert budget.used_llm_calls == 2
 
 
 def test_budget_reserve_is_atomic_under_concurrency():
@@ -174,7 +196,30 @@ def test_budgeted_client_settles_estimated_input_with_real_usage():
 
     # 预扣的字符估算被 provider 真实 usage 替换，输出也计入预算。
     assert budget.used_input_tokens == 120
+    assert budget.estimated_input_tokens > 0
     assert budget.used_output_tokens == 30
+
+
+def test_actual_input_usage_over_budget_blocks_followup_calls():
+    class OversizedUsageClient(FakeClient):
+        @property
+        def last_usage(self):
+            return {
+                "prompt_tokens": 120,
+                "completion_tokens": 0,
+                "total_tokens": 120,
+            }
+
+    inner = OversizedUsageClient()
+    budget = ReviewBudget(max_input_tokens=100)
+    client = BudgetedLLMClient(inner, budget)
+
+    client.generate_structured("s", "u", Output)
+
+    assert budget.used_input_tokens == 120
+    with pytest.raises(BudgetExceeded):
+        client.generate_structured("s", "u", Output)
+    assert inner.calls == 1
 
 
 def test_budget_stops_when_output_cap_is_reached():
@@ -187,6 +232,22 @@ def test_budget_stops_when_output_cap_is_reached():
 
     assert budget.remaining_output_tokens() == 0
     assert not budget.allow(calls=1)
+
+
+def test_output_tokens_are_reserved_before_concurrent_provider_calls():
+    budget = ReviewBudget(max_output_tokens=100)
+    assert budget.try_reserve(calls=1, output_tokens=80)
+    assert budget.remaining_output_tokens() == 20
+    assert not budget.try_reserve(calls=1, output_tokens=21)
+
+    budget.settle(
+        reserved_input_tokens=0,
+        actual_input_tokens=0,
+        actual_output_tokens=12,
+        reserved_output_tokens=80,
+    )
+    assert budget.remaining_output_tokens() == 88
+    assert budget.reserved_output_tokens == 0
 
 
 def test_budgeted_client_charges_usage_even_when_parsing_fails():

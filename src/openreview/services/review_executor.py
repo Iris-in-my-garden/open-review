@@ -14,12 +14,13 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from openreview.domain.models import PullRequestInfo, ReviewResult
 from openreview.domain.policies import merge_review_results
@@ -233,11 +234,8 @@ class ReviewExecutor:
         bind_budget = getattr(self.budgeted_client, "bind_budget", None)
         if callable(bind_budget):
             bind_budget(state.budget)
-        # 记录 run 开始时的累计值，后续用 delta 计算本次真实成本。
+        # 保留累计 usage 快照，供未提供 run-tagged call log 的自定义客户端回退。
         state.usage_start = self._usage_snapshot()
-        state.llm_call_start = int(
-            len(getattr(self.llm_client, "call_log", []) or [])
-        )
         state.cache_hits_start = int(getattr(self.llm_client, "hits", 0) or 0)
         state.cache_misses_start = int(getattr(self.llm_client, "misses", 0) or 0)
         return state
@@ -245,9 +243,71 @@ class ReviewExecutor:
     def execute(self, state: ReviewState) -> Path:
         try:
             state = self._build_workflow().run(state)
-        except Exception:
+        except Exception as exc:
+            node = next(
+                (
+                    event.node
+                    for event in reversed(state.trace)
+                    if event.status == "error"
+                ),
+                "workflow",
+            )
+            state.record_error(node, exc)
             outcome = self.outcome_resolver.resolve(state, failed=True)
             state.outcome = outcome
+            metrics: Dict[str, Any]
+            try:
+                metrics = dict(
+                    self.metrics_collector.build(
+                        state, self.llm_client, outcome
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to collect full metrics for failed review run %s",
+                    state.run_id,
+                )
+                metrics = dict(state.metrics())
+                metrics.update(
+                    {
+                        "outcome": outcome.as_dict(),
+                        "failed_batches": state.failed_batches,
+                        "budget_exhausted": state.budget_exhausted,
+                        "degraded_reasons": list(state.degraded_reasons),
+                        "errors": list(state.errors),
+                    }
+                )
+
+            state.metrics_snapshot = dict(metrics)
+            if state.review_result is not None:
+                state.review_result.metrics = dict(metrics)
+            if state.report_path is not None and state.review_result is not None:
+                try:
+                    state.report_path.write_text(
+                        ReportWriter.render_markdown(state.review_result),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to update failed review report %s",
+                        state.report_path,
+                    )
+            try:
+                state.output_dir.mkdir(parents=True, exist_ok=True)
+                metrics_path = (
+                    state.output_dir / f"run_{state.run_id}_metrics.json"
+                )
+                metrics_path.write_text(
+                    json.dumps(metrics, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist metrics for failed review run %s",
+                    state.run_id,
+                )
+            if self.debug_sink is not None:
+                self.debug_sink.record_state(state)
             self.last_state = state
             self.last_result = state.review_result
             self.last_outcome = outcome
@@ -798,13 +858,14 @@ class ReviewExecutor:
             # 的 cache 命中信息与 run identity。
             result.metrics = dict(
                 self.metrics_collector.cache_hit_metrics(
-                    state, result.metrics, outcome
+                    state, result.metrics, outcome, self.llm_client
                 )
             )
         else:
             result.metrics = dict(
                 self.metrics_collector.build(state, self.llm_client, outcome)
             )
+        state.metrics_snapshot = dict(result.metrics)
         logger.info("Review metrics: %s", result.metrics)
 
         # 报告首次写入时 metrics 还没补齐；这里补齐后重新落盘，

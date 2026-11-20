@@ -74,11 +74,19 @@ class BudgetMetrics(TypedDict):
     max_llm_calls: int
     used_llm_calls: int
     max_input_tokens: int
+    estimated_input_tokens: int
     used_input_tokens: int
     max_output_tokens: int
     used_output_tokens: int
+    reserved_output_tokens: int
     max_seconds: float
     elapsed_seconds: float
+    input_tokens_over_budget: bool
+    output_tokens_over_budget: bool
+    input_token_limit: str
+    input_usage_source: str
+    output_token_limit: str
+    time_limit: str
 
 
 class CacheMetrics(TypedDict, total=False):

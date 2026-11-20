@@ -9,6 +9,7 @@ from openreview.review.verifier import (
     FindingVerifier,
     VerifierResult,
 )
+from openreview.review.workflow import ReviewBudget
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -107,6 +108,20 @@ def test_verifier_rejects_findings_and_recomputes_risk():
     assert result.potential_issues[0].line == 2
     assert result.risk_level == "HIGH"
     assert any("Verifier 拒绝" in note for note in result.review_notes)
+
+
+def test_direct_verifier_uses_budgeted_client_for_provider_call():
+    llm = ScriptedVerifierLLM({"issue-1": "verified"})
+    budget = ReviewBudget(max_llm_calls=1, max_output_tokens=10_000)
+
+    _, stats = FindingVerifier(llm, batch_size=10, max_attempts=1).verify(
+        _result([_issue(1)]), _diff(), contexts=[], budget=budget
+    )
+
+    assert stats.llm_calls == 1
+    assert budget.used_llm_calls == 1
+    assert budget.reserved_output_tokens == 0
+    assert budget.used_output_tokens == 10_000
 
 
 def test_verifier_lowers_confidence_when_context_is_insufficient():

@@ -228,16 +228,46 @@ class MetricsCollector:
                 "max_llm_calls": state.budget.max_llm_calls,
                 "used_llm_calls": state.budget.used_llm_calls,
                 "max_input_tokens": state.budget.max_input_tokens,
+                "estimated_input_tokens": state.budget.estimated_input_tokens,
                 "used_input_tokens": state.budget.used_input_tokens,
                 "max_output_tokens": state.budget.max_output_tokens,
                 "used_output_tokens": state.budget.used_output_tokens,
+                "reserved_output_tokens": state.budget.reserved_output_tokens,
                 "max_seconds": state.budget.max_seconds,
                 "elapsed_seconds": round(state.budget.elapsed(), 3),
+                "input_tokens_over_budget": bool(
+                    state.budget.max_input_tokens > 0
+                    and state.budget.used_input_tokens
+                    > state.budget.max_input_tokens
+                ),
+                "output_tokens_over_budget": bool(
+                    state.budget.max_output_tokens > 0
+                    and state.budget.used_output_tokens
+                    > state.budget.max_output_tokens
+                ),
+                "input_token_limit": (
+                    "estimated before request; reconciled with provider usage "
+                    "after response"
+                ),
+                "input_usage_source": (
+                    "provider usage when available; estimate for requests without usage"
+                ),
+                "output_token_limit": (
+                    "reserved before request; enforced by max_completion_tokens"
+                ),
+                "time_limit": (
+                    "request timeout is capped by remaining run budget; "
+                    "client-side cancellation is not guaranteed"
+                ),
             },
             "llm_usage": self._usage_delta(
-                state.usage_start, self.usage_snapshot(llm_client)
+                state.usage_start,
+                self.usage_snapshot(llm_client),
             ),
         }
+        run_usage = self._run_usage(state, llm_client)
+        if run_usage is not None:
+            metrics["llm_usage"] = run_usage
         metrics.update(self.outcome_metrics(state, outcome))
         return metrics
 
@@ -246,6 +276,7 @@ class MetricsCollector:
         state: ReviewState,
         cached_metrics: Dict[str, Any],
         outcome: ReviewOutcome,
+        llm_client: Any = None,
     ) -> RunMetrics:
         """Preserve cached analysis metrics, refresh run-scoped fields."""
         metrics = dict(cached_metrics)
@@ -269,6 +300,36 @@ class MetricsCollector:
         metrics["schema_version"] = metric_schema_version()
         metrics["run_id"] = state.run_id
         metrics["versions"] = ARTIFACT_VERSIONS.as_dict()
+        metrics["stages_seconds"] = dict(state.stages)
+        metrics["total_seconds"] = round(sum(state.stages.values()), 3)
+        metrics["llm_calls"] = state.budget.used_llm_calls
+        metrics["llm_calls_detail"] = self._call_details(state, llm_client)
+        run_usage = self._run_usage(state, llm_client)
+        metrics["llm_usage"] = run_usage or {
+            "calls": 0,
+            "estimated_prompt_tokens": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        budget: Dict[str, Any] = dict(metrics.get("budget") or {})
+        budget.update(
+            {
+                "max_llm_calls": state.budget.max_llm_calls,
+                "used_llm_calls": state.budget.used_llm_calls,
+                "max_input_tokens": state.budget.max_input_tokens,
+                "estimated_input_tokens": state.budget.estimated_input_tokens,
+                "used_input_tokens": state.budget.used_input_tokens,
+                "max_output_tokens": state.budget.max_output_tokens,
+                "used_output_tokens": state.budget.used_output_tokens,
+                "reserved_output_tokens": state.budget.reserved_output_tokens,
+                "max_seconds": state.budget.max_seconds,
+                "elapsed_seconds": round(state.budget.elapsed(), 3),
+                "input_tokens_over_budget": False,
+                "output_tokens_over_budget": False,
+            }
+        )
+        metrics["budget"] = budget
         metrics.update(self.outcome_metrics(state, outcome))
         return metrics  # type: ignore[return-value]
 
@@ -363,13 +424,42 @@ class MetricsCollector:
 
     @staticmethod
     def _call_details(state: ReviewState, llm_client: Any) -> list[Dict[str, Any]]:
-        """Per-call model/latency/token details for this run only."""
+        """Return provider attempts explicitly tagged with this run identity."""
         log = getattr(llm_client, "call_log", []) or []
+        tagged = [dict(item) for item in log if item.get("run_id") == state.run_id]
+        if tagged or any("run_id" in item for item in log):
+            return tagged
+        # Backward compatibility for third-party clients that don't tag events.
         start = max(0, int(getattr(state, "llm_call_start", 0) or 0))
-        details = [dict(item) for item in log[start:]]
-        for item in details:
-            item.setdefault("run_id", state.run_id)
-        return details
+        return [dict(item, run_id=state.run_id) for item in log[start:]]
+
+    @classmethod
+    def _run_usage(
+        cls, state: ReviewState, llm_client: Any
+    ) -> Dict[str, int] | None:
+        log = getattr(llm_client, "call_log", None)
+        if not isinstance(log, list):
+            return None
+        if any("run_id" in item for item in log):
+            details = cls._call_details(state, llm_client)
+            return {
+                "calls": len(details),
+                "estimated_prompt_tokens": sum(
+                    int(item.get("estimated_prompt_tokens", 0) or 0)
+                    for item in details
+                ),
+                "prompt_tokens": sum(
+                    int(item.get("prompt_tokens", 0) or 0) for item in details
+                ),
+                "completion_tokens": sum(
+                    int(item.get("completion_tokens", 0) or 0)
+                    for item in details
+                ),
+                "total_tokens": sum(
+                    int(item.get("total_tokens", 0) or 0) for item in details
+                ),
+            }
+        return None
 
     def _cache_metrics(self, state: ReviewState, llm_client: Any) -> CacheMetrics:
         return {

@@ -90,17 +90,26 @@ def review(
     budget_tokens: int = typer.Option(
         0,
         "--budget-tokens",
-        help="Hard cap on estimated input tokens per review (0 = unlimited)",
+        help=(
+            "Preflight cap on estimated input tokens per review (0 = unlimited); "
+            "provider usage is reconciled after each response"
+        ),
     ),
     budget_output_tokens: int = typer.Option(
         0,
         "--budget-output-tokens",
-        help="Hard cap on provider-reported output tokens (0 = unlimited)",
+        help=(
+            "Hard cap on provider output tokens; reserved per request and applied "
+            "as max_completion_tokens (0 = unlimited)"
+        ),
     ),
     budget_seconds: float = typer.Option(
         0.0,
         "--budget-seconds",
-        help="Hard wall-clock budget for LLM work (0 = unlimited)",
+        help=(
+            "LLM request time budget; each request timeout is capped by the "
+            "remaining time (0 = unlimited)"
+        ),
     ),
     cache_review: bool = typer.Option(
         False,
@@ -164,6 +173,21 @@ def review(
         )
 
     pipeline = None
+
+    def show_failure_metrics() -> None:
+        failed_state = pipeline.last_state if pipeline is not None else None
+        if failed_state is None or not failed_state.metrics_snapshot:
+            return
+        metrics_path = (
+            failed_state.output_dir / f"run_{failed_state.run_id}_metrics.json"
+        )
+        if metrics_path.exists():
+            typer.secho(
+                f"Failure metrics saved to: {metrics_path.resolve()}",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+
     try:
         pipeline = ReviewPipeline(
             github_token=github_token,
@@ -244,6 +268,7 @@ def review(
         typer.secho(
             f"\n❌ Git Command Error: {e.stderr}", fg=typer.colors.RED, err=True
         )
+        show_failure_metrics()
         raise typer.Exit(code=1) from e
     except Exception as e:
         err_msg = str(e)
@@ -253,6 +278,7 @@ def review(
         typer.secho(
             f"\n❌ Review failed: {err_msg}", fg=typer.colors.RED, err=True
         )
+        show_failure_metrics()
         raise typer.Exit(code=1) from e
     finally:
         if pipeline is not None:

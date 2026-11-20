@@ -89,10 +89,10 @@ class ReviewOutcome:
 
 @dataclass
 class ReviewBudget:
-    """单次 review 的硬预算。
+    """单次 review 的调用、输出与估算输入预算。
 
-    0 表示不限制。图工作流在任何新增 LLM 调用前都应该先检查 allow()，
-    避免 verifier / retry 把成本放大到不可控。
+    0 表示不限制。调用数和输出 token 在请求前预留；输入 token 先按估算值
+    预检，收到 provider usage 后校正，因此估算误差可能令当前请求超出输入上限。
     """
 
     max_llm_calls: int = 0
@@ -100,8 +100,10 @@ class ReviewBudget:
     max_output_tokens: int = 0
     max_seconds: float = 0.0
     used_llm_calls: int = 0
+    estimated_input_tokens: int = 0
     used_input_tokens: int = 0
     used_output_tokens: int = 0
+    reserved_output_tokens: int = 0
     started_at: float = field(default_factory=time.monotonic)
     # 四个 aspect 由线程池并发执行，预算检查 + 扣减必须是同一临界区，
     # 否则多个线程可能同时通过检查，把“硬预算”变成软预算。
@@ -129,9 +131,22 @@ class ReviewBudget:
         with self._lock:
             if self.max_output_tokens <= 0:
                 return None
-            return max(0, self.max_output_tokens - self.used_output_tokens)
+            return max(
+                0,
+                self.max_output_tokens
+                - self.used_output_tokens
+                - self.reserved_output_tokens,
+            )
 
-    def _allow_unlocked(self, calls: int, tokens: int) -> bool:
+    def remaining_seconds(self) -> Optional[float]:
+        with self._lock:
+            if self.max_seconds <= 0:
+                return None
+            return max(0.0, self.max_seconds - self.elapsed())
+
+    def _allow_unlocked(
+        self, calls: int, tokens: int, output_tokens: int = 0
+    ) -> bool:
         if self.max_seconds > 0 and self.elapsed() >= self.max_seconds:
             return False
         if (
@@ -146,33 +161,59 @@ class ReviewBudget:
             return False
         if (
             self.max_output_tokens > 0
-            and self.used_output_tokens >= self.max_output_tokens
+            and (
+                self.used_output_tokens
+                + self.reserved_output_tokens
+                + max(0, output_tokens)
+                > self.max_output_tokens
+                or (
+                    calls > 0
+                    and self.used_output_tokens + self.reserved_output_tokens
+                    >= self.max_output_tokens
+                )
+            )
         ):
             return False
         return True
 
-    def allow(self, calls: int = 1, tokens: int = 0) -> bool:
+    def allow(
+        self, calls: int = 1, tokens: int = 0, output_tokens: int = 0
+    ) -> bool:
         """只检查、不扣减；用于调用前的快速预检。
 
         并发场景下应使用 :meth:`reserve`，否则“检查”和“扣减”之间
         仍可能被其他线程插入。
         """
         with self._lock:
-            return self._allow_unlocked(calls, tokens)
+            return self._allow_unlocked(calls, tokens, output_tokens)
 
-    def _consume_unlocked(self, calls: int, tokens: int) -> None:
+    def _consume_unlocked(
+        self, calls: int, tokens: int, output_tokens: int = 0
+    ) -> None:
         self.used_llm_calls += max(0, calls)
         self.used_input_tokens += max(0, tokens)
+        self.estimated_input_tokens += max(0, tokens)
+        self.reserved_output_tokens += max(0, output_tokens)
 
-    def consume(self, calls: int = 0, tokens: int = 0) -> None:
+    def consume(
+        self, calls: int = 0, tokens: int = 0, output_tokens: int = 0
+    ) -> None:
         with self._lock:
-            self._consume_unlocked(calls, tokens)
+            self._consume_unlocked(calls, tokens, output_tokens)
 
-    def refund(self, calls: int = 0, tokens: int = 0) -> None:
-        """退还一次失败调用占用的预算，避免重试把预算提前耗尽。"""
+    def refund(
+        self, calls: int = 0, tokens: int = 0, output_tokens: int = 0
+    ) -> None:
+        """退还未实际发出的请求所占预算。"""
         with self._lock:
             self.used_llm_calls = max(0, self.used_llm_calls - max(0, calls))
             self.used_input_tokens = max(0, self.used_input_tokens - max(0, tokens))
+            self.estimated_input_tokens = max(
+                0, self.estimated_input_tokens - max(0, tokens)
+            )
+            self.reserved_output_tokens = max(
+                0, self.reserved_output_tokens - max(0, output_tokens)
+            )
 
     def settle(
         self,
@@ -180,12 +221,14 @@ class ReviewBudget:
         reserved_input_tokens: int,
         actual_input_tokens: int,
         actual_output_tokens: int = 0,
+        reserved_output_tokens: int = 0,
+        charge_reserved_output: bool = False,
     ) -> None:
-        """用 provider 返回的真实 usage 修正预扣的 input 预算。
+        """用 provider 返回的 usage 校正估算输入并结算预留输出。
 
         ``reserve`` 只能按字符估算预扣；真实 token 数在响应后才拿得到。
-        如果只记 usage 不回冲预算，估算偏差会让 ``--budget-tokens`` 失去
-        硬上限语义。这里把本次预扣替换成真实 input，并累计 output。
+        实际输入若超过限额，本次调用已发生，但后续调用会被拦截并在 metrics
+        中标记超限。输出上限通过请求参数和调用前预留控制。
         """
         with self._lock:
             reserved = max(0, int(reserved_input_tokens))
@@ -193,31 +236,46 @@ class ReviewBudget:
             self.used_input_tokens = max(
                 0, self.used_input_tokens - reserved + actual_input
             )
-            self.used_output_tokens += max(0, int(actual_output_tokens))
+            output_reservation = max(0, int(reserved_output_tokens))
+            self.reserved_output_tokens = max(
+                0, self.reserved_output_tokens - output_reservation
+            )
+            output_charge = (
+                output_reservation
+                if charge_reserved_output
+                else max(0, int(actual_output_tokens))
+            )
+            self.used_output_tokens += output_charge
 
-    def reserve(self, calls: int = 1, tokens: int = 0) -> None:
+    def reserve(
+        self, calls: int = 1, tokens: int = 0, output_tokens: int = 0
+    ) -> None:
         """原子地检查并扣减预算；不足时抛 ``BudgetExceeded``。
 
         这是真正给并发调用使用的入口：检查和扣减在同一个锁内完成，
         不会出现四个线程同时通过 ``max_llm_calls`` 检查的情况。
         """
         with self._lock:
-            if not self._allow_unlocked(calls, tokens):
+            if not self._allow_unlocked(calls, tokens, output_tokens):
                 raise BudgetExceeded(
                     f"Review budget exceeded: calls={self.used_llm_calls}/"
                     f"{self.max_llm_calls or 'unlimited'}, "
                     f"tokens={self.used_input_tokens}/"
                     f"{self.max_input_tokens or 'unlimited'}, "
+                    f"output_tokens={self.used_output_tokens + self.reserved_output_tokens}/"
+                    f"{self.max_output_tokens or 'unlimited'}, "
                     f"elapsed={self.elapsed():.1f}s"
                 )
-            self._consume_unlocked(calls, tokens)
+            self._consume_unlocked(calls, tokens, output_tokens)
 
-    def try_reserve(self, calls: int = 1, tokens: int = 0) -> bool:
+    def try_reserve(
+        self, calls: int = 1, tokens: int = 0, output_tokens: int = 0
+    ) -> bool:
         """``reserve`` 的非异常版本，方便调用方把预算不足当作普通分支处理。"""
         with self._lock:
-            if not self._allow_unlocked(calls, tokens):
+            if not self._allow_unlocked(calls, tokens, output_tokens):
                 return False
-            self._consume_unlocked(calls, tokens)
+            self._consume_unlocked(calls, tokens, output_tokens)
             return True
 
     def require(self, calls: int = 1, tokens: int = 0) -> None:
@@ -263,9 +321,9 @@ class ReviewState:
     # 每次 run 开始时的客户端累计计数。pipeline 会被评测复用，
     # 直接用客户端上的累计值会把上一次 run 的成本算进本次报告。
     usage_start: Dict[str, int] = field(default_factory=dict)
-    llm_call_start: int = 0
     cache_hits_start: int = 0
     cache_misses_start: int = 0
+    metrics_snapshot: Dict[str, Any] = field(default_factory=dict)
 
     pr_ref: Optional[GitHubPRRef] = None
     pr_info: Optional[PullRequestInfo] = None
@@ -372,9 +430,11 @@ class ReviewState:
                 "max_llm_calls": self.budget.max_llm_calls,
                 "used_llm_calls": self.budget.used_llm_calls,
                 "max_input_tokens": self.budget.max_input_tokens,
+                "estimated_input_tokens": self.budget.estimated_input_tokens,
                 "used_input_tokens": self.budget.used_input_tokens,
                 "max_output_tokens": self.budget.max_output_tokens,
                 "used_output_tokens": self.budget.used_output_tokens,
+                "reserved_output_tokens": self.budget.reserved_output_tokens,
                 "elapsed_seconds": round(self.budget.elapsed(), 3),
             },
             "selected_aspects": list(self.selected_aspects),

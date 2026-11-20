@@ -159,3 +159,5 @@ class DebugSink:
             self.write_json(
                 "metrics.json", getattr(result, "metrics", None) or {}
             )
+        elif getattr(state, "metrics_snapshot", None):
+            self.write_json("metrics.json", state.metrics_snapshot)

@@ -28,8 +28,7 @@ from openreview.review.assessment import (
     decide,
     unique_files,
 )
-from openreview.review.llm_client import AbstractLLMClient
-from openreview.review.token_budget import estimate_tokens
+from openreview.review.llm_client import AbstractLLMClient, BudgetedLLMClient
 from openreview.review.workflow import BudgetExceeded, ReviewBudget
 
 logger = logging.getLogger(__name__)
@@ -203,9 +202,11 @@ class FindingVerifier:
         retry_modes: Dict[str, Literal["format", "context"]] = {}
         pending = candidates
         symbol_search_deadline: Optional[float] = None
-        # 流水线里 client 是 BudgetedLLMClient，预算已经在调用层扣过；
-        # 这里只给直接使用 verifier 的场景保留手动预算兜底。
-        budgeted_client = bool(getattr(self.llm_client, "has_budget", False))
+        # Pipeline clients already have the run budget. Direct verifier users
+        # get the same per-attempt accounting by wrapping their client here.
+        call_client = self.llm_client
+        if budget is not None and not getattr(call_client, "has_budget", False):
+            call_client = BudgetedLLMClient(call_client, budget)
         for attempt in range(self.max_attempts):
             next_pending: List[Tuple[str, PotentialIssue]] = []
             for start in range(0, len(pending), self.batch_size):
@@ -258,15 +259,8 @@ class FindingVerifier:
                         if retry_modes.get(issue_id) == "format"
                     },
                 )
-                estimated = estimate_tokens(prompt) + 200
-                if budget is not None and not budgeted_client:
-                    # 与 BudgetedLLMClient 一样，检查与扣减必须原子完成。
-                    if not budget.try_reserve(calls=1, tokens=estimated):
-                        stats.skipped_by_budget += len(chunk)
-                        continue
-
                 try:
-                    response = self.llm_client.generate_structured(
+                    response = call_client.generate_structured(
                         system_prompt=VERIFIER_SYSTEM_PROMPT,
                         user_prompt=prompt,
                         response_schema=VerifierBatchOutput,

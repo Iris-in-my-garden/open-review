@@ -1,17 +1,60 @@
+import contextvars
+import json
 import os
 import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Protocol, Type, TypeVar
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    InternalServerError,
+    OpenAI,
+)
 from pydantic import BaseModel
 
+from openreview.domain.errors import BudgetExceeded, ProviderError
 from openreview.review.output_parser import PotentialIssueSchema
 from openreview.review.token_budget import estimate_tokens
 from openreview.review.workflow import ReviewBudget
 
 T = TypeVar("T", bound=BaseModel)
+_REQUEST_RUN_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "openreview_request_run_id", default=None
+)
+_REQUEST_TIMEOUT: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
+    "openreview_request_timeout", default=None
+)
+_REQUEST_OUTPUT_LIMIT: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "openreview_request_output_limit", default=None
+)
+_REQUEST_ATTEMPT: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "openreview_request_attempt", default=1
+)
+
+
+def _is_retryable_provider_error(exc: Exception) -> bool:
+    if isinstance(exc, ProviderError):
+        cause = exc.__cause__
+        return isinstance(cause, Exception) and _is_retryable_provider_error(cause)
+    if isinstance(exc, (APIConnectionError, APITimeoutError, InternalServerError)):
+        return True
+    if isinstance(exc, APIStatusError):
+        return exc.status_code in {408, 409, 429} or exc.status_code >= 500
+    return isinstance(exc, (TimeoutError, ConnectionError, OSError))
+
+
+def _estimate_request_tokens(
+    system_prompt: str, user_prompt: str, response_schema: Type[BaseModel]
+) -> int:
+    schema = json.dumps(response_schema.model_json_schema(), sort_keys=True)
+    return (
+        estimate_tokens(system_prompt)
+        + estimate_tokens(user_prompt)
+        + estimate_tokens(schema)
+    )
 
 
 class AbstractLLMClient(Protocol):
@@ -40,9 +83,11 @@ class BudgetedLLMClient:
         self,
         inner: AbstractLLMClient,
         budget: Optional[ReviewBudget] = None,
+        run_id: Optional[str] = None,
     ):
         self.inner = inner
         self._budget = budget
+        self.run_id = run_id
 
     def bind_budget(self, budget: Optional[ReviewBudget]) -> None:
         self._budget = budget
@@ -67,57 +112,128 @@ class BudgetedLLMClient:
     def seed(self) -> Optional[int]:
         return getattr(self.inner, "seed", None)
 
+    @property
+    def max_retries(self) -> int:
+        return max(0, int(getattr(self.inner, "max_retries", 0) or 0))
+
     def generate_structured(
         self,
         system_prompt: str,
         user_prompt: str,
         response_schema: Type[T],
     ) -> T:
-        estimated = 0
-        if self._budget is not None:
-            estimated = estimate_tokens(system_prompt) + estimate_tokens(user_prompt)
-            # 检查与扣减在同一临界区完成：4 个 aspect 并发时不会同时越过上限。
-            self._budget.reserve(calls=1, tokens=estimated)
-        try:
-            result = self.inner.generate_structured(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                response_schema=response_schema,
+        estimated = _estimate_request_tokens(
+            system_prompt, user_prompt, response_schema
+        )
+        for attempt in range(self.max_retries + 1):
+            budget = self._budget
+            output_reservation = 0
+            configured_output_limit = getattr(
+                self.inner, "max_completion_tokens", None
             )
-        except Exception:
-            # 调用失败不一定免费：provider 可能已经生成响应（随后解析/拒答
-            # 失败），此时 last_usage 已有真实用量，必须结算而不是退款。
-            # 只有完全没拿到响应的失败（超时、连接错误）才退款，否则重试会
-            # 被“预算不足”提前终止，掩盖真正的失败原因。
-            if self._budget is not None:
-                actual = getattr(self.inner, "last_usage", None)
-                if isinstance(actual, dict) and actual:
-                    self._budget.settle(
-                        reserved_input_tokens=estimated,
-                        actual_input_tokens=int(
-                            actual.get("prompt_tokens", 0) or 0
-                        ),
-                        actual_output_tokens=int(
-                            actual.get("completion_tokens", 0) or 0
-                        ),
+            if budget is not None:
+                remaining_output = budget.remaining_output_tokens()
+                if remaining_output is not None:
+                    output_reservation = min(
+                        remaining_output,
+                        max(0, int(configured_output_limit or remaining_output)),
                     )
-                else:
-                    self._budget.refund(calls=1, tokens=estimated)
-            raise
-
-        # 用 provider 返回的真实 usage 修正预扣值。last_usage 由真实客户端
-        # 写在 thread-local 上，避免多线程并发调用时累计值互相污染。
-        if self._budget is not None:
-            actual = getattr(self.inner, "last_usage", None)
-            if isinstance(actual, dict) and actual:
-                self._budget.settle(
-                    reserved_input_tokens=estimated,
-                    actual_input_tokens=int(actual.get("prompt_tokens", 0) or 0),
-                    actual_output_tokens=int(
-                        actual.get("completion_tokens", 0) or 0
-                    ),
+                # Check and reserve the full possible response atomically.
+                budget.reserve(
+                    calls=1,
+                    tokens=estimated,
+                    output_tokens=output_reservation,
                 )
-        return result
+
+            remaining_seconds = budget.remaining_seconds() if budget else None
+            configured_timeout = float(getattr(self.inner, "timeout", 60.0))
+            timeout = (
+                min(configured_timeout, remaining_seconds)
+                if remaining_seconds is not None
+                else configured_timeout
+            )
+            run_token = _REQUEST_RUN_ID.set(self.run_id)
+            timeout_token = _REQUEST_TIMEOUT.set(timeout)
+            output_token = _REQUEST_OUTPUT_LIMIT.set(
+                output_reservation
+                if budget is not None and budget.max_output_tokens > 0
+                else None
+            )
+            attempt_token = _REQUEST_ATTEMPT.set(attempt + 1)
+            try:
+                result = self.inner.generate_structured(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    response_schema=response_schema,
+                )
+            except Exception as exc:
+                if isinstance(exc, BudgetExceeded):
+                    if budget is not None:
+                        budget.refund(
+                            calls=1,
+                            tokens=estimated,
+                            output_tokens=output_reservation,
+                        )
+                    raise
+                actual = getattr(self.inner, "last_usage", None)
+                if budget is not None:
+                    if isinstance(actual, dict) and actual:
+                        budget.settle(
+                            reserved_input_tokens=estimated,
+                            actual_input_tokens=int(
+                                actual.get("prompt_tokens", 0) or 0
+                            ),
+                            actual_output_tokens=int(
+                                actual.get("completion_tokens", 0) or 0
+                            ),
+                            reserved_output_tokens=output_reservation,
+                        )
+                    else:
+                        # A timeout may happen after the provider accepted the
+                        # request. Charge conservatively instead of assuming free.
+                        budget.settle(
+                            reserved_input_tokens=estimated,
+                            actual_input_tokens=estimated,
+                            reserved_output_tokens=output_reservation,
+                            charge_reserved_output=True,
+                        )
+                if attempt >= self.max_retries or not _is_retryable_provider_error(exc):
+                    raise
+                delay = min(0.5 * (2**attempt), 8.0)
+                if budget is not None:
+                    remaining = budget.remaining_seconds()
+                    if remaining is not None:
+                        delay = min(delay, remaining)
+                time.sleep(delay)
+            else:
+                actual = getattr(self.inner, "last_usage", None)
+                if budget is not None:
+                    if isinstance(actual, dict) and actual:
+                        budget.settle(
+                            reserved_input_tokens=estimated,
+                            actual_input_tokens=int(
+                                actual.get("prompt_tokens", 0) or 0
+                            ),
+                            actual_output_tokens=int(
+                                actual.get("completion_tokens", 0) or 0
+                            ),
+                            reserved_output_tokens=output_reservation,
+                        )
+                    else:
+                        budget.settle(
+                            reserved_input_tokens=estimated,
+                            actual_input_tokens=estimated,
+                            reserved_output_tokens=output_reservation,
+                            charge_reserved_output=True,
+                        )
+                return result
+            finally:
+                _REQUEST_ATTEMPT.reset(attempt_token)
+                _REQUEST_OUTPUT_LIMIT.reset(output_token)
+                _REQUEST_TIMEOUT.reset(timeout_token)
+                _REQUEST_RUN_ID.reset(run_token)
+
+        raise RuntimeError("LLM retry loop finished without a result or exception.")
 
     def __getattr__(self, name: str) -> Any:
         # 透传 cache wrapper 的 hits/misses 等统计字段。
@@ -153,6 +269,7 @@ class LLMClient:
         self.model: str = model or os.getenv("OPENAI_MODEL") or "gpt-4o"
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
         self.timeout = timeout
+        self.max_retries = max(0, int(max_retries))
         # 固定采样参数，保证同一 prompt 的结果可复现；评测/回放需要这一点。
         self.temperature = temperature
         self.seed = seed
@@ -166,7 +283,9 @@ class LLMClient:
         client_kwargs: dict[str, Any] = {
             "api_key": self.api_key,
             "timeout": timeout,
-            "max_retries": max_retries,
+            # BudgetedLLMClient retries one provider attempt at a time so each
+            # attempt is charged against the run's call and time limits.
+            "max_retries": 0,
         }
         if self.base_url:
             client_kwargs["base_url"] = self.base_url
@@ -216,6 +335,13 @@ class LLMClient:
         user_prompt: str,
         response_schema: Type[T],
     ) -> T:
+        self._thread_local.last_usage = {}
+        timeout = _REQUEST_TIMEOUT.get()
+        if timeout is None:
+            timeout = self.timeout
+        if timeout <= 0:
+            raise BudgetExceeded("Review time budget exhausted before LLM request.")
+
         request: Dict[str, Any] = {
             "model": self.model,
             "messages": [
@@ -224,41 +350,59 @@ class LLMClient:
             ],
             "response_format": response_schema,
             # 把 HTTP 超时压到 aspect_timeout 以下，避免线程超时后请求还挂很久。
-            "timeout": self.timeout,
+            "timeout": timeout,
         }
         if self.temperature is not None:
             request["temperature"] = self.temperature
         if self.seed is not None:
             request["seed"] = self.seed
-        if self.max_completion_tokens is not None:
+        output_limit = _REQUEST_OUTPUT_LIMIT.get()
+        if output_limit is not None:
+            request["max_completion_tokens"] = output_limit
+        elif self.max_completion_tokens is not None:
             request["max_completion_tokens"] = self.max_completion_tokens
-        self._thread_local.last_usage = {}
         started = time.perf_counter()
-        response = self._client.beta.chat.completions.parse(**request)
-
-        message = response.choices[0].message
-        actual = self._record_usage(getattr(response, "usage", None))
-        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
-        with self._call_log_lock:
-            self.call_log.append(
-                {
-                    "model": self.model,
-                    "latency_ms": elapsed_ms,
-                    "prompt_tokens": int(actual.get("prompt_tokens", 0)),
-                    "completion_tokens": int(actual.get("completion_tokens", 0)),
-                    "total_tokens": int(actual.get("total_tokens", 0)),
-                }
-            )
-
-        # 检查模型是否拒绝了请求
-        if message.refusal:
-            raise ValueError(f"Model refused to respond: {message.refusal}")
-
-        # 检查解析结果是否存在
-        if message.parsed is None:
-            raise RuntimeError("Failed to parse structured output from model response.")
-
-        return message.parsed
+        actual: Dict[str, int] = {}
+        status = "error"
+        error_type = ""
+        try:
+            response = self._client.beta.chat.completions.parse(**request)
+            actual = self._record_usage(getattr(response, "usage", None))
+            message = response.choices[0].message
+            if message.refusal:
+                raise ValueError(f"Model refused to respond: {message.refusal}")
+            if message.parsed is None:
+                raise RuntimeError(
+                    "Failed to parse structured output from model response."
+                )
+            status = "ok"
+            return message.parsed
+        except Exception as exc:
+            error_type = type(exc).__name__
+            if isinstance(exc, ProviderError):
+                raise
+            raise ProviderError(f"LLM provider request failed: {exc}") from exc
+        finally:
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+            with self._call_log_lock:
+                self.call_log.append(
+                    {
+                        "run_id": _REQUEST_RUN_ID.get(),
+                        "attempt": _REQUEST_ATTEMPT.get(),
+                        "status": status,
+                        "error_type": error_type,
+                        "model": self.model,
+                        "latency_ms": elapsed_ms,
+                        "estimated_prompt_tokens": _estimate_request_tokens(
+                            system_prompt, user_prompt, response_schema
+                        ),
+                        "prompt_tokens": int(actual.get("prompt_tokens", 0)),
+                        "completion_tokens": int(
+                            actual.get("completion_tokens", 0)
+                        ),
+                        "total_tokens": int(actual.get("total_tokens", 0)),
+                    }
+                )
 
 
 class MockLLMClient:
@@ -278,6 +422,13 @@ class MockLLMClient:
         }
         # 并发调用时未加锁的 ``+=`` 会丢计数。
         self._usage_lock = threading.Lock()
+        self.call_log: List[Dict[str, Any]] = []
+        self._call_log_lock = threading.Lock()
+        self._thread_local = threading.local()
+
+    @property
+    def last_usage(self) -> Optional[Dict[str, int]]:
+        return getattr(self._thread_local, "last_usage", None)
 
     @staticmethod
     def _extract_anchor(user_prompt: str, filename: str) -> tuple[Optional[int], Optional[str]]:
@@ -302,11 +453,20 @@ class MockLLMClient:
             user_prompt: str,
             response_schema: Type[T],
     ) -> T:
+        started = time.perf_counter()
+        self._thread_local.last_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
         with self._usage_lock:
             self.usage["calls"] += 1
 
         # 1. 如果用户自定义了匹配的实例，优先返回
         if self.custom_schema and isinstance(self.custom_schema, response_schema):
+            self._record_mock_call(
+                started, system_prompt, user_prompt, response_schema
+            )
             return self.custom_schema
 
         schema_name = response_schema.__name__
@@ -314,7 +474,7 @@ class MockLLMClient:
         # Verifier 的 Mock：默认认为所有候选问题都成立，方便离线跑通。
         if "VerifierBatchOutput" in schema_name:
             issue_ids = re.findall(r'"id"\s*:\s*"([^"]+)"', user_prompt)
-            return response_schema(
+            result = response_schema(
                 results=[
                     {
                         "issue_id": issue_id,
@@ -327,6 +487,10 @@ class MockLLMClient:
                     for issue_id in issue_ids
                 ]
             )
+            self._record_mock_call(
+                started, system_prompt, user_prompt, response_schema
+            )
+            return result
 
         # 2. 审查输出 Schema（single-pass）
         if "AspectReviewOutputSchema" in schema_name:
@@ -370,13 +534,17 @@ class MockLLMClient:
                 )
             ]
 
-            return response_schema(
+            result = response_schema(
                 aspect_summary="[MOCK] 本次审查完成，发现了一些需要注意的潜在问题。",
                 issues=mock_issues
             )
+            self._record_mock_call(
+                started, system_prompt, user_prompt, response_schema
+            )
+            return result
 
         # 3. 针对全局总表的 Schema (ReviewResultSchema)
-        return response_schema(
+        result = response_schema(
             summary="[MOCK] 这是一个测试 PR Review 总结",
             risk_level="MEDIUM",
             risk_reason="[MOCK] 发现少量高风险或中风险问题，建议修复后再合并。",
@@ -387,3 +555,30 @@ class MockLLMClient:
             final_decision="REQUEST_CHANGES",
             final_summary="[MOCK] 审查结束。最终决策: REQUEST_CHANGES (风险等级: MEDIUM)"
         )
+        self._record_mock_call(started, system_prompt, user_prompt, response_schema)
+        return result
+
+    def _record_mock_call(
+        self,
+        started: float,
+        system_prompt: str,
+        user_prompt: str,
+        response_schema: Type[T],
+    ) -> None:
+        with self._call_log_lock:
+            self.call_log.append(
+                {
+                    "run_id": _REQUEST_RUN_ID.get(),
+                    "attempt": _REQUEST_ATTEMPT.get(),
+                    "status": "ok",
+                    "error_type": "",
+                    "model": self.model,
+                    "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+                    "estimated_prompt_tokens": _estimate_request_tokens(
+                        system_prompt, user_prompt, response_schema
+                    ),
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                }
+            )

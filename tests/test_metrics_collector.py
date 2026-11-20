@@ -20,6 +20,42 @@ def test_call_details_are_scoped_to_current_run():
     assert details[0]["run_id"] == "run-2"
 
 
+def test_call_details_and_usage_are_isolated_by_run_id():
+    state = SimpleNamespace(run_id="run-a", usage_start={})
+    client = SimpleNamespace(
+        usage={"calls": 4, "prompt_tokens": 400, "completion_tokens": 100},
+        call_log=[
+            {
+                "run_id": "run-a",
+                "model": "m",
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+            },
+            {
+                "run_id": "run-b",
+                "model": "m",
+                "prompt_tokens": 300,
+                "completion_tokens": 90,
+                "total_tokens": 390,
+            },
+        ],
+    )
+
+    details = MetricsCollector._call_details(state, client)
+    usage = MetricsCollector._run_usage(state, client)
+
+    assert len(details) == 1
+    assert details[0]["run_id"] == "run-a"
+    assert usage == {
+        "calls": 1,
+        "estimated_prompt_tokens": 0,
+        "prompt_tokens": 100,
+        "completion_tokens": 10,
+        "total_tokens": 110,
+    }
+
+
 def test_verification_metrics_separate_drops_from_events():
     state = SimpleNamespace(
         validation_stats={
