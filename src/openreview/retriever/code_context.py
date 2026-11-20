@@ -134,3 +134,82 @@ def dedupe_contexts(
             # P6 import 行），优先级相同时再比较 score。
             best[key] = context
     return [best[key] for key in order]
+
+
+# 这些 kind 抽取的是“定义节点”，同一个节点可能被 AST / index / graph
+# 以不同 kind 重复找到。
+DEFINITION_NODE_KINDS = frozenset(
+    {"enclosing", "definition", "base_definition", "callee", "dependency"}
+)
+
+
+def _ranges_overlap(left: CodeContext, right: CodeContext) -> bool:
+    assert left.start_line is not None and left.end_line is not None
+    assert right.start_line is not None and right.end_line is not None
+    return not (
+        left.end_line < right.start_line or right.end_line < left.start_line
+    )
+
+
+def _is_redundant_context(context: CodeContext, kept: CodeContext) -> bool:
+    """判断 ``context`` 是否已经被 ``kept`` 覆盖，可以直接合并掉。
+
+    只比较同一文件、同一 revision 的上下文；base 与 head 的行号空间不同，
+    不能互相覆盖。
+    """
+    if context.file_path != kept.file_path or context.revision != kept.revision:
+        return False
+    if None in (
+        context.start_line,
+        context.end_line,
+        kept.start_line,
+        kept.end_line,
+    ):
+        return False
+
+    # 同一个 AST 节点：定义类证据的 symbol 相同且行号范围有交集。
+    if (
+        context.symbol
+        and context.symbol == kept.symbol
+        and context.kind in DEFINITION_NODE_KINDS
+        and kept.kind in DEFINITION_NODE_KINDS
+        and _ranges_overlap(context, kept)
+    ):
+        return True
+
+    # P2 包含 P5：字段代码已经出现在未折叠的 enclosing 片段里时，再单独
+    # 注入一条 field 只会重复占用预算。
+    if (
+        kept.kind == "enclosing"
+        and context.kind == "field"
+        and not kept.folded
+        and kept.start_line <= context.start_line
+        and context.end_line <= kept.end_line
+    ):
+        return True
+
+    return False
+
+
+def merge_contexts(contexts: Iterable[CodeContext]) -> List[CodeContext]:
+    """在注入 prompt 前合并重复上下文。
+
+    去重顺序（强 → 弱）：
+
+    1. 完全相同的 file + revision + 行号范围，只保留一条；
+    2. 同一个 AST 节点（相同 symbol、定义类 kind、范围重叠），保留优先级
+       更高 / score 更高的一条；
+    3. P2 enclosing 完整包含 P5 field 时，合并掉 field。
+
+    结果按 ``(priority, -score)`` 排序，保证高价值证据先进入预算。
+    """
+    ordered = sorted(
+        dedupe_contexts(contexts),
+        key=lambda context: (context.priority, -context.score),
+    )
+    merged: List[CodeContext] = []
+    for context in ordered:
+        if any(_is_redundant_context(context, kept) for kept in merged):
+            continue
+        merged.append(context)
+    return merged

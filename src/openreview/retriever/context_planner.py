@@ -21,12 +21,12 @@ P1/P5/P6 有独立的 soft cap；dependency 虽然是 P3，但单独限 1000 tok
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence
 
 from openreview.retriever.code_context import (
     CodeContext,
     ContextPriority,
-    context_identity,
+    merge_contexts,
 )
 from openreview.review.token_budget import estimate_tokens
 
@@ -85,7 +85,8 @@ def plan_contexts(
     if kind_caps:
         dependency_caps.update(kind_caps)
 
-    deduped = _dedupe_by_priority(contexts)
+    # 装配前统一去重：相同范围 / 同一 AST 节点 / P2 包含 P5 的 field。
+    deduped = merge_contexts(contexts)
     buckets: Dict[ContextPriority, List[CodeContext]] = {}
     for context in deduped:
         buckets.setdefault(context.priority, []).append(context)
@@ -147,26 +148,6 @@ def plan_contexts(
         merged[key] = float(merged.get(key, 0.0)) + tokens
     stats["context_tokens_by_priority_detail"] = merged  # type: ignore[assignment]
     return selected
-
-
-def _dedupe_by_priority(contexts: Iterable[CodeContext]) -> List[CodeContext]:
-    """同一代码范围只保留 priority 更高（数值更小）、score 更高的一条。"""
-    best: Dict[tuple, CodeContext] = {}
-    order: List[tuple] = []
-    for context in contexts:
-        context.ensure_context_id()
-        key = context_identity(context)
-        existing = best.get(key)
-        if existing is None:
-            best[key] = context
-            order.append(key)
-            continue
-        if (context.priority, -context.score) < (
-            existing.priority,
-            -existing.score,
-        ):
-            best[key] = context
-    return [best[key] for key in order]
 
 
 def _round_robin_by_file(

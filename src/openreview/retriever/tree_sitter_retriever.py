@@ -19,7 +19,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from tree_sitter import Language, Node, Parser, Tree
 
-from openreview.repo.diff_parser import ParsedDiff
+from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
 from openreview.retriever import ast_utils
 from openreview.retriever.code_context import (
     CodeContext,
@@ -45,6 +45,8 @@ MAX_REFERENCE_CONTEXTS = 200
 MAX_TEST_FUNCTION_CONTEXTS = 2
 # 单个 enclosing 方法超过该 token 数时做 AST 折叠；折叠会保留全部变更行。
 MAX_ENCLOSING_SNIPPET_TOKENS = 1600
+# 函数体小于该行数且整段都已出现在 diff hunk 里时，P2 片段完全是重复内容。
+MIN_ENCLOSING_BODY_LINES = 5
 
 # 打分：变更行所在的函数/类 > 符号定义 > 关联测试 > 符号引用 > base 侧历史代码
 SCORE_ENCLOSING = 0.95
@@ -192,17 +194,27 @@ class TreeSitterLocalRetriever:
                 if name:
                     definition_names.add(name)
 
+                start_row, end_row = node.start_point[0], node.end_point[0]
+                # 微小型 enclosing 如果整段都已出现在 hunk 上下文里，
+                # 注入 P2 只是重复 diff 内容，直接跳过。
+                if self._is_fully_visible_tiny_enclosing(
+                    file_diff, start_row, end_row
+                ):
+                    self.last_stats["tiny_enclosing_skipped"] = (
+                        self.last_stats.get("tiny_enclosing_skipped", 0) + 1
+                    )
+                    continue
+
                 unique_key = (
                     file_diff.filename,
-                    node.start_point[0],
-                    node.end_point[0],
+                    start_row,
+                    end_row,
                     "head",
                 )
                 if unique_key in seen_node_ranges:
                     continue
                 seen_node_ranges.add(unique_key)
 
-                start_row, end_row = node.start_point[0], node.end_point[0]
                 snippet = "\n".join(lines[start_row : end_row + 1])
                 folded = False
                 if estimate_tokens(snippet) > MAX_ENCLOSING_SNIPPET_TOKENS:
@@ -247,6 +259,24 @@ class TreeSitterLocalRetriever:
                 )
 
         return contexts, definition_names
+
+    @staticmethod
+    def _is_fully_visible_tiny_enclosing(
+        file_diff: ParsedChangedFile,
+        start_row: int,
+        end_row: int,
+    ) -> bool:
+        """函数体 < ``MIN_ENCLOSING_BODY_LINES`` 且整段都在 hunk 上下文里。"""
+        body_lines = end_row - start_row  # 去掉声明行
+        if body_lines >= MIN_ENCLOSING_BODY_LINES:
+            return False
+        visible = set(file_diff.visible_lines or [])
+        if not visible:
+            return False
+        # start_row/end_row 是 0-based；visible_lines 是 1-based。
+        return all(
+            line in visible for line in range(start_row + 1, end_row + 2)
+        )
 
     # ------------------------------------------------------------------
     # P5 fields

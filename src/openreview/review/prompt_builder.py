@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 from openreview.domain.models import PullRequestInfo
 from openreview.repo.diff_parser import HUNK_RANGE_PATTERN, ParsedDiff
-from openreview.retriever.code_context import CodeContext
+from openreview.retriever.code_context import CodeContext, merge_contexts
 from openreview.retriever.context_planner import (
     kind_token_cap,
     priority_token_cap,
@@ -36,9 +36,9 @@ OUTPUT_CONSTRAINTS = """### 【输出约束】（必须遵守）
 6. `confidence` 是系统过滤依据：低于 0.6 会被直接丢弃。置信度按证据完整度赋值：0.90–1.00 表示完整代码链和直接证据；0.75–0.89 表示核心链完整但缺少次要上下文；0.60–0.74 表示触发条件或影响路径存在局限。禁止因风险类别或潜在影响而上调置信度。
 7. 最多报告 8 个问题，按 `severity` 从高到低排序；超过时只保留最严重的。
 8. `category` 必须是 `bugs`、`security`、`performance`、`clean_code`、`test_gap` 之一。
-9. 如果结论依赖 `Context`，把对应上下文的 `[ctx-xxxxxxxx]` 写入 `context_refs`；禁止编造不存在的 ID。
+9. 如果结论依赖 `Context`，把对应上下文的 `[ctx-xxxxxxxx]` 写入 `context_refs`；禁止编造不存在的 ID。`<base_branch_context>` 中的旧代码只用于理解被删除内容，其 ctx-id 不得写入 `context_refs`。
 10. 当 Patch 被截断、文件未展示或 Context 因预算省略时，不得推测被省略代码的行为；若关键调用、配置或分支信息缺失，直接省略该 finding。
-11. 每个问题提供 `short_claim`：一句独立、可验证的缺陷断言，最多 180 个字符；不要复述推理过程、背景或修复建议。如果结论依赖 `Context`，把对应上下文的 `[ctx-xxxxxxxx]` 写入 `context_refs`；禁止编造不存在的 ID。
+11. 每个问题提供 `short_claim`：一句独立、可验证的缺陷断言，最多 180 个字符；不要复述推理过程、背景或修复建议。如果结论依赖 `Context`，把对应上下文的 `[ctx-xxxxxxxx]` 写入 `context_refs`；禁止编造不存在的 ID，也不得把 `<base_branch_context>` 的 ctx-id 写入 `context_refs`。
 """
 
 # Prompt Injection 检测规则：命中后仅作为“风险提示”，不会阻断审查
@@ -110,6 +110,7 @@ class PromptBuilder:
         self.context_stats: Dict[str, int] = {
             "used_contexts": 0,
             "omitted_contexts": 0,
+            "merged_contexts": 0,
             "used_context_tokens": 0,
             "omitted_context_tokens": 0,
         }
@@ -286,6 +287,7 @@ class PromptBuilder:
         block_files = set(block_order)
         by_file: Dict[str, List[str]] = {}
         other_blocks: List[str] = []
+        base_blocks: List[str] = []
         remaining = self.max_context_tokens
         omitted = 0
         omitted_tokens = 0
@@ -293,10 +295,14 @@ class PromptBuilder:
         used_tokens = 0
         used_by_priority: Dict[int, int] = {}
         used_by_kind: Dict[str, int] = {}
+        # 注入前最后一道去重：即使调用方绕过了 planner，这里也不能把同一
+        # 段代码重复塞进 prompt。
+        merged = merge_contexts(contexts)
+        self.context_stats["merged_contexts"] += len(contexts) - len(merged)
         # 严格按 priority 填充：P1 static > P2 enclosing > P3 定义 > P4 引用
         # > P5 field > P6 test。planner 已经做过一次预算和 cap，这里再做最终兜底。
         ordered = sorted(
-            contexts, key=lambda item: (item.priority, -item.score)
+            merged, key=lambda item: (item.priority, -item.score)
         )
 
         for ctx in ordered:
@@ -316,7 +322,11 @@ class PromptBuilder:
                 omitted += 1
                 omitted_tokens += cost
                 continue
-            if ctx.file_path in block_files:
+            # base revision 的旧代码必须与当前 head 上下文隔离：不能混进
+            # “同文件可直接引用”的区域，也不能作为 context_refs 的证据。
+            if ctx.revision == "base":
+                base_blocks.append(rendered)
+            elif ctx.file_path in block_files:
                 by_file.setdefault(ctx.file_path, []).append(rendered)
             else:
                 other_blocks.append(rendered)
@@ -340,11 +350,26 @@ class PromptBuilder:
         patch_str = (
             "\n\n".join(rendered_blocks) if rendered_blocks else "No patches available."
         )
-        context_str = (
-            "\n\n".join(other_blocks)
-            if other_blocks
-            else "No additional contexts retrieved."
-        )
+        if other_blocks:
+            context_str = "\n\n".join(other_blocks)
+        elif base_blocks:
+            context_str = ""
+        else:
+            context_str = "No additional contexts retrieved."
+
+        if base_blocks:
+            base_section = (
+                "<base_branch_context>\n"
+                "以下代码来自 base branch（修改前版本），仅用于理解哪些内容被删除或改写；"
+                "它不是当前文件内容，不能用于定位当前行号，其 ctx-id 也不得写入 "
+                "`context_refs`。\n\n"
+                + "\n\n".join(base_blocks)
+                + "\n</base_branch_context>"
+            )
+            context_str = (
+                f"{context_str}\n\n{base_section}" if context_str else base_section
+            )
+
         if omitted:
             context_str += f"\n\n> 另有 {omitted} 段上下文因 token 预算被省略。"
         self.context_stats["used_contexts"] += used

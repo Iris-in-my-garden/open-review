@@ -1,6 +1,10 @@
 """P1-P6 上下文预算装配的行为约束。"""
 
-from openreview.retriever.code_context import CodeContext, ContextPriority
+from openreview.retriever.code_context import (
+    CodeContext,
+    ContextPriority,
+    merge_contexts,
+)
 from openreview.retriever.context_planner import CONTEXT_OVERHEAD_TOKENS, plan_contexts
 from openreview.review.token_budget import estimate_tokens
 
@@ -14,6 +18,8 @@ def _context(
     start_line: int = 1,
     end_line: int = 1,
     score: float = 0.5,
+    symbol: str = "",
+    folded: bool = False,
 ) -> CodeContext:
     return CodeContext(
         file_path=file_path,
@@ -22,6 +28,8 @@ def _context(
         score=score,
         kind=kind,
         priority=priority,
+        symbol=symbol,
+        folded=folded,
         start_line=start_line,
         end_line=end_line,
     )
@@ -273,3 +281,105 @@ def test_context_priorities_follow_agreed_hierarchy():
         ContextPriority.FIELD,
         ContextPriority.TEST,
     ]
+
+
+def test_merge_contexts_collapses_same_ast_node_with_overlapping_ranges():
+    """同一文件、同一 symbol 的定义节点，即使范围略有偏差也只保留一条。"""
+    enclosing = _context(
+        "src/a.py",
+        priority=ContextPriority.ENCLOSING,
+        kind="enclosing",
+        symbol="login",
+        start_line=10,
+        end_line=20,
+        score=0.95,
+    )
+    callee = _context(
+        "src/a.py",
+        priority=ContextPriority.DEFINITION,
+        kind="callee",
+        symbol="login",
+        start_line=18,
+        end_line=25,
+        score=0.90,
+    )
+
+    merged = merge_contexts([callee, enclosing])
+
+    assert merged == [enclosing]
+
+
+def test_merge_contexts_drops_field_contained_in_unfolded_enclosing():
+    """P2 已经完整包含 P5 字段代码时，field 是重复内容。"""
+    enclosing = _context(
+        "src/a.py",
+        priority=ContextPriority.ENCLOSING,
+        kind="enclosing",
+        start_line=10,
+        end_line=40,
+        score=0.95,
+    )
+    field = _context(
+        "src/a.py",
+        priority=ContextPriority.FIELD,
+        kind="field",
+        start_line=15,
+        end_line=16,
+        score=0.8,
+    )
+
+    assert merge_contexts([field, enclosing]) == [enclosing]
+
+
+def test_merge_contexts_keeps_field_outside_or_when_enclosing_is_folded():
+    """超出 enclosing 范围、或 enclosing 已折叠时，field 仍应保留。"""
+    folded_enclosing = _context(
+        "src/a.py",
+        priority=ContextPriority.ENCLOSING,
+        kind="enclosing",
+        start_line=10,
+        end_line=40,
+        folded=True,
+    )
+    inside = _context(
+        "src/a.py",
+        priority=ContextPriority.FIELD,
+        kind="field",
+        start_line=15,
+        end_line=16,
+    )
+    outside = _context(
+        "src/a.py",
+        priority=ContextPriority.FIELD,
+        kind="field",
+        start_line=41,
+        end_line=42,
+    )
+
+    merged = merge_contexts([inside, outside, folded_enclosing])
+
+    assert {item.kind for item in merged} == {"enclosing", "field"}
+    assert any(item.start_line == 41 for item in merged)
+
+
+def test_merge_contexts_does_not_mix_base_and_head_ranges():
+    """base 与 head 行号空间不同，即使范围相同也不能互相覆盖。"""
+    head = _context(
+        "src/a.py",
+        priority=ContextPriority.ENCLOSING,
+        kind="enclosing",
+        symbol="login",
+        start_line=10,
+        end_line=20,
+    )
+    base = head.model_copy(
+        update={
+            "revision": "base",
+            "kind": "base_definition",
+            "priority": ContextPriority.DEFINITION,
+        }
+    )
+
+    merged = merge_contexts([head, base])
+
+    assert {item.revision for item in merged} == {"head", "base"}

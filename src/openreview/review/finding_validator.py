@@ -125,7 +125,18 @@ class FindingValidator:
     ) -> ReviewResult:
         files_by_name = {file.filename: file for file in parsed_diff.files}
         contexts = contexts or []
-        valid_context_ids = {context.ensure_context_id() for context in contexts}
+        # base revision 的上下文只用于解释被删除代码，不能作为当前新文件
+        # finding 的引用证据，因此不进入 valid_context_ids。
+        valid_context_ids = {
+            context.ensure_context_id()
+            for context in contexts
+            if context.revision != "base"
+        }
+        base_context_ids = {
+            context.ensure_context_id()
+            for context in contexts
+            if context.revision == "base"
+        }
         stats = {
             "candidates": len(result.potential_issues),
             "kept": 0,
@@ -141,6 +152,7 @@ class FindingValidator:
             "evidence_line_match": 0,
             "evidence_token_match": 0,
             "invalid_context_ref": 0,
+            "base_context_ref": 0,
             "low_confidence": 0,
             "deduplicated": 0,
             "patch_checked": 0,
@@ -181,15 +193,19 @@ class FindingValidator:
                 record["drop_reason"] = "unknown_file"
                 continue
 
-            # 规则 1.5: context_refs 只能引用本次实际注入的上下文。
+            # 规则 1.5: context_refs 只能引用本次实际注入的 head 上下文；
+            # base_branch_context 的 ctx-id 明确禁止混入。
             if issue.context_refs:
                 original_refs = list(issue.context_refs)
-                issue.context_refs = [
-                    ref for ref in original_refs if ref in valid_context_ids
-                ]
-                stats["invalid_context_ref"] += len(original_refs) - len(
-                    issue.context_refs
-                )
+                kept_refs: List[str] = []
+                for ref in original_refs:
+                    if ref in valid_context_ids:
+                        kept_refs.append(ref)
+                    elif ref in base_context_ids:
+                        stats["base_context_ref"] += 1
+                    else:
+                        stats["invalid_context_ref"] += 1
+                issue.context_refs = kept_refs
 
             # 规则 1.8: 历史问题默认直接丢弃，不参与风险计算和行内评论。
             if issue.scope == "pre_existing" and not self.keep_pre_existing:

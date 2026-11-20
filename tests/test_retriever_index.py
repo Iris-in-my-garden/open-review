@@ -262,10 +262,10 @@ def test_hybrid_retriever_adds_index_contexts_with_ids(tmp_path: Path):
                 "status": "modified",
                 "additions": 1,
                 "deletions": 1,
+                # 只暴露变更行本身，避免微小型 enclosing 因“整段都在
+                # hunk 里”被新的 P2 过滤规则跳过。
                 "patch": (
-                    "@@ -4,3 +4,3 @@\n"
-                    " class AuthService:\n"
-                    "     def login(self, user: User):\n"
+                    "@@ -6 +6 @@\n"
                     "-        return None\n"
                     "+        return make_token(user)\n"
                 ),

@@ -68,6 +68,46 @@ def test_body_only_change_returns_enclosing_function(sample_repo: Path):
     assert "Enclosing function_definition 'target'" in enclosing.reason
 
 
+def test_tiny_enclosing_fully_covered_by_hunk_is_skipped(sample_repo: Path):
+    """函数体 <5 行且整段都在 hunk 里时，P2 只是重复 diff 内容。"""
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="pkg/mod.py",
+                status="modified",
+                changed_lines=[2],
+                visible_lines=[1, 2],
+            )
+        ]
+    )
+    retriever = TreeSitterLocalRetriever()
+
+    contexts = retriever.retrieve(sample_repo, diff)
+
+    assert not any(context.kind == "enclosing" for context in contexts)
+    assert retriever.last_stats["tiny_enclosing_skipped"] == 1
+
+
+def test_tiny_enclosing_not_fully_visible_is_kept(sample_repo: Path):
+    """hunk 只展示变更行时，函数体其余部分仍需 P2 补充。"""
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="pkg/mod.py",
+                status="modified",
+                changed_lines=[2],
+                visible_lines=[2],
+            )
+        ]
+    )
+    retriever = TreeSitterLocalRetriever()
+
+    contexts = retriever.retrieve(sample_repo, diff)
+
+    assert any(context.kind == "enclosing" for context in contexts)
+    assert "tiny_enclosing_skipped" not in retriever.last_stats
+
+
 def test_reference_is_not_misclassified_as_definition(sample_repo: Path):
     """降级兜底里，引用所在行不应被标成 Definition 并拿高分。"""
     diff = ParsedDiff(

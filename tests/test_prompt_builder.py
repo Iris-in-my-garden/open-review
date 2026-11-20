@@ -229,7 +229,7 @@ def test_task_instruction_is_placed_before_output_constraints():
 
     assert prompt.index("### 【任务】") < prompt.index("### 【输出约束】")
     # 输出约束仍然是 prompt 的最后一段，模型最后读到的是格式要求。
-    assert prompt.rstrip().endswith("直接省略该 finding。")
+    assert prompt.rstrip().endswith("的 ctx-id 写入 `context_refs`。")
 
 
 def test_prompt_redacts_credentials_before_leaving_process():
@@ -285,3 +285,70 @@ def test_prompt_builder_records_used_and_omitted_context_stats():
 
     builder.reset_context_stats()
     assert builder.context_stats["omitted_contexts"] == 0
+
+
+def test_base_revision_context_is_isolated_from_head_contexts():
+    """P3 base 旧代码必须单独包在 <base_branch_context> 里，不能混入可引用区。"""
+    head = CodeContext(
+        file_path="src/utils.py",
+        reason="enclosing",
+        snippet="def new_func():\n    return 1",
+        score=0.9,
+        kind="enclosing",
+        priority=ContextPriority.ENCLOSING,
+        symbol="new_func",
+        start_line=10,
+        end_line=11,
+    )
+    base = CodeContext(
+        file_path="src/utils.py",
+        reason="base definition",
+        snippet="def old_func():\n    return 0",
+        score=0.8,
+        revision="base",
+        kind="base_definition",
+        priority=ContextPriority.DEFINITION,
+        symbol="old_func",
+        start_line=10,
+        end_line=11,
+    )
+
+    prompt = PromptBuilder().build_user_prompt(_pr(), _diff(), [head, base])
+
+    base_start = prompt.index("<base_branch_context>")
+    assert head.context_id in prompt[:base_start]
+    assert base.context_id in prompt[base_start:]
+    assert prompt.index("Related context（同文件") < base_start
+
+
+def test_prompt_builder_merges_duplicate_contexts_before_injection():
+    """即使调用方绕过 planner，相同范围 / 同一 AST 节点也不能重复注入。"""
+    enclosing = CodeContext(
+        file_path="src/utils.py",
+        reason="enclosing",
+        snippet="def new_func():\n    return 1",
+        score=0.9,
+        kind="enclosing",
+        priority=ContextPriority.ENCLOSING,
+        symbol="new_func",
+        start_line=10,
+        end_line=11,
+    )
+    duplicate = CodeContext(
+        file_path="src/utils.py",
+        reason="callee",
+        snippet="def new_func():\n    return 1",
+        score=0.8,
+        kind="callee",
+        priority=ContextPriority.DEFINITION,
+        symbol="new_func",
+        start_line=10,
+        end_line=11,
+    )
+    builder = PromptBuilder()
+
+    prompt = builder.build_user_prompt(_pr(), _diff(), [enclosing, duplicate])
+
+    assert builder.context_stats["merged_contexts"] == 1
+    assert prompt.count(enclosing.context_id) == 1
+    assert duplicate.context_id not in prompt

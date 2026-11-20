@@ -151,6 +151,43 @@ def test_validate_grounded_evidence_gets_bonus():
     assert result.potential_issues[0].confidence == 0.75
 
 
+def test_base_revision_context_ref_is_rejected():
+    """base 旧代码只能解释删除内容，不能作为当前 finding 的 context_ref。"""
+    from openreview.retriever.code_context import CodeContext, ContextPriority
+
+    base = CodeContext(
+        file_path="src/auth.py",
+        reason="base definition",
+        snippet='password = "old"',
+        score=0.8,
+        revision="base",
+        kind="base_definition",
+        priority=ContextPriority.DEFINITION,
+        start_line=1,
+        end_line=1,
+    )
+    issue = PotentialIssue(
+        file="src/auth.py",
+        severity="High",
+        category="Security",
+        confidence=0.7,
+        reasoning="Hardcoded password.",
+        suggestion="Use env vars.",
+        line=1,
+        evidence='password = "123"',
+        context_refs=[base.ensure_context_id()],
+    )
+    validator = FindingValidator()
+
+    result = validator.validate(
+        _result([issue]), _diff_with_patch(), contexts=[base]
+    )
+
+    assert result.potential_issues[0].context_refs == []
+    assert validator.last_stats["base_context_ref"] == 1
+    assert validator.last_stats["invalid_context_ref"] == 0
+
+
 def test_validate_ungrounded_evidence_is_penalized_and_dropped():
     issue = PotentialIssue(
         file="src/auth.py",
@@ -405,6 +442,7 @@ def test_validate_records_counters_for_eval():
         "evidence_line_match": 0,
         "evidence_token_match": 0,
         "invalid_context_ref": 0,
+        "base_context_ref": 0,
         "low_confidence": 0,
         "deduplicated": 0,
         "patch_checked": 0,
