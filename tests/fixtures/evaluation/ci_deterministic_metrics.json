@@ -1,0 +1,18 @@
+{
+  "instances": 10,
+  "results_ok": 10,
+  "results_error": 0,
+  "results_missing": 0,
+  "validity": {
+    "unknown_file_rate": 0.0,
+    "invalid_line_rate": 0.0
+  },
+  "evidence": {
+    "checked": 10,
+    "ungrounded": 0,
+    "coverage": 1.0
+  },
+  "attribution": {
+    "coverage": 1.0
+  }
+}

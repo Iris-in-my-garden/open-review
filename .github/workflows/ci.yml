@@ -29,4 +29,4 @@ jobs:
       - name: Deterministic eval gate
         run: >-
           uv run python -m evaluation.cli gate
-          --metrics evaluation/metrics/aacr-pygo-v1/dev-mock/deterministic_dev-mock.json
+          --metrics tests/fixtures/evaluation/ci_deterministic_metrics.json

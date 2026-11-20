@@ -34,6 +34,20 @@ def test_gate_passes_on_clean_deterministic_metrics():
     assert result.failures == []
 
 
+def test_ci_metrics_fixture_passes_gate():
+    fixture_path = (
+        Path(__file__).parent
+        / "fixtures"
+        / "evaluation"
+        / "ci_deterministic_metrics.json"
+    )
+
+    result = evaluate_gate(load_metrics(fixture_path))
+
+    assert result.passed
+    assert result.failures == []
+
+
 def test_gate_fails_on_invented_lines():
     result = evaluate_gate(
         _metrics(

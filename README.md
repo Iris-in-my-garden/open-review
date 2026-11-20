@@ -349,14 +349,17 @@ PR 标题、描述、代码注释都视为不可信数据：统一放入 `<untru
 
 数据使用 AACR-Bench Python/Go 子集的固定切分：**10 dev / 25 test / 8 holdout**。README 只保留模板；真实结果跑完后由 `report` 子命令生成并替换。
 
-确定性指标可以直接作为 CI 门禁，不消耗 token：
+确定性指标可以作为 CI 门禁，不消耗 token。评测运行的指标文件默认位于
+`evaluation/metrics/`（该目录不提交）；CI 使用仓库内的受控 fixture 验证门禁
+CLI 和阈值契约，不代表本次提交运行了模型评测：
 
 ```bash
 uv run python -m evaluation.cli gate \
-  --metrics evaluation/metrics/aacr-pygo-v1/dev-mock/deterministic_dev-mock.json
+  --metrics tests/fixtures/evaluation/ci_deterministic_metrics.json
 ```
 
 门禁默认要求：结果无 error/missing、未知文件率 0、非法行号率 0、未 grounding 的 evidence 率 0，evidence/归因覆盖率不低于阈值；阈值可用 `--min-*` / `--max-*` 调整。
+运行真实或 mock 评测后，可将实际生成的 `deterministic_<run>.json` 传给同一命令检查该次结果。
 
 ### 复现 dev mini-eval
 
@@ -430,7 +433,7 @@ uv run mypy src evaluation
 uv run pre-commit run --all-files
 ```
 
-CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、mypy、pytest，最后跑确定性评测门禁（`evaluation.cli gate`）。门禁不调用模型，只对已产出的确定性指标检查硬阈值：不得出现未知文件/非法行号/未 grounding 的 evidence，结果不得缺失。`ruff` / `mypy` / `pre-commit` 通过 `dependency-groups.dev` 管理。
+CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、mypy、pytest，最后用跟踪的受控 fixture 运行确定性评测门禁（`evaluation.cli gate`）。这保证 gate 命令和阈值契约有效；它不代表 CI 运行了 AACR 评测或调用了模型。实际结果仍可用同一 gate 命令检查。`ruff` / `mypy` / `pre-commit` 通过 `dependency-groups.dev` 管理。
 
 ## 已知限制 / Roadmap
 
