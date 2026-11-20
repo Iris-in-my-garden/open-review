@@ -343,7 +343,7 @@ PR 标题、描述、代码注释都视为不可信数据：统一放入 `<untru
 
 评测分两层：
 
-- **无需 LLM 调用的确定性指标**：行号合法性、evidence 可定位性、triage、归因、token/调用用量
+- **无需 LLM 调用的确定性指标**：行号合法性、按 finding 行号精确匹配源码的 evidence 核验（不可核验项单独统计）、triage、归因、token/调用用量
 - **检索缺口指标**：`prompt_context_coverage`、`retrieval_truncated_total`、`cross_batch_duplicates_total` 等，用于区分“召回失败”和“召回后被 cap / prompt 预算丢弃”；它们不是人工标注的 ground-truth recall，但能直接暴露检索链路的损耗位置
 - **可选语义指标**：复用 AACR-Bench 官方 LLM judge，计算文件级 Precision / Recall / Balanced
 
@@ -358,7 +358,7 @@ uv run python -m evaluation.cli gate \
   --metrics tests/fixtures/evaluation/ci_deterministic_metrics.json
 ```
 
-门禁默认要求：结果无 error/missing、未知文件率 0、非法行号率 0、未 grounding 的 evidence 率 0，evidence/归因覆盖率不低于阈值；阈值可用 `--min-*` / `--max-*` 调整。
+门禁默认要求：结果无 error/missing、未知文件率 0、非法行号率 0、未 grounding 的 evidence 率 0，evidence 可核验率至少 0.8、evidence/归因覆盖率不低于阈值；阈值可用 `--min-*` / `--max-*` 调整。
 运行真实或 mock 评测后，可将实际生成的 `deterministic_<run>.json` 传给同一命令检查该次结果。
 
 ### 复现 dev mini-eval

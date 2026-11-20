@@ -312,6 +312,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
         max_invalid_line_rate=args.max_invalid_line_rate,
         max_ungrounded_rate=args.max_ungrounded_rate,
         min_evidence_coverage=args.min_evidence_coverage,
+        min_evidence_evaluable_rate=args.min_evidence_evaluable_rate,
         min_attribution_coverage=args.min_attribution_coverage,
     )
     try:
@@ -639,6 +640,7 @@ def build_parser() -> argparse.ArgumentParser:
     gate.add_argument("--max-invalid-line-rate", type=float, default=0.0)
     gate.add_argument("--max-ungrounded-rate", type=float, default=0.0)
     gate.add_argument("--min-evidence-coverage", type=float, default=0.8)
+    gate.add_argument("--min-evidence-evaluable-rate", type=float, default=0.8)
     gate.add_argument("--min-attribution-coverage", type=float, default=0.9)
     gate.set_defaults(func=cmd_gate)
 

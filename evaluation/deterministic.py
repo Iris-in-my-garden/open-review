@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -23,9 +22,8 @@ from openreview.domain.versions import VERIFICATION_METRICS_SCHEMA_VERSION
 from openreview.repo.diff_parser import DiffParser, ParsedChangedFile
 from openreview.repo.local import collect_local_changes
 
-TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+")
 EVIDENCE_MIN_CHARS = 6
-EVIDENCE_TOKEN_OVERLAP = 0.8
+EVIDENCE_METRICS_SCHEMA_VERSION = 2
 
 
 def _rate(numerator: int, denominator: int) -> float:
@@ -33,20 +31,36 @@ def _rate(numerator: int, denominator: int) -> float:
 
 
 def _normalize(text: str) -> str:
-    return " ".join(text.lower().split())
+    return " ".join(text.split())
 
 
 def evidence_is_grounded(evidence: str, haystack: str) -> bool:
     if not evidence or len(evidence.strip()) < EVIDENCE_MIN_CHARS or not haystack:
         return False
-    evidence_tokens = set(TOKEN_PATTERN.findall(evidence.lower()))
-    if len(evidence_tokens) < 3:
-        return _normalize(evidence) in _normalize(haystack)
-    haystack_tokens = set(TOKEN_PATTERN.findall(haystack.lower()))
-    if not haystack_tokens:
-        return False
-    overlap = len(evidence_tokens & haystack_tokens) / len(evidence_tokens)
-    return overlap >= EVIDENCE_TOKEN_OVERLAP
+    return _normalize(evidence) in _normalize(haystack)
+
+
+def _line_range(
+    start_line: Any, end_line: Any, visible_lines: set[int]
+) -> Optional[tuple[int, int]]:
+    if isinstance(start_line, bool) or isinstance(end_line, bool):
+        return None
+    if isinstance(start_line, float) and not start_line.is_integer():
+        return None
+    if isinstance(end_line, float) and not end_line.is_integer():
+        return None
+    try:
+        start = int(start_line)
+        end = int(end_line if end_line is not None else start_line)
+    except (TypeError, ValueError):
+        return None
+    if start <= 0 or end < start:
+        return None
+    if end - start + 1 > len(visible_lines):
+        return None
+    if any(line not in visible_lines for line in range(start, end + 1)):
+        return None
+    return start, end
 
 
 def _parsed_diff(
@@ -101,11 +115,13 @@ def compute_deterministic_metrics(
         "evidence_grounded": 0,
         "evidence_missing": 0,
         "evidence_ungrounded": 0,
+        "evidence_unevaluable": 0,
         "triage_skipped": 0,
         "attributed_issues": 0,
         "grounding_unavailable": 0,
     }
     triage_reasons: Counter[str] = Counter()
+    evidence_unevaluable_reasons: Counter[str] = Counter()
     aspect_counts: Counter[str] = Counter()
     validator_totals: Counter[str] = Counter()
     verification_stages: Counter[str] = Counter(
@@ -334,13 +350,15 @@ def compute_deterministic_metrics(
         diff_files = _parsed_diff(
             repo_path, instance["base_commit"], instance["head_commit"]
         )
-        head_cache: Dict[str, Optional[str]] = {}
+        source_cache: Dict[tuple[str, str], Optional[str]] = {}
         row_invalid = 0
         row_missing_line = 0
         row_unknown = 0
         row_grounded = 0
         row_evidence_checked = 0
         row_missing_evidence = 0
+        row_unevaluable = 0
+        row_unevaluable_reasons: Counter[str] = Counter()
 
         for comment in comments:
             path = str(comment.get("path") or "")
@@ -356,9 +374,16 @@ def compute_deterministic_metrics(
             elif path not in diff_files:
                 counters["unknown_file"] += 1
                 row_unknown += 1
-            elif int(line) not in diff_files[path].visible_lines:
-                counters["invalid_line"] += 1
-                row_invalid += 1
+            else:
+                side = str(comment.get("side") or "RIGHT").upper()
+                visible_lines = set(
+                    diff_files[path].old_visible_lines
+                    if side == "LEFT"
+                    else diff_files[path].visible_lines
+                )
+                if _line_range(line, comment.get("end_line"), visible_lines) is None:
+                    counters["invalid_line"] += 1
+                    row_invalid += 1
 
             if aspects:
                 counters["attributed_issues"] += 1
@@ -370,34 +395,59 @@ def compute_deterministic_metrics(
                 row_missing_evidence += 1
                 continue
             if diff_files is None:
+                counters["evidence_unevaluable"] += 1
+                evidence_unevaluable_reasons["diff_unavailable"] += 1
+                row_unevaluable_reasons["diff_unavailable"] += 1
+                row_unevaluable += 1
                 continue
 
             file_diff = diff_files.get(path)
             if file_diff is None:
+                counters["evidence_unevaluable"] += 1
+                evidence_unevaluable_reasons["unknown_file"] += 1
+                row_unevaluable_reasons["unknown_file"] += 1
+                row_unevaluable += 1
                 continue
-            if path not in head_cache:
-                head_cache[path] = (
-                    read_file_at_commit(
-                        repo_path, instance["head_commit"], path
-                    )
+
+            side = str(comment.get("side") or "RIGHT").upper()
+            visible_lines = set(
+                file_diff.old_visible_lines
+                if side == "LEFT"
+                else file_diff.visible_lines
+            )
+            line_range = _line_range(
+                line, comment.get("end_line"), visible_lines
+            )
+            if line_range is None:
+                reason = "missing_line" if line is None else "line_outside_diff"
+                counters["evidence_unevaluable"] += 1
+                evidence_unevaluable_reasons[reason] += 1
+                row_unevaluable_reasons[reason] += 1
+                row_unevaluable += 1
+                continue
+
+            start_line, end_line = line_range
+            commit = (
+                instance["base_commit"]
+                if side == "LEFT"
+                else instance["head_commit"]
+            )
+            cache_key = (commit, path)
+            if cache_key not in source_cache:
+                source_cache[cache_key] = (
+                    read_file_at_commit(repo_path, commit, path)
                     if repo_path is not None
                     else None
                 )
-            haystack_parts = [file_diff.patch or ""]
-            if line is not None:
-                source = head_cache[path] or ""
-                source_lines = source.splitlines()
-                try:
-                    line_number = int(line)
-                except (TypeError, ValueError):
-                    line_number = 0
-                if line_number > 0 and source_lines:
-                    start = max(0, line_number - 8)
-                    end = min(len(source_lines), line_number + 8)
-                    haystack_parts.append("\n".join(source_lines[start:end]))
-            # 没有行号时只信任 patch，不再用整个 head 文件兜底；否则
-            # “证据在同文件任意角落”会被算作 grounded，指标失去意义。
-            haystack = "\n".join(part for part in haystack_parts if part)
+            source = source_cache[cache_key]
+            source_lines = source.splitlines() if source is not None else []
+            if end_line > len(source_lines):
+                counters["evidence_unevaluable"] += 1
+                evidence_unevaluable_reasons["source_unavailable"] += 1
+                row_unevaluable_reasons["source_unavailable"] += 1
+                row_unevaluable += 1
+                continue
+            haystack = "\n".join(source_lines[start_line - 1 : end_line])
             counters["evidence_checked"] += 1
             row_evidence_checked += 1
             if evidence_is_grounded(str(evidence), haystack):
@@ -417,6 +467,10 @@ def compute_deterministic_metrics(
                 "evidence_checked": row_evidence_checked,
                 "evidence_grounded": row_grounded,
                 "evidence_missing": row_missing_evidence,
+                "evidence_unevaluable": row_unevaluable,
+                "evidence_unevaluable_reasons": dict(
+                    row_unevaluable_reasons.most_common()
+                ),
                 "attribution_coverage": _rate(attributed, len(comments)),
             }
         )
@@ -442,10 +496,19 @@ def compute_deterministic_metrics(
             "missing_line_count": counters["missing_line"],
         },
         "evidence": {
+            "schema_version": EVIDENCE_METRICS_SCHEMA_VERSION,
             "checked": counters["evidence_checked"],
             "grounded": counters["evidence_grounded"],
             "ungrounded": counters["evidence_ungrounded"],
             "missing": counters["evidence_missing"],
+            "unevaluable": counters["evidence_unevaluable"],
+            "unevaluable_reasons": dict(
+                evidence_unevaluable_reasons.most_common()
+            ),
+            "evaluable_rate": _rate(
+                counters["evidence_checked"],
+                counters["evidence_checked"] + counters["evidence_unevaluable"],
+            ),
             "coverage": _rate(
                 counters["evidence_grounded"], counters["evidence_checked"]
             ),
@@ -543,6 +606,8 @@ def print_summary(metrics: Dict[str, Any]) -> None:
     print(
         "evidence: "
         f"coverage={metrics['evidence']['coverage']} "
+        f"evaluable_rate={metrics['evidence']['evaluable_rate']} "
+        f"unevaluable={metrics['evidence']['unevaluable']} "
         f"missing_rate={metrics['evidence']['missing_rate']} "
         f"checked={metrics['evidence']['checked']}"
     )

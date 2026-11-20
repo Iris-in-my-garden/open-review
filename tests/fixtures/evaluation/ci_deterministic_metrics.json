@@ -10,7 +10,8 @@
   "evidence": {
     "checked": 10,
     "ungrounded": 0,
-    "coverage": 1.0
+    "coverage": 1.0,
+    "evaluable_rate": 1.0
   },
   "attribution": {
     "coverage": 1.0

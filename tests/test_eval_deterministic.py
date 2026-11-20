@@ -57,7 +57,7 @@ def _write_result(results_dir: Path, instance_id: str, base: str, head: str) -> 
         },
         {
             "path": "src/app.py",
-            "start_line": 99,
+            "start_line": 2,
             "end_line": 99,
             "content": "Line outside diff.",
             "severity": "high",
@@ -65,6 +65,17 @@ def _write_result(results_dir: Path, instance_id: str, base: str, head: str) -> 
             "confidence": 0.8,
             "source_aspects": ["bugs"],
             "evidence": "this evidence is definitely not here",
+        },
+        {
+            "path": "src/app.py",
+            "start_line": 2,
+            "end_line": 2,
+            "content": "Evidence does not match the cited line.",
+            "severity": "medium",
+            "category": "bugs",
+            "confidence": 0.6,
+            "source_aspects": [],
+            "evidence": "def add(a, b):",
         },
         {
             "path": "src/app.py",
@@ -147,6 +158,17 @@ def _write_result(results_dir: Path, instance_id: str, base: str, head: str) -> 
 
 def test_evidence_is_grounded():
     assert evidence_is_grounded("return a + b", "def add(a, b):\n    return a + b")
+    assert evidence_is_grounded(
+        "return  a +\nb", "    return a + b"
+    )
+    assert not evidence_is_grounded(
+        "return a + b", "def add(a, b):\n    return a - b"
+    )
+    assert not evidence_is_grounded(
+        "user_id return a + b",
+        "def add(a, b):\n    return a + b\n    log(user_id)",
+    )
+    assert not evidence_is_grounded("Return a + b", "return a + b")
     assert not evidence_is_grounded(
         "this evidence is definitely not here", "def add(a, b):\n    return a + b"
     )
@@ -180,17 +202,24 @@ def test_deterministic_metrics_aggregate(tmp_path: Path, monkeypatch):
     )
 
     assert metrics["results_ok"] == 1
-    assert metrics["issues"] == 3
+    assert metrics["issues"] == 4
     assert metrics["validity"]["invalid_line_count"] == 1
     assert metrics["validity"]["missing_line_count"] == 1
-    assert metrics["validity"]["invalid_line_rate"] == 0.333
+    assert metrics["validity"]["invalid_line_rate"] == 0.25
+    assert metrics["evidence"]["schema_version"] == 2
     assert metrics["evidence"]["checked"] == 2
     assert metrics["evidence"]["grounded"] == 1
+    assert metrics["evidence"]["ungrounded"] == 1
+    assert metrics["evidence"]["unevaluable"] == 1
+    assert metrics["evidence"]["unevaluable_reasons"] == {
+        "line_outside_diff": 1
+    }
+    assert metrics["evidence"]["evaluable_rate"] == 0.667
     assert metrics["evidence"]["coverage"] == 0.5
-    assert metrics["evidence"]["missing_rate"] == 0.333
+    assert metrics["evidence"]["missing_rate"] == 0.25
     assert metrics["triage"]["skip_rate"] == 1.0
     assert metrics["triage"]["reasons"] == {"docs-only": 1}
-    assert metrics["attribution"]["coverage"] == 0.667
+    assert metrics["attribution"]["coverage"] == 0.5
     assert metrics["attribution"]["aspect_counts"] == {"bugs": 2, "security": 1}
     assert metrics["retrieval"]["contexts"] == 5
     assert metrics["retrieval"]["mean_changed_file_coverage"] == 0.5
@@ -208,6 +237,92 @@ def test_deterministic_metrics_aggregate(tmp_path: Path, monkeypatch):
     assert metrics["cost"]["llm_calls"] == 4
     assert metrics["cost"]["input_tokens"] == 100
     assert metrics["cost"]["duration_seconds"] == 1.5
+
+
+def test_evidence_grounding_uses_deleted_side_and_base_commit(
+    tmp_path: Path, monkeypatch
+):
+    repo, base, head = _make_repo(tmp_path)
+    instance_id = "owner__repo@left-side"
+    results_dir = tmp_path / "results"
+    _write_result(results_dir, instance_id, base, head)
+    result_path = results_dir / f"{instance_id}.json"
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    payload["review"]["comments"] = [
+        {
+            "path": "src/app.py",
+            "start_line": 2,
+            "end_line": 2,
+            "side": "LEFT",
+            "evidence": "return a - b",
+        }
+    ]
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        "evaluation.deterministic.repo_cache_path",
+        lambda cache_dir, repo_name: repo,
+    )
+
+    metrics = compute_deterministic_metrics(
+        [
+            {
+                "instance_id": instance_id,
+                "split": "dev",
+                "repo": "owner/repo",
+                "base_commit": base,
+                "head_commit": head,
+            }
+        ],
+        results_dir=results_dir,
+        repo_cache=tmp_path / "cache",
+    )
+
+    assert metrics["evidence"]["checked"] == 1
+    assert metrics["evidence"]["grounded"] == 1
+    assert metrics["evidence"]["unevaluable"] == 0
+
+
+def test_evidence_without_local_diff_is_counted_unevaluable(tmp_path: Path):
+    instance_id = "owner__repo@unavailable"
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    (results_dir / f"{instance_id}.json").write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "review": {
+                    "comments": [
+                        {
+                            "path": "src/app.py",
+                            "start_line": 2,
+                            "evidence": "return a + b",
+                        }
+                    ],
+                    "metrics": {},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    metrics = compute_deterministic_metrics(
+        [
+            {
+                "instance_id": instance_id,
+                "repo": "owner/repo",
+                "base_commit": "a" * 40,
+                "head_commit": "b" * 40,
+            }
+        ],
+        results_dir=results_dir,
+        repo_cache=tmp_path / "empty-cache",
+    )
+
+    assert metrics["evidence"]["checked"] == 0
+    assert metrics["evidence"]["unevaluable"] == 1
+    assert metrics["evidence"]["unevaluable_reasons"] == {
+        "diff_unavailable": 1
+    }
 
 
 def test_deterministic_metrics_counts_missing_result(tmp_path: Path):

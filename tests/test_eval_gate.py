@@ -20,6 +20,7 @@ def _metrics(**overrides):
             "checked": 10,
             "ungrounded": 0,
             "coverage": 1.0,
+            "evaluable_rate": 1.0,
         },
         "attribution": {"coverage": 1.0},
     }
@@ -76,6 +77,22 @@ def test_gate_fails_on_ungrounded_evidence():
 
     assert not result.passed
     assert any("ungrounded_rate" in failure for failure in result.failures)
+
+
+def test_gate_fails_when_evidence_is_mostly_unevaluable():
+    result = evaluate_gate(
+        _metrics(
+            evidence={
+                "checked": 10,
+                "ungrounded": 0,
+                "coverage": 1.0,
+                "evaluable_rate": 0.4,
+            }
+        )
+    )
+
+    assert not result.passed
+    assert any("evidence_evaluable_rate" in failure for failure in result.failures)
 
 
 def test_gate_thresholds_are_overridable_for_smoke_runs():

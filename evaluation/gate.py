@@ -30,6 +30,7 @@ class GateThresholds:
     max_invalid_line_rate: float = 0.0
     max_ungrounded_rate: float = 0.0
     min_evidence_coverage: float = 0.8
+    min_evidence_evaluable_rate: float = 0.8
     min_attribution_coverage: float = 0.9
 
     def as_dict(self) -> Dict[str, float]:
@@ -39,6 +40,7 @@ class GateThresholds:
             "max_invalid_line_rate": self.max_invalid_line_rate,
             "max_ungrounded_rate": self.max_ungrounded_rate,
             "min_evidence_coverage": self.min_evidence_coverage,
+            "min_evidence_evaluable_rate": self.min_evidence_evaluable_rate,
             "min_attribution_coverage": self.min_attribution_coverage,
         }
 
@@ -85,6 +87,7 @@ def evaluate_gate(
     ungrounded = int(evidence.get("ungrounded") or 0)
     ungrounded_rate = _rate(ungrounded, checked)
     evidence_coverage = float(evidence.get("coverage") or 0.0)
+    evidence_evaluable_rate = evidence.get("evaluable_rate")
 
     attribution = metrics.get("attribution") or {}
     attribution_coverage = float(attribution.get("coverage") or 0.0)
@@ -121,6 +124,14 @@ def evaluate_gate(
             f"evidence_coverage={evidence_coverage:.3f} < "
             f"{thresholds.min_evidence_coverage:.3f}"
         )
+    if (
+        evidence_evaluable_rate is not None
+        and float(evidence_evaluable_rate) < thresholds.min_evidence_evaluable_rate
+    ):
+        failures.append(
+            f"evidence_evaluable_rate={float(evidence_evaluable_rate):.3f} < "
+            f"{thresholds.min_evidence_evaluable_rate:.3f}"
+        )
     if attribution_coverage < thresholds.min_attribution_coverage:
         failures.append(
             f"attribution_coverage={attribution_coverage:.3f} < "
@@ -137,6 +148,11 @@ def evaluate_gate(
             "invalid_line_rate": round(invalid_line_rate, 3),
             "ungrounded_rate": round(ungrounded_rate, 3),
             "evidence_coverage": round(evidence_coverage, 3),
+            "evidence_evaluable_rate": (
+                round(float(evidence_evaluable_rate), 3)
+                if evidence_evaluable_rate is not None
+                else 0.0
+            ),
             "attribution_coverage": round(attribution_coverage, 3),
         },
     )

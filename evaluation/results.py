@@ -48,6 +48,7 @@ def issue_comment(issue: PotentialIssue) -> Dict[str, Any]:
         "path": issue.file,
         "start_line": issue.line,
         "end_line": issue.end_line if issue.end_line is not None else issue.line,
+        "side": issue.side,
         "content": content,
         # 以下字段 AACR 不读取，仅用于本地确定性指标 / 人工分析。
         "severity": issue.severity,

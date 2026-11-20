@@ -113,7 +113,7 @@ uv run python -m evaluation.cli gate \
 ```
 
 默认硬阈值：结果不能有 error/missing，未知文件率、非法行号率、未 grounding
-的 evidence 率必须为 0，evidence/归因覆盖率有下限。阈值可通过 `--min-*` /
+的 evidence 率必须为 0，evidence 可核验率和归因覆盖率有下限。阈值可通过 `--min-*` /
 `--max-*` 覆盖，但 `results_error` / `results_missing` 不允许放宽。
 
 - `file_recall` / `index_file_recall`：reference comment 指向的文件是否被上下文覆盖
@@ -267,11 +267,20 @@ validator 已经把非法行号置空、把幻觉文件丢掉，所以这三个�
 
 ### evidence
 
-- `coverage`：有 evidence 且能在 head 源码或 patch 中定位 / 已检查 evidence 数
+- 新口径在 `evidence.schema_version = 2` 标识
+- `coverage`：严格按 finding 的文件、LEFT/RIGHT 侧和闭区间行号取对应 commit 的源码，
+  evidence 经空白归一化后能在该行范围内精确定位 / 已检查 evidence 数
+- `evaluable_rate`：能做上述检查的 evidence 数 / 有 evidence 的 finding 数
+- `ungrounded`：行号和源码均可检查，但引用文本不匹配的 evidence 数
+- `unevaluable` / `unevaluable_reasons`：无法核验的 evidence 数及原因（diff 不可用、
+  未知文件、行号缺失/非法/不在 diff、源码不可用）；不再把这些样本混入 grounded/
+  ungrounded 的分母
 - `missing_rate`：没有 evidence / 总 findings
 
-evidence 定位规则与 validator 类似：短文本用归一化子串匹配，长文本用 token
-overlap ≥ 0.8。它不是语义判断，只回答“引用的代码是否真的存在”。
+这项指标有意比 pipeline Validator 更严格：不使用附近代码窗口、整份 patch 或
+token overlap 作为证据；大小写敏感，仅折叠空白。它只验证“引用代码是否逐字出现于
+所标行”，不判断引用是否足以支持 finding 的语义结论。CI gate 对新格式指标同时
+要求 `evaluable_rate` 至少 0.8，避免只在少数可核验项上获得高 coverage。
 
 ### triage
 

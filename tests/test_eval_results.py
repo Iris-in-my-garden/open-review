@@ -35,6 +35,7 @@ def _result() -> ReviewResult:
                 reasoning="The operator is inverted.",
                 suggestion="Use + instead of -.",
                 line=12,
+                side="LEFT",
                 evidence="return a + b",
                 source_aspects=["bugs", "security"],
             )
@@ -62,6 +63,7 @@ def test_build_result_payload_matches_aacr_ocr_shape():
     assert comment["path"] == "src/app.py"
     assert comment["start_line"] == 12
     assert comment["end_line"] == 12
+    assert comment["side"] == "LEFT"
     assert "The operator is inverted." in comment["content"]
     assert "Suggestion: Use + instead of -." in comment["content"]
     assert comment["source_aspects"] == ["bugs", "security"]
