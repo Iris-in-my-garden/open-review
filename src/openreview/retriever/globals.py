@@ -766,20 +766,28 @@ def _go_expr_type(
         return node_text(type_node, source) if type_node else ""
     if node.type == "unary_expression":
         text = node_text(node, source)
-        child = next((item for item in node.children if item.is_named), None)
-        if child is None:
+        unary_child = next(
+            (item for item in node.children if item.is_named), None
+        )
+        if unary_child is None:
             return ""
         child_type = _go_expr_type(
-            child, type_env, struct_fields, package_types, source
+            unary_child, type_env, struct_fields, package_types, source
         )
         return f"*{child_type}" if text.startswith("&") else child_type
     if node.type == "parenthesized_expression":
-        child = next((item for item in node.children if item.is_named), None)
+        parenthesized_child = next(
+            (item for item in node.children if item.is_named), None
+        )
         return (
             _go_expr_type(
-                child, type_env, struct_fields, package_types, source
+                parenthesized_child,
+                type_env,
+                struct_fields,
+                package_types,
+                source,
             )
-            if child is not None
+            if parenthesized_child is not None
             else ""
         )
     if node.type == "call_expression":

@@ -119,7 +119,7 @@ class HybridRetriever:
             )
 
         def _run_graph() -> List[CodeContext]:
-            if not graph_available:
+            if not self.graph_enabled or index is None or query is None:
                 return []
             return list(
                 self.graph_retriever.retrieve(

@@ -642,7 +642,8 @@ def _relocate_line_from_evidence(
     visible_lines: Sequence[int],
 ) -> Optional[int]:
     """Relocate a nearby invalid line only when evidence has one exact anchor."""
-    normalized_evidence = _normalize_text(redact_text(evidence or "")[0])
+    evidence_text = evidence or ""
+    normalized_evidence = _normalize_text(redact_text(evidence_text)[0])
     if not normalized_evidence:
         return None
 
@@ -671,7 +672,7 @@ def _relocate_line_from_evidence(
             new_line += 1
 
     visible = set(visible_lines)
-    evidence_line_count = max(1, len(evidence.splitlines()))
+    evidence_line_count = max(1, len(evidence_text.splitlines()))
     matches: List[int] = []
     for candidate in sorted(visible):
         if abs(candidate - reported_line) > 3:

@@ -159,11 +159,11 @@ def _is_redundant_context(context: CodeContext, kept: CodeContext) -> bool:
     """
     if context.file_path != kept.file_path or context.revision != kept.revision:
         return False
-    if None in (
-        context.start_line,
-        context.end_line,
-        kept.start_line,
-        kept.end_line,
+    if (
+        context.start_line is None
+        or context.end_line is None
+        or kept.start_line is None
+        or kept.end_line is None
     ):
         return False
 
