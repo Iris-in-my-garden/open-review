@@ -21,7 +21,8 @@
 
 - 21 个 Python PR + 22 个 Go PR = **43 个 PR**
 - 覆盖 **10 个仓库**
-- 固定切分：**10 dev / 25 test / 8 holdout**
+- 固定的语言分层、仓库互斥切分：**7 dev / 26 test / 10 holdout PR**，分别覆盖
+  **2 / 6 / 2 个仓库**；每种语言都出现在每个 split。
 
 原始数据 SHA256 固定为：
 
@@ -29,17 +30,21 @@
 02c8561f1c3994a26f427d479b2a3f6e6c8e6858161fbc903b45248fa2cb2097
 ```
 
-`manifests/aacr_pygo_v1.json` 是提交到仓库的固定索引，包含每个实例的
-`instance_id / split / base_commit / head_commit / clone_url`。切分算法使用
-`SHA256(seed + instance_id)` 排序，而不是 `random.shuffle`，因此不依赖 Python
-版本的随机数实现：
+`manifests/aacr_pygo_v2.json` 是提交到仓库的固定索引，包含每个实例的
+`instance_id / split / base_commit / head_commit / clone_url`。同一仓库的所有 PR
+只会落入一个 split。每种语言各选一个 dev 仓库，再从剩余仓库中选一个 holdout
+仓库；所选仓库的 PR 数尽量接近该语言样本总数的 20%，其余仓库全部用于 test。
+候选并列时使用 SHA256(seed + split + language + repo) 稳定打破平局，不依赖
+Python 版本的随机数实现：
 
-- **dev**：每个 repo 取 1 条，保证 5 Python + 5 Go 仓库都有覆盖
-- **holdout**：每种语言最多 4 个仍有剩余样本的 repo，各取 1 条
-- **test**：其余全部
+- **dev**：Python、Go 各一个仓库
+- **holdout**：与 dev 不重叠，Python、Go 各一个未见仓库
+- **test**：剩余仓库；三个 split 都覆盖 Python 与 Go
 
-注意：这是 **PR 级 holdout**，不是 repo 级 holdout。同一个仓库的代码风格会同时
-出现在 dev/test 中，结论更偏向“同仓库新 PR 的泛化”，不要解读成“未见仓库泛化”。
+这使 holdout 可以用于评估未见仓库泛化；dev/test/holdout 之间仍可能有仓库数量与
+PR 数量不平衡，结论需同时查看按语言和仓库分层的结果。每个 split 的仓库数很少，
+如果某语言少于两个仓库簇，报告会省略该层及总体的仓库 bootstrap 区间，而不是给出
+无意义的零宽区间。
 
 ---
 
@@ -62,7 +67,7 @@ uv run python -m evaluation.cli prepare \
 uv run python -m evaluation.cli prepare --download
 ```
 
-默认写入 `evaluation/manifests/aacr_pygo_v1.json`。
+默认写入 `evaluation/manifests/aacr_pygo_v2.json`。
 
 如果用的是本地 fixture 或内网镜像（SHA256 与官方不同），加
 `--no-verify-source` 跳过校验。它只影响校验，不会把数据标记成官方版本；
@@ -90,10 +95,10 @@ uv run python -m evaluation.cli metrics \
 
 输出：
 
-- `evaluation/results/aacr-pygo-v1/dev-mock/<instance_id>.json`
-- `evaluation/results/aacr-pygo-v1/dev-mock/summary_openreview.json`
-- `evaluation/metrics/aacr-pygo-v1/dev-mock/deterministic_dev-mock.json`
-- `evaluation/metrics/aacr-pygo-v1/dev-mock/retrieval_dev-mock.json`
+- `evaluation/results/aacr-pygo-v2/dev-mock/<instance_id>.json`
+- `evaluation/results/aacr-pygo-v2/dev-mock/summary_openreview.json`
+- `evaluation/metrics/aacr-pygo-v2/dev-mock/deterministic_dev-mock.json`
+- `evaluation/metrics/aacr-pygo-v2/dev-mock/retrieval_dev-mock.json`
 
 `deterministic_*.json` 覆盖行号合法性、证据可定位性、维度归因与 token 用量；
 `retrieval_*.json` 是 Phase 1/2 的检索质量指标，完全不调用 LLM：
@@ -104,7 +109,7 @@ uv run python -m evaluation.cli metrics \
 
 ```bash
 uv run python -m evaluation.cli gate \
-  --metrics evaluation/metrics/aacr-pygo-v1/dev-mock/deterministic_dev-mock.json
+  --metrics evaluation/metrics/aacr-pygo-v2/dev-mock/deterministic_dev-mock.json
 ```
 
 默认硬阈值：结果不能有 error/missing，未知文件率、非法行号率、未 grounding
@@ -188,14 +193,18 @@ AACR OCR 兼容字段（`review.comments[].content`、`review.summary.input_toke
 
 ```bash
 uv run python -m evaluation.cli report \
-  --run diff=evaluation/metrics/aacr-pygo-v1/dev-diff \
-  --run ast=evaluation/metrics/aacr-pygo-v1/dev-ast \
-  --run graph=evaluation/metrics/aacr-pygo-v1/dev-graph \
-  --run verifier=evaluation/metrics/aacr-pygo-v1/dev-verifier \
+  --run diff=evaluation/metrics/aacr-pygo-v2/dev-diff \
+  --run ast=evaluation/metrics/aacr-pygo-v2/dev-ast \
+  --run graph=evaluation/metrics/aacr-pygo-v2/dev-graph \
+  --run verifier=evaluation/metrics/aacr-pygo-v2/dev-verifier \
   --out reports/eval_dev.md
 ```
 
-- 报告展示 P/R、检索覆盖、citation、graph context、调用次数和延迟
+- 报告展示 P/R、检索覆盖、citation、graph context、调用次数和延迟；有 AACR
+  逐样本 judge 记录时还会展示语言/仓库分层语义指标
+- 单个 run 的 95% 区间按语言分层、以仓库为簇有放回抽样；多 run 共同 PR 的配置
+  差异另用语言分层的配对 PR bootstrap 区间。任一语言少于两个仓库簇/配对 PR 时
+  不报告区间。随机 seed 固定为 42，结果可复现。
 - 语义文件默认在 metrics 目录里自动查找最新的 `metrics_openreview_*.json`
 - 也可以显式指定：`--semantic single=/path/to/metrics_openreview_xxx.json`
 
@@ -393,7 +402,7 @@ evaluation/
   report.py          # 多次 run -> Markdown Results 表
   cli.py             # prepare / review / metrics / semantic / report
   manifests/
-    aacr_pygo_v1.json
+    aacr_pygo_v2.json
 ```
 
 ---

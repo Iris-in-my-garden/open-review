@@ -26,8 +26,9 @@ AACR_DATA_SHA256 = (
     "02c8561f1c3994a26f427d479b2a3f6e6c8e6858161fbc903b45248fa2cb2097"
 )
 SUPPORTED_LANGUAGES = {"python": "Python", "go": "Go"}
-MANIFEST_VERSION = "aacr-pygo-v1"
+MANIFEST_VERSION = "aacr-pygo-v2"
 DEFAULT_SEED = 42
+_DEV_HOLDOUT_FRACTION = 0.2
 
 _GITHUB_PR_PATTERN = re.compile(
     r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", re.IGNORECASE
@@ -167,6 +168,79 @@ def _hash_key(seed: int, *parts: object) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _closest_repo(
+    candidates: Sequence[str],
+    repo_sizes: Dict[str, int],
+    target_size: float,
+    *,
+    seed: int,
+    language: str,
+    split: str,
+) -> str:
+    ranked = [
+        (
+            abs(repo_sizes[repo] - target_size),
+            _hash_key(seed, split, language, repo),
+            repo,
+        )
+        for repo in candidates
+    ]
+    return min(ranked)[2]
+
+
+def _assign_repo_splits(
+    records: Sequence[Dict[str, Any]], *, seed: int
+) -> Dict[str, str]:
+    """Assign every PR from a repository to the same language-stratified split."""
+    by_language: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for record in records:
+        by_language[record["_language"]][record["_repo"]].append(record)
+
+    split_by_id: Dict[str, str] = {}
+    for language, repos in sorted(by_language.items()):
+        target_size = (
+            sum(len(repo_records) for repo_records in repos.values())
+            * _DEV_HOLDOUT_FRACTION
+        )
+
+        candidates = sorted(repos)
+        if len(candidates) < 3:
+            raise ManifestError(
+                f"{language} 至少需要 3 个仓库才能构造 dev/test/holdout "
+                f"repo-level split，当前只有 {len(candidates)} 个"
+            )
+        repo_sizes = {repo: len(repo_records) for repo, repo_records in repos.items()}
+        dev_repo = _closest_repo(
+            candidates,
+            repo_sizes,
+            target_size,
+            seed=seed,
+            language=language,
+            split="dev",
+        )
+        holdout_repo = _closest_repo(
+            [repo for repo in candidates if repo != dev_repo],
+            repo_sizes,
+            target_size,
+            seed=seed,
+            language=language,
+            split="holdout",
+        )
+        for repo, repo_records in repos.items():
+            split = (
+                "dev"
+                if repo == dev_repo
+                else "holdout"
+                if repo == holdout_repo
+                else "test"
+            )
+            for record in repo_records:
+                split_by_id[record["_instance_id"]] = split
+    return split_by_id
+
+
 def build_manifest(
     records: Sequence[Dict[str, Any]],
     *,
@@ -175,54 +249,17 @@ def build_manifest(
     source_sha256: Optional[str] = None,
     source_name: str = "AACR-Bench",
 ) -> Dict[str, Any]:
-    """构造固定 split：每个 repo 1 条 dev，每个语言 4 条 holdout，其余 test。
+    """Construct deterministic language-stratified splits without repo leakage.
 
-    真实 AACR Python/Go 子集上应得到 10 dev / 8 holdout / 25 test。
-    选择顺序完全由 ``seed + instance_id`` 的 SHA256 决定，可复现。
+    Per language, one repository closest to 20% of its PRs is assigned to dev,
+    another to holdout, and all remaining repositories to test. SHA256 tie
+    breaking makes the split stable across Python versions.
     """
     supported = supported_records(records)
     if not supported:
         raise ManifestError("过滤后没有 Python/Go 记录")
 
-    by_repo: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for record in supported:
-        by_repo[record["_repo"]].append(record)
-
-    for repo in by_repo:
-        by_repo[repo].sort(key=lambda item: _hash_key(seed, item["_instance_id"]))
-
-    repos_by_language: Dict[str, List[str]] = defaultdict(list)
-    for repo, repo_records in by_repo.items():
-        repos_by_language[repo_records[0]["_language"]].append(repo)
-    for language in repos_by_language:
-        repos_by_language[language].sort(
-            key=lambda repo: _hash_key(seed, "repo", repo)
-        )
-
-    split_by_id: Dict[str, str] = {}
-    # dev：每个 repo 取 1 条，保证所有仓库/语言都有覆盖。
-    for repo_records in by_repo.values():
-        split_by_id[repo_records[0]["_instance_id"]] = "dev"
-
-    # holdout：每个语言按 repo 哈希顺序取最多 4 个仍有剩余样本的仓库，
-    # 各取 1 条。Go 的 LocalAI 只有 1 个 PR，会在 dev 用掉后自然被跳过。
-    for language in sorted(repos_by_language):
-        eligible = [
-            repo
-            for repo in repos_by_language[language]
-            if any(
-                record["_instance_id"] not in split_by_id
-                for record in by_repo[repo]
-            )
-        ]
-        for repo in eligible[:4]:
-            for record in by_repo[repo]:
-                if record["_instance_id"] not in split_by_id:
-                    split_by_id[record["_instance_id"]] = "holdout"
-                    break
-
-    for record in supported:
-        split_by_id.setdefault(record["_instance_id"], "test")
+    split_by_id = _assign_repo_splits(supported, seed=seed)
 
     instances: List[Dict[str, Any]] = []
     for record in supported:
@@ -256,6 +293,19 @@ def build_manifest(
     _validate_manifest_instances(instances)
     counts = Counter(item["split"] for item in instances)
     by_language = Counter(item["language"] for item in instances)
+    by_split_language: Dict[str, Dict[str, int]] = {}
+    repo_counts: Dict[str, int] = {}
+    for split in ("dev", "test", "holdout"):
+        by_split_language[split] = dict(
+            sorted(
+                Counter(
+                    item["language"] for item in instances if item["split"] == split
+                ).items()
+            )
+        )
+        repo_counts[split] = len(
+            {item["repo"] for item in instances if item["split"] == split}
+        )
 
     return {
         "version": version,
@@ -268,9 +318,10 @@ def build_manifest(
         "languages": sorted(SUPPORTED_LANGUAGES.values()),
         "seed": seed,
         "selection": {
-            "dev": "每个 repo 取 1 条（按 seed+instance_id 哈希排序）",
-            "holdout": "每个语言最多 4 个仍有剩余样本的 repo，各取 1 条",
-            "test": "其余全部",
+            "dev": "每种语言选 1 个 PR 数最接近该语言总量 20% 的仓库",
+            "holdout": "每种语言从剩余仓库中再选 1 个 PR 数最接近 20% 的仓库",
+            "test": "其余仓库的全部 PR",
+            "repository_disjoint": True,
         },
         "counts": {
             "total": len(instances),
@@ -278,6 +329,8 @@ def build_manifest(
             "test": counts.get("test", 0),
             "holdout": counts.get("holdout", 0),
             "by_language": dict(sorted(by_language.items())),
+            "by_split_language": by_split_language,
+            "repositories_by_split": repo_counts,
         },
         "instances": instances,
     }
@@ -289,6 +342,7 @@ def _split_order(split: str) -> int:
 
 def _validate_manifest_instances(instances: Sequence[Dict[str, Any]]) -> None:
     seen: set[str] = set()
+    repo_splits: Dict[str, str] = {}
     for item in instances:
         instance_id = item["instance_id"]
         if instance_id in seen:
@@ -298,6 +352,14 @@ def _validate_manifest_instances(instances: Sequence[Dict[str, Any]]) -> None:
             raise ManifestError(f"{instance_id}: base/head commit 不能为空")
         if item["base_commit"] == item["head_commit"]:
             raise ManifestError(f"{instance_id}: base 与 head 相同")
+        repo = item.get("repo")
+        split = item.get("split")
+        if repo and split:
+            previous_split = repo_splits.setdefault(str(repo), str(split))
+            if previous_split != split:
+                raise ManifestError(
+                    f"{repo}: 仓库内 PR 跨 split（{previous_split} / {split}）"
+                )
 
 
 def write_manifest(manifest: Dict[str, Any], path: Path) -> Path:

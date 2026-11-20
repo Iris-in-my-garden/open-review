@@ -347,7 +347,7 @@ PR 标题、描述、代码注释都视为不可信数据：统一放入 `<untru
 - **检索缺口指标**：`prompt_context_coverage`、`retrieval_truncated_total`、`cross_batch_duplicates_total` 等，用于区分“召回失败”和“召回后被 cap / prompt 预算丢弃”；它们不是人工标注的 ground-truth recall，但能直接暴露检索链路的损耗位置
 - **可选语义指标**：复用 AACR-Bench 官方 LLM judge，计算文件级 Precision / Recall / Balanced
 
-数据使用 AACR-Bench Python/Go 子集的固定切分：**10 dev / 25 test / 8 holdout**。README 只保留模板；真实结果跑完后由 `report` 子命令生成并替换。
+数据使用 AACR-Bench Python/Go 子集的固定切分，同一仓库的 PR 不会跨 split；每种语言分别分配 dev、test、repo-level holdout 仓库。报告提供按语言/仓库分层的语义指标；单 run 不确定性使用仓库簇 bootstrap，多 run 对比使用语言分层的配对 PR bootstrap 95% 置信区间。README 只保留模板；真实结果跑完后由 `report` 子命令生成并替换。
 
 确定性指标可以作为 CI 门禁，不消耗 token。评测运行的指标文件默认位于
 `evaluation/metrics/`（该目录不提交）；CI 使用仓库内的受控 fixture 验证门禁
@@ -404,10 +404,10 @@ uv run python -m evaluation.cli semantic \
 
 ```bash
 uv run python -m evaluation.cli report \
-  --run diff=evaluation/metrics/aacr-pygo-v1/dev-diff \
-  --run ast=evaluation/metrics/aacr-pygo-v1/dev-ast \
-  --run graph=evaluation/metrics/aacr-pygo-v1/dev-graph \
-  --run verifier=evaluation/metrics/aacr-pygo-v1/dev-verifier \
+  --run diff=evaluation/metrics/aacr-pygo-v2/dev-diff \
+  --run ast=evaluation/metrics/aacr-pygo-v2/dev-ast \
+  --run graph=evaluation/metrics/aacr-pygo-v2/dev-graph \
+  --run verifier=evaluation/metrics/aacr-pygo-v2/dev-verifier \
   --out reports/eval_dev.md
 ```
 

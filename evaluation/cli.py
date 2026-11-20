@@ -23,8 +23,8 @@
 
     # 6) 汇总多次 run 为 Markdown 表格
     python -m evaluation.cli report \
-        --run diff=evaluation/metrics/aacr-pygo-v1/dev-diff \
-        --run graph=evaluation/metrics/aacr-pygo-v1/dev-graph
+        --run diff=evaluation/metrics/aacr-pygo-v2/dev-diff \
+        --run graph=evaluation/metrics/aacr-pygo-v2/dev-graph
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ from evaluation.retrieval import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EVAL_ROOT = PROJECT_ROOT / "evaluation"
-DEFAULT_MANIFEST = EVAL_ROOT / "manifests" / "aacr_pygo_v1.json"
+DEFAULT_MANIFEST = EVAL_ROOT / "manifests" / "aacr_pygo_v2.json"
 DEFAULT_SOURCE = EVAL_ROOT / ".cache" / "aacr" / "positive_samples.json"
 DEFAULT_REPO_CACHE = EVAL_ROOT / ".cache" / "repos"
 DEFAULT_RESULTS_ROOT = EVAL_ROOT / "results"
@@ -660,7 +660,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         required=True,
         metavar="LABEL=METRICS_DIR",
-        help="一次 run，例如 single=evaluation/metrics/aacr-pygo-v1/dev-single",
+        help="一次 run，例如 single=evaluation/metrics/aacr-pygo-v2/dev-single",
     )
     report.add_argument(
         "--semantic",

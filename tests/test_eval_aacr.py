@@ -1,7 +1,10 @@
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from evaluation.aacr import (
+    ManifestError,
     build_manifest,
     instances_for_split,
     load_manifest,
@@ -60,17 +63,25 @@ def test_build_manifest_is_deterministic_and_stratified():
     assert first == second
     assert first["counts"] == {
         "total": 20,
-        "dev": 10,
-        "test": 2,
-        "holdout": 8,
+        "dev": 4,
+        "test": 12,
+        "holdout": 4,
         "by_language": {"Go": 10, "Python": 10},
+        "by_split_language": {
+            "dev": {"Go": 2, "Python": 2},
+            "test": {"Go": 6, "Python": 6},
+            "holdout": {"Go": 2, "Python": 2},
+        },
+        "repositories_by_split": {"dev": 2, "test": 6, "holdout": 2},
     }
     instances = first["instances"]
     assert len({item["instance_id"] for item in instances}) == 20
     assert {item["split"] for item in instances} == {"dev", "test", "holdout"}
-    # 每个 repo 的 dev 样本恰好一条
-    dev_repos = [item["repo"] for item in instances if item["split"] == "dev"]
-    assert len(dev_repos) == len(set(dev_repos)) == 10
+    split_by_repo = {}
+    for item in instances:
+        split_by_repo.setdefault(item["repo"], item["split"])
+        assert split_by_repo[item["repo"]] == item["split"]
+    assert len(split_by_repo) == 10
     assert all(item["base_commit"] != item["head_commit"] for item in instances)
 
 
@@ -81,12 +92,30 @@ def test_manifest_roundtrip_and_split_lookup(tmp_path: Path):
 
     assert loaded == manifest
     dev = instances_for_split(loaded, _records(), "dev")
-    assert len(dev) == 10
+    assert len(dev) == 4
     assert all(item["comments"] for item in dev)
 
     holdout = instances_for_split(loaded, _records(), "holdout")
-    assert len(holdout) == 8
+    assert len(holdout) == 4
     assert {item["language"] for item in holdout} == {"Python", "Go"}
+    assert {item["repo"] for item in dev}.isdisjoint(
+        item["repo"] for item in holdout
+    )
+
+
+def test_manifest_rejects_repository_leakage(tmp_path: Path):
+    manifest = build_manifest(_records(), seed=7)
+    repo = next(
+        item["repo"]
+        for item in manifest["instances"]
+        if item["split"] == "dev"
+    )
+    matching = [item for item in manifest["instances"] if item["repo"] == repo]
+    matching[-1]["split"] = "test"
+    path = write_manifest(manifest, tmp_path / "leaked.json")
+
+    with pytest.raises(ManifestError, match="跨 split"):
+        load_manifest(path)
 
 
 def test_parse_github_pr():

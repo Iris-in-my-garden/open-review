@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import json
+import random
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
@@ -97,6 +99,319 @@ def _first_present(summary: Dict[str, Any], keys: Sequence[str]) -> Optional[flo
     return None
 
 
+def _semantic_rates(counts: Dict[str, int]) -> Dict[str, Optional[float]]:
+    generated = counts["generated"]
+    expected = counts["expected"]
+    precision = counts["matched_generated"] / generated if generated else 0.0
+    recall = counts["matched_reference"] / expected if expected else 0.0
+    balanced = (
+        2 * precision * recall / (precision + recall)
+        if precision + recall
+        else 0.0
+    )
+    return {
+        "instances": counts["instances"],
+        "generated": generated,
+        "expected": expected,
+        "precision": precision,
+        "recall": recall,
+        "balanced": balanced,
+    }
+
+
+def _percentile(values: Sequence[float], percentile: float) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * percentile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
+
+
+def _bootstrap_confidence_intervals(
+    repo_counts: Dict[str, Dict[str, Any]],
+    *,
+    iterations: int = 2000,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """Stratified cluster bootstrap: resample repositories within each language."""
+    repos_by_language: Dict[str, list[str]] = defaultdict(list)
+    for repo, counts in repo_counts.items():
+        language = counts.get("language")
+        if language:
+            repos_by_language[str(language)].append(repo)
+    for repos in repos_by_language.values():
+        repos.sort()
+
+    if not repos_by_language:
+        return {}
+    insufficient_languages = sorted(
+        language
+        for language, repos in repos_by_language.items()
+        if len(repos) < 2
+    )
+
+    rng = random.Random(seed)
+    samples: Dict[str, Dict[str, list[float]]] = {
+        scope: {metric: [] for metric in ("precision", "recall", "balanced")}
+        for scope in ("overall", *sorted(repos_by_language))
+    }
+    for _ in range(iterations):
+        overall = {
+            "instances": 0,
+            "generated": 0,
+            "expected": 0,
+            "matched_generated": 0,
+            "matched_reference": 0,
+        }
+        for language, repos in sorted(repos_by_language.items()):
+            language_total = {
+                "instances": 0,
+                "generated": 0,
+                "expected": 0,
+                "matched_generated": 0,
+                "matched_reference": 0,
+            }
+            for repo in rng.choices(repos, k=len(repos)):
+                source = repo_counts[repo]
+                for key in language_total:
+                    language_total[key] += int(source.get(key, 0))
+            for key in overall:
+                overall[key] += language_total[key]
+            rates = _semantic_rates(language_total)
+            for metric in ("precision", "recall", "balanced"):
+                samples[language][metric].append(float(rates[metric] or 0.0))
+
+        rates = _semantic_rates(overall)
+        for metric in ("precision", "recall", "balanced"):
+            samples["overall"][metric].append(float(rates[metric] or 0.0))
+
+    intervals: Dict[str, Any] = {}
+    for scope, metrics in samples.items():
+        scope_has_enough_clusters = (
+            not insufficient_languages
+            if scope == "overall"
+            else len(repos_by_language[scope]) >= 2
+        )
+        intervals[scope] = {
+            metric: (
+                [
+                    _percentile(values, 0.025),
+                    _percentile(values, 0.975),
+                ]
+                if scope_has_enough_clusters
+                else [None, None]
+            )
+            for metric, values in metrics.items()
+        }
+    return {
+        "method": "language-stratified repository-cluster percentile bootstrap",
+        "confidence_level": 0.95,
+        "iterations": iterations,
+        "seed": seed,
+        "repositories_by_language": {
+            language: len(repos)
+            for language, repos in sorted(repos_by_language.items())
+        },
+        "insufficient_languages": insufficient_languages,
+        "intervals": intervals,
+    }
+
+
+def _semantic_strata(
+    deterministic: Dict[str, Any], semantic: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Aggregate AACR's per-instance judge records by repository and language."""
+    if (semantic.get("ex_info") or {}).get("score_mode", "file_semantic") != (
+        "file_semantic"
+    ):
+        return {}
+    eval_rows = semantic.get("eval_res")
+    if not isinstance(eval_rows, list):
+        return {}
+
+    metadata = {
+        str(row.get("instance_id")): row
+        for row in (deterministic.get("per_instance") or [])
+        if isinstance(row, dict) and row.get("instance_id")
+    }
+    repos: Dict[str, Dict[str, Any]] = {}
+    languages: Dict[str, Dict[str, Any]] = {}
+    by_instance: Dict[str, Dict[str, Any]] = {}
+    for row in eval_rows:
+        if not isinstance(row, dict):
+            continue
+        comments = row.get("comments")
+        generated = row.get("generated_comments")
+        if not isinstance(comments, list) or not isinstance(generated, list):
+            continue
+        instance = metadata.get(str(row.get("instance_id")), {})
+        repo = str(instance.get("repo") or row.get("repo") or "")
+        language = str(instance.get("language") or "")
+        if not repo:
+            continue
+        instance_counts = {
+            "instances": 1,
+            "generated": len(generated),
+            "expected": sum(
+                1 for comment in comments if isinstance(comment, dict)
+            ),
+            "matched_generated": sum(
+                1
+                for comment in generated
+                if isinstance(comment, dict) and comment.get("hit_new_gt")
+            ),
+            "matched_reference": sum(
+                1
+                for comment in comments
+                if isinstance(comment, dict)
+                and comment.get("file_semantic_match")
+            ),
+        }
+        instance_id = str(row.get("instance_id") or "")
+        if instance_id:
+            by_instance[instance_id] = {
+                **instance_counts,
+                "repo": repo,
+                "language": language or "unknown",
+            }
+        if repo not in repos:
+            repos[repo] = {
+                **{key: 0 for key in instance_counts},
+                "language": language or "unknown",
+            }
+        elif language and repos[repo].get("language") not in (
+            "unknown",
+            language,
+        ):
+            raise ValueError(f"仓库 {repo} 在语义结果中出现多个语言")
+        if language:
+            repos[repo]["language"] = language
+        for key, value in instance_counts.items():
+            repos[repo][key] += value
+
+        group_key = language or "unknown"
+        if group_key not in languages:
+            languages[group_key] = {key: 0 for key in instance_counts}
+        for key, value in instance_counts.items():
+            languages[group_key][key] += value
+
+    if not repos:
+        return {}
+    by_repo = {
+        repo: _semantic_rates(counts) for repo, counts in sorted(repos.items())
+    }
+    by_language = {
+        language: _semantic_rates(counts)
+        for language, counts in sorted(languages.items())
+    }
+    return {
+        "by_language": by_language,
+        "by_repo": by_repo,
+        "by_instance": by_instance,
+        "bootstrap_95_ci": _bootstrap_confidence_intervals(repos),
+    }
+
+
+def _paired_bootstrap_comparison(
+    left: Dict[str, Any],
+    right: Dict[str, Any],
+    *,
+    iterations: int = 2000,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    left_instances = (left.get("semantic_strata") or {}).get("by_instance") or {}
+    right_instances = (right.get("semantic_strata") or {}).get("by_instance") or {}
+    common_ids = sorted(set(left_instances) & set(right_instances))
+    if not common_ids:
+        return {}
+
+    ids_by_language: Dict[str, list[str]] = defaultdict(list)
+    for instance_id in common_ids:
+        row = left_instances[instance_id]
+        language = str(row.get("language") or "unknown")
+        ids_by_language[language].append(instance_id)
+        right_language = str(
+            right_instances[instance_id].get("language") or "unknown"
+        )
+        if language != right_language:
+            raise ValueError(
+                f"PR {instance_id} 在两个 run 中语言不一致: "
+                f"{language} / {right_language}"
+            )
+
+    keys = (
+        "instances",
+        "generated",
+        "expected",
+        "matched_generated",
+        "matched_reference",
+    )
+    left_total = {key: 0 for key in keys}
+    right_total = {key: 0 for key in keys}
+    for instance_id in common_ids:
+        for key in keys:
+            left_total[key] += int(left_instances[instance_id].get(key, 0))
+            right_total[key] += int(right_instances[instance_id].get(key, 0))
+    left_rates = _semantic_rates(left_total)
+    right_rates = _semantic_rates(right_total)
+    metrics = ("precision", "recall", "balanced")
+    point_delta = {
+        metric: float(left_rates[metric] or 0.0)
+        - float(right_rates[metric] or 0.0)
+        for metric in metrics
+    }
+
+    rng = random.Random(seed)
+    samples: Dict[str, list[float]] = {metric: [] for metric in metrics}
+    enough_pairs_per_stratum = all(
+        len(instance_ids) >= 2 for instance_ids in ids_by_language.values()
+    )
+    for _ in range(iterations):
+        sampled_left = {key: 0 for key in keys}
+        sampled_right = {key: 0 for key in keys}
+        for instance_ids in ids_by_language.values():
+            for instance_id in rng.choices(instance_ids, k=len(instance_ids)):
+                for key in keys:
+                    sampled_left[key] += int(left_instances[instance_id].get(key, 0))
+                    sampled_right[key] += int(right_instances[instance_id].get(key, 0))
+        left_sample_rates = _semantic_rates(sampled_left)
+        right_sample_rates = _semantic_rates(sampled_right)
+        for metric in metrics:
+            samples[metric].append(
+                float(left_sample_rates[metric] or 0.0)
+                - float(right_sample_rates[metric] or 0.0)
+            )
+
+    return {
+        "left": left["config"],
+        "right": right["config"],
+        "paired_instances": len(common_ids),
+        "language_strata": {
+            language: len(instance_ids)
+            for language, instance_ids in sorted(ids_by_language.items())
+        },
+        "delta_left_minus_right": point_delta,
+        "bootstrap_95_ci": {
+            metric: (
+                [
+                    _percentile(values, 0.025),
+                    _percentile(values, 0.975),
+                ]
+                if enough_pairs_per_stratum
+                else [None, None]
+            )
+            for metric, values in samples.items()
+        },
+        "sufficient_pairs_per_language": enough_pairs_per_stratum,
+        "method": "language-stratified paired PR bootstrap",
+        "iterations": iterations,
+        "seed": seed,
+    }
+
+
 def build_row(
     label: str,
     deterministic: Dict[str, Any],
@@ -148,6 +463,7 @@ def build_row(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
+        "semantic_strata": _semantic_strata(deterministic, semantic),
     }
 
 
@@ -181,6 +497,22 @@ def _format_latency(value: Any) -> str:
     if not isinstance(value, (int, float)):
         return "-"
     return f"{float(value):.1f}s"
+
+
+def _format_ci(values: Any) -> str:
+    if (
+        not isinstance(values, list)
+        or len(values) != 2
+        or not all(isinstance(value, (int, float)) for value in values)
+    ):
+        return "-"
+    return f"{float(values[0]) * 100:.1f}–{float(values[1]) * 100:.1f}%"
+
+
+def _format_delta(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "-"
+    return f"{float(value) * 100:+.1f}%"
 
 
 def render_table(rows: Sequence[Dict[str, Any]]) -> str:
@@ -270,6 +602,106 @@ def render_report(
     ]
     for spec in specs:
         lines.append(f"- **{spec.label}**: `{spec.path}`")
+    stratified_rows = [
+        row for row in rows if row.get("semantic_strata")
+    ]
+    if stratified_rows:
+        lines.extend(
+            [
+                "",
+                "## 语义指标分层与置信区间",
+                "",
+                "分层指标基于 AACR 每个 PR 的 judge 记录计算。单 run 的 95% CI 使用"
+                "语言分层的仓库簇 bootstrap；配置对比则对相同 PR 做配对 bootstrap。"
+                "固定 seed=42；任一语言少于 2 个仓库簇/配对 PR 时不报告区间，"
+                "以免给出虚假的零宽区间。",
+                "",
+            ]
+        )
+        for row in stratified_rows:
+            strata = row["semantic_strata"]
+            lines.extend(
+                [
+                    f"### {row['config']}",
+                    "",
+                    "| Group | N | Precision | Recall | Balanced |",
+                    "|---|---:|---:|---:|---:|",
+                ]
+            )
+            for language, metrics in strata.get("by_language", {}).items():
+                lines.append(
+                    "| {} | {} | {} | {} | {} |".format(
+                        language,
+                        metrics["instances"],
+                        _format_rate(metrics["precision"]),
+                        _format_rate(metrics["recall"]),
+                        _format_rate(metrics["balanced"]),
+                    )
+                )
+            for repo, metrics in strata.get("by_repo", {}).items():
+                lines.append(
+                    "| {} | {} | {} | {} | {} |".format(
+                        repo,
+                        metrics["instances"],
+                        _format_rate(metrics["precision"]),
+                        _format_rate(metrics["recall"]),
+                        _format_rate(metrics["balanced"]),
+                    )
+                )
+            lines.extend(
+                [
+                    "",
+                    "| Scope | Precision 95% CI | Recall 95% CI | Balanced 95% CI |",
+                    "|---|---:|---:|---:|",
+                ]
+            )
+            intervals = (
+                strata.get("bootstrap_95_ci", {}).get("intervals", {})
+            )
+            for scope in ("overall", *strata.get("by_language", {}).keys()):
+                interval = intervals.get(scope, {})
+                lines.append(
+                    "| {} | {} | {} | {} |".format(
+                        scope,
+                        _format_ci(interval.get("precision")),
+                        _format_ci(interval.get("recall")),
+                        _format_ci(interval.get("balanced")),
+                    )
+                )
+            lines.append("")
+    comparisons = [
+        _paired_bootstrap_comparison(left, right)
+        for left_index, left in enumerate(stratified_rows)
+        for right in stratified_rows[left_index + 1 :]
+    ]
+    comparisons = [comparison for comparison in comparisons if comparison]
+    if comparisons:
+        lines.extend(
+            [
+                "## 配置间配对比较",
+                "",
+                "对相同 PR 计算左侧配置减右侧配置的差值，并在语言层内对 PR 有放回"
+                "抽样；每次抽样在两个配置间使用相同的 PR，给出配对 95% bootstrap CI。",
+                "",
+                "| Comparison | Paired PRs | Metric | Δ (left − right) | 95% paired bootstrap CI |",
+                "|---|---:|---|---:|---:|",
+            ]
+        )
+        for comparison in comparisons:
+            deltas = comparison["delta_left_minus_right"]
+            intervals = comparison["bootstrap_95_ci"]
+            for metric in ("precision", "recall", "balanced"):
+                lines.append(
+                    "| {} vs {} | {} | {} | {} | {} |".format(
+                        comparison["left"],
+                        comparison["right"],
+                        comparison["paired_instances"],
+                        metric,
+                        _format_delta(deltas[metric]),
+                        _format_ci(intervals[metric]),
+                    )
+                )
+        lines.append("")
     lines.append("")
     return "\n".join(lines)
 

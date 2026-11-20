@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 
@@ -5,9 +6,12 @@ import pytest
 
 from evaluation.cli import main
 from evaluation.report import (
+    RunSpec,
+    _bootstrap_confidence_intervals,
     build_row,
     load_run,
     parse_run_spec,
+    render_report,
     render_table,
 )
 
@@ -114,6 +118,93 @@ def test_missing_semantic_file_renders_dash(tmp_path: Path):
     assert row["precision"] is None
     table = render_table([row])
     assert "| mock | 1/1 | 0 | - | - | - |" in table
+
+
+def test_semantic_strata_and_repository_bootstrap_are_reproducible():
+    deterministic = {
+        "per_instance": [
+            {"instance_id": "py-1", "repo": "owner/py-one", "language": "Python"},
+            {"instance_id": "py-2", "repo": "owner/py-two", "language": "Python"},
+            {"instance_id": "go-1", "repo": "owner/go-one", "language": "Go"},
+            {"instance_id": "go-2", "repo": "owner/go-two", "language": "Go"},
+        ]
+    }
+    semantic = {
+        "ex_info": {"score_mode": "file_semantic"},
+        "eval_res": [
+            {
+                "instance_id": "py-1",
+                "repo": "owner/py-one",
+                "comments": [{"note": "a", "file_semantic_match": True}],
+                "generated_comments": [{"hit_new_gt": True}],
+            },
+            {
+                "instance_id": "py-2",
+                "repo": "owner/py-two",
+                "comments": [{"note": "b", "file_semantic_match": False}],
+                "generated_comments": [{"hit_new_gt": False}],
+            },
+            {
+                "instance_id": "go-1",
+                "repo": "owner/go-one",
+                "comments": [
+                    {"note": "c", "file_semantic_match": True},
+                    {"note": "d", "file_semantic_match": False},
+                ],
+                "generated_comments": [{"hit_new_gt": True}],
+            },
+            {
+                "instance_id": "go-2",
+                "repo": "owner/go-two",
+                "comments": [{"note": "e", "file_semantic_match": False}],
+                "generated_comments": [{"hit_new_gt": False}],
+            },
+        ],
+    }
+    row = build_row("grouped", deterministic, {}, semantic)
+    repeat = build_row("grouped", deterministic, {}, semantic)
+    strata = row["semantic_strata"]
+
+    assert strata["by_language"]["Python"]["instances"] == 2
+    assert strata["by_language"]["Python"]["precision"] == 0.5
+    assert strata["by_language"]["Go"]["recall"] == 1 / 3
+    assert strata["by_repo"]["owner/py-one"]["balanced"] == 1.0
+    assert strata["bootstrap_95_ci"] == repeat["semantic_strata"]["bootstrap_95_ci"]
+    overall_ci = strata["bootstrap_95_ci"]["intervals"]["overall"]
+    assert 0.0 <= overall_ci["balanced"][0] <= overall_ci["balanced"][1] <= 1.0
+    singleton_ci = _bootstrap_confidence_intervals(
+        {
+            "owner/only-repo": {
+                "language": "Go",
+                "instances": 1,
+                "generated": 1,
+                "expected": 1,
+                "matched_generated": 1,
+                "matched_reference": 1,
+            }
+        }
+    )
+    assert singleton_ci["intervals"]["overall"]["balanced"] == [None, None]
+
+    report = render_report([RunSpec("grouped", Path("metrics"))], [row])
+    assert "## 语义指标分层与置信区间" in report
+    assert "仓库簇 bootstrap" in report
+    assert "owner/py-one" in report
+    assert "Python" in report
+
+    improved_semantic = copy.deepcopy(semantic)
+    improved_semantic["eval_res"][1]["comments"][0][
+        "file_semantic_match"
+    ] = True
+    improved_semantic["eval_res"][1]["generated_comments"][0]["hit_new_gt"] = True
+    improved = build_row("improved", deterministic, {}, improved_semantic)
+    comparison_report = render_report(
+        [RunSpec("grouped", Path("metrics")), RunSpec("improved", Path("metrics"))],
+        [row, improved],
+    )
+    assert "## 配置间配对比较" in comparison_report
+    assert "grouped vs improved" in comparison_report
+    assert "Paired PRs" in comparison_report
 
 
 def test_parse_run_spec_rejects_malformed_value():

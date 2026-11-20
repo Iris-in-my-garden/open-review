@@ -172,6 +172,8 @@ def compute_deterministic_metrics(
         row: Dict[str, Any] = {
             "instance_id": instance_id,
             "split": instance.get("split"),
+            "repo": instance.get("repo"),
+            "language": instance.get("language"),
             "status": "missing",
             "issues": 0,
         }
