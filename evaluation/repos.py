@@ -11,7 +11,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 DEFAULT_TIMEOUT = 1800
 
@@ -124,7 +124,7 @@ def ensure_repo(
     *,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> Path:
-    """返回一个包含 base/head commit 的本地仓库（不 checkout）。"""
+    """返回包含所需 commits 的本地仓库；对象已缓存时不发起网络 fetch。"""
     path = repo_cache_path(cache_dir, repo)
     if not (path / ".git").exists():
         if path.exists():
@@ -132,21 +132,45 @@ def ensure_repo(
             shutil.rmtree(path, ignore_errors=True)
         print(f"[repo] clone {repo} -> {path}")
         _clone(path, clone_url, timeout=timeout)
-    else:
-        # 已有缓存：先尝试更新 refs；失败不致命，只要 commit 已存在即可。
-        run_git(
-            path,
-            "fetch",
-            "--all",
-            "--tags",
-            "--prune",
-            timeout=timeout,
-            check=False,
-        )
 
+    # Cached commits need no network access. Fetch only when a required object
+    # is missing; ensure_commit falls back to a full fetch if a direct fetch fails.
     ensure_commit(path, base_commit, timeout=timeout)
     ensure_commit(path, head_commit, timeout=timeout)
     return path
+
+
+def prepare_repositories(
+    instances: Sequence[Dict[str, Any]],
+    *,
+    cache_dir: Path,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> int:
+    """Pre-populate repo caches and all requested base/head commits."""
+    by_repo: Dict[str, List[Dict[str, Any]]] = {}
+    for instance in instances:
+        by_repo.setdefault(instance["repo"], []).append(instance)
+
+    for repo, repo_instances in by_repo.items():
+        first = repo_instances[0]
+        repo_path = ensure_repo(
+            cache_dir,
+            repo,
+            first.get("clone_url") or f"https://github.com/{repo}.git",
+            first["base_commit"],
+            first["head_commit"],
+            timeout=timeout,
+        )
+        commits = {
+            commit
+            for instance in repo_instances
+            for commit in (instance["base_commit"], instance["head_commit"])
+        }
+        commits.discard(first["base_commit"])
+        commits.discard(first["head_commit"])
+        for commit in sorted(commits):
+            ensure_commit(repo_path, commit, timeout=timeout)
+    return len(by_repo)
 
 
 def read_file_at_commit(

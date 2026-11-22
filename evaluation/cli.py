@@ -222,6 +222,44 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prepare_repos(args: argparse.Namespace) -> int:
+    from evaluation.repos import prepare_repositories
+
+    _, instances = _load_manifest_instances(args)
+    count = prepare_repositories(instances, cache_dir=args.repo_cache)
+    print(
+        f"[repo-cache] prepared {count} unique repositories "
+        f"for {len(instances)} instances"
+    )
+    return 0
+
+
+def cmd_check_run(args: argparse.Namespace) -> int:
+    from evaluation.results import has_reusable_results
+    from evaluation.run_config import expected_run_config
+
+    manifest, instances = _load_manifest_instances(args)
+    results_dir = args.results_dir or _resolve_run_dir(
+        DEFAULT_RESULTS_ROOT, manifest["version"], args.run_id
+    )
+    config = expected_run_config(
+        manifest_path=args.manifest,
+        split=args.split,
+        ablation=args.ablation,
+        model=args.model,
+        base_url=args.base_url,
+    )
+    if has_reusable_results(
+        instances,
+        results_dir=results_dir,
+        evaluation_config=config,
+    ):
+        print(f"[reuse] complete compatible results found: {results_dir}")
+        return 0
+    print(f"[reuse] compatible complete results not found: {results_dir}")
+    return 1
+
+
 def cmd_review(args: argparse.Namespace) -> int:
     from evaluation.results import run_reviews
     from openreview.services.review_service import ReviewPipeline
@@ -315,6 +353,16 @@ def cmd_review(args: argparse.Namespace) -> int:
     review_cache_dir = args.review_cache_dir
     if args.review_cache and not review_cache_dir:
         review_cache_dir = EVAL_ROOT / ".cache" / "review"
+    from evaluation.run_config import expected_run_config
+
+    evaluation_config = expected_run_config(
+        manifest_path=args.manifest,
+        split=args.split,
+        ablation=args.ablation,
+        model=args.model,
+        base_url=args.base_url,
+        mock_llm=args.mock_llm,
+    )
     pipeline = ReviewPipeline(
         mock_llm=args.mock_llm,
         llm_model=args.model,
@@ -337,6 +385,7 @@ def cmd_review(args: argparse.Namespace) -> int:
             fail_fast=args.fail_fast,
             limit=None,
             resume=args.resume,
+            evaluation_config=evaluation_config,
         )
     finally:
         pipeline.close()
@@ -609,6 +658,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="跳过 SHA256 校验（仅用于本地 fixture / 镜像数据）",
     )
+
+    prepare_repos = sub.add_parser(
+        "prepare-repos",
+        parents=[common],
+        help="预热评测仓库缓存并确保所需 base/head commits 可用",
+    )
+    prepare_repos.set_defaults(func=cmd_prepare_repos)
+
+    check_run = sub.add_parser(
+        "check-run", parents=[common], help=argparse.SUPPRESS
+    )
+    check_run.add_argument("--results-dir", type=Path, default=None)
+    check_run.add_argument("--ablation", choices=["diff", "ast", "graph", "verifier"])
+    check_run.add_argument("--model", default=None)
+    check_run.add_argument("--base-url", default=None)
+    check_run.set_defaults(func=cmd_check_run)
 
     review = sub.add_parser("review", parents=[common], help="调用 run_local 跑评测")
     review.add_argument("--results-dir", type=Path, default=None)

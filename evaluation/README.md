@@ -134,6 +134,9 @@ uv run python -m evaluation.cli gate \
 四档也可以一键串起来（review → metrics → gate → 可选 semantic → report）：
 
 ```bash
+# 可选：预先下载 split 涉及的仓库和所有 base/head commits
+uv run python -m evaluation.cli prepare-repos --split dev
+
 # 实际检索上下文并估算 prompt；必要时 clone/fetch，但不调用 LLM
 ./evaluation/run_ablation.sh --dry-run --split dev --limit 1
 
@@ -152,6 +155,10 @@ uv run python -m evaluation.cli gate \
 
 脚本会为每档生成 `dev-diff / dev-ast / dev-graph / dev-verifier` 四个 run-id；
 gate 未通过时会继续跑完其余档位，最后以非零退出码提示。
+非 dry-run 会在 review 前按唯一仓库预热仓库与所需 commits；若目标 commit 已缓存，
+后续评测不再重复 fetch。启用 `--semantic` 时，脚本先验证已有逐样本结果的状态、
+manifest、ablation、模型和代码工件版本；完整匹配的档位直接复用，不匹配/缺失的样本
+才补跑。旧结果没有这些元数据时不会被自动复用，以免混淆模型或配置。
 
 ### 4. 真实模型（按需，消耗 token）
 

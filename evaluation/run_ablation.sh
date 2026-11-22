@@ -47,8 +47,8 @@ usage() {
   --run-budget-tokens N      单个 PR run 的运行时输入 token 上限
   --budget-calls N           单个 PR run 的 LLM 调用上限
   --dry-run                  实际检索上下文并估算 prompt；不调用 LLM
-  --resume                   跳过已成功的样本
-  --semantic                 额外跑 AACR 官方语义评测
+  --resume                   跳过已有成功且配置匹配的结果
+  --semantic                 复用配置匹配的完整结果；缺失时补跑 review，再跑 AACR judge
   --aacr-eval-dir DIR        AACR 的 evaluation/ 目录（--semantic 必需）
   --no-verify-source         跳过数据集 SHA256 校验（仅本地 fixture / 镜像）
   --report-out PATH          汇总报告输出路径（默认 reports/eval_<split>.md）
@@ -112,6 +112,11 @@ fi
 run_review() {
   local level="$1"
   local run_id="${SPLIT}-${level}"
+  if [[ "$SEMANTIC" -eq 1 ]] && is_reusable_level "$level"; then
+    echo "==> [$level] 复用已存在且配置匹配的 review 结果"
+    return 0
+  fi
+
   local -a cmd=(
     "${PYTHON[@]}" -m evaluation.cli review
     --manifest "$MANIFEST"
@@ -124,12 +129,26 @@ run_review() {
   if [[ -n "$PREFLIGHT_TOKENS" ]]; then cmd+=(--preflight-tokens "$PREFLIGHT_TOKENS"); fi
   if [[ -n "$RUN_BUDGET_TOKENS" ]]; then cmd+=(--run-budget-tokens "$RUN_BUDGET_TOKENS"); fi
   if [[ -n "$BUDGET_CALLS" ]]; then cmd+=(--budget-calls "$BUDGET_CALLS"); fi
-  if [[ "$RESUME" -eq 1 ]]; then cmd+=(--resume); fi
+  if [[ "$RESUME" -eq 1 || "$SEMANTIC" -eq 1 ]]; then cmd+=(--resume); fi
   if [[ "$DRY_RUN" -eq 1 ]]; then cmd+=(--dry-run); fi
   if [[ "$NO_VERIFY" -eq 1 ]]; then cmd+=(--no-verify-source); fi
 
   echo ""
   echo "==> [$level] review ($run_id)"
+  "${cmd[@]}"
+}
+
+is_reusable_level() {
+  local level="$1"
+  local -a cmd=(
+    "${PYTHON[@]}" -m evaluation.cli check-run
+    --manifest "$MANIFEST"
+    --split "$SPLIT"
+    --run-id "${SPLIT}-${level}"
+    --ablation "$level"
+  )
+  if [[ -n "$LIMIT" ]]; then cmd+=(--limit "$LIMIT"); fi
+  if [[ -n "$MODEL" ]]; then cmd+=(--model "$MODEL"); fi
   "${cmd[@]}"
 }
 
@@ -176,6 +195,30 @@ run_metrics_and_gate() {
 }
 
 GATE_FAILED=0
+
+NEEDS_REVIEW=0
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  if [[ "$SEMANTIC" -eq 1 ]]; then
+    for level in "${LEVEL_ARRAY[@]}"; do
+      if ! is_reusable_level "$level"; then
+        NEEDS_REVIEW=1
+      fi
+    done
+  else
+    NEEDS_REVIEW=1
+  fi
+  if [[ "$NEEDS_REVIEW" -eq 1 ]]; then
+    echo ""
+    echo "==> 预热仓库缓存（按唯一仓库准备，并确保所需 commits 可用）"
+    prepare_cmd=(
+      "${PYTHON[@]}" -m evaluation.cli prepare-repos
+      --manifest "$MANIFEST"
+      --split "$SPLIT"
+    )
+    if [[ -n "$LIMIT" ]]; then prepare_cmd+=(--limit "$LIMIT"); fi
+    "${prepare_cmd[@]}"
+  fi
+fi
 
 for level in "${LEVEL_ARRAY[@]}"; do
   run_review "$level"

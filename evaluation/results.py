@@ -149,6 +149,7 @@ def run_reviews(
     fail_fast: bool = False,
     limit: Optional[int] = None,
     resume: bool = False,
+    evaluation_config: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """逐条调用 ``pipeline.run_local`` 并把结果落盘。
 
@@ -173,7 +174,17 @@ def run_reviews(
                 existing = json.loads(existing_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 existing = None
-            if isinstance(existing, dict) and existing.get("status") == "ok":
+            config_matches = isinstance(existing, dict) and (
+                evaluation_config is None
+                or existing.get("evaluation_config") == evaluation_config
+            )
+            if (
+                isinstance(existing, dict)
+                and existing.get("status") == "ok"
+                and config_matches
+                and existing.get("base_commit") == instance["base_commit"]
+                and existing.get("head_commit") == instance["head_commit"]
+            ):
                 review = existing.get("review") or {}
                 print("  [resume] skip existing ok result")
                 rows.append(
@@ -260,6 +271,9 @@ def run_reviews(
                 raise
             print(f"  ! {payload['error']}")
 
+        if evaluation_config is not None:
+            payload["evaluation_config"] = evaluation_config
+
         out_path = write_result(results_dir, payload)
         rows.append(
             {
@@ -282,3 +296,36 @@ def run_reviews(
     succeeded = sum(1 for row in rows if row["status"] == "ok")
     print(f"[done] {succeeded}/{len(rows)} ok; summary -> {summary_path}")
     return rows
+
+
+def has_reusable_results(
+    instances: List[Dict[str, Any]],
+    *,
+    results_dir: Path,
+    evaluation_config: Dict[str, Any],
+) -> bool:
+    """Return whether every requested instance has a complete compatible result."""
+    for instance in instances:
+        path = result_path(results_dir, instance["instance_id"])
+        if not path.is_file():
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        review = payload.get("review")
+        if (
+            payload.get("status") != "ok"
+            or payload.get("instance_id") != instance["instance_id"]
+            or payload.get("base_commit") != instance["base_commit"]
+            or payload.get("head_commit") != instance["head_commit"]
+            or payload.get("evaluation_config") != evaluation_config
+            or not isinstance(review, dict)
+            or not isinstance(review.get("comments"), list)
+            or not isinstance(review.get("summary"), dict)
+            or not isinstance(review.get("metrics"), dict)
+        ):
+            return False
+    return bool(instances)
