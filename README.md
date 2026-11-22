@@ -23,16 +23,9 @@ flowchart TD
 
 工作流节点显式编排；模型调用、预算和错误都按单次 run 跟踪。设计权衡、异常路径和局限见[架构说明](docs/ARCHITECTURE.md)。
 
-## 消融结果
+## 评测状态
 
-评测工具支持从纯 Diff 到 AST、代码图谱和 Verifier 的固定对照。**质量和成本评测尚未完成，空白单元格不是零值或结论。**评测集配置：AACR-Bench Python/Go 子集，共 43 个 PR、10 个仓库，按仓库隔离为 dev/test/holdout（7/26/10 个 PR）。
-
-| 配置 | 相对上一档 | 语义质量 | 检索覆盖 | 调用 / Token | 延迟 |
-|---|---|---:|---:|---:|---:|
-| `diff` | 仅 Patch |  |  |  |  |
-| `ast` | + AST 上下文 |  |  |  |  |
-| `graph` | + 代码图谱 |  |  |  |  |
-| `verifier` | + Finding 复核 |  |  |  |  |
+评测工具支持从纯 Diff 到 AST、代码图谱和 Verifier 的固定对照（43 个 PR / 10 个仓库，按仓库互斥切分 dev/test/holdout）。**质量与成本评测尚未完成，空白不是 0，也不是结论。**指标定义、切分方法与复现步骤见[评测方法](docs/architecture/08-evaluation.md)。
 
 ## Quickstart
 
@@ -66,8 +59,14 @@ uv run openreview review https://github.com/owner/repo/pull/123 \
 
 输入 Token 使用字符估算，估算误差可能使已发出的单次请求超过上限；时间预算约束 LLM 请求，不等同于整个流程的墙钟超时。Mock 仅验证链路，不代表审查效果。
 
-**工程状态：**当前 335 项测试通过，ruff 与全包 mypy 检查通过。评测框架和固定样本已准备，实际质量结果待补。
+**工程状态：**当前 338 项测试通过（`uv run pytest -q`，2026-11-20），ruff 与全包 mypy 检查通过。评测框架和固定样本已准备，实际质量结果待补。
 
 ---
 
-详细设计与局限见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)；评测复现步骤见 [`evaluation/README.md`](evaluation/README.md)。
+## 文档
+
+- [架构地图](docs/ARCHITECTURE.md)：系统边界、生命周期、关键决策索引
+- [架构决策 ADR](docs/decisions/)：有界工作流、结构化检索、预算下沉、单遍审查、partial outcome
+- [节点与预算契约](docs/architecture/03-workflow.md)：13 个节点的输入/输出/失败语义
+- [评测方法](docs/architecture/08-evaluation.md)：指标定义、数据切分、四档消融、当前状态
+- [评测复现步骤](evaluation/README.md)
