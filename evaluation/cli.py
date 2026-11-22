@@ -90,6 +90,19 @@ def _load_dataset(args: argparse.Namespace):
     return manifest, instances
 
 
+def _load_manifest_instances(args: argparse.Namespace):
+    """Dry-run only needs pinned repo/commit metadata, not reference comments."""
+    manifest = load_manifest(args.manifest)
+    instances = [
+        item
+        for item in manifest["instances"]
+        if args.split == "all" or item["split"] == args.split
+    ]
+    if args.limit is not None:
+        instances = instances[: args.limit]
+    return manifest, instances
+
+
 def _restrict_to_actual_run(
     instances: list[dict], results_dir: Path
 ) -> list[dict]:
@@ -213,13 +226,15 @@ def cmd_review(args: argparse.Namespace) -> int:
     from evaluation.results import run_reviews
     from openreview.services.review_service import ReviewPipeline
 
-    manifest, instances = _load_dataset(args)
+    manifest, instances = (
+        _load_manifest_instances(args) if args.dry_run else _load_dataset(args)
+    )
     run_id = args.run_id or _default_run_id()
     results_dir = args.results_dir or _resolve_run_dir(
         DEFAULT_RESULTS_ROOT, manifest["version"], run_id
     )
 
-    if args.dry_run or args.preflight_tokens is not None:
+    if args.preflight_tokens is not None:
         estimate = _estimate_aacr_review(
             instances,
             ablation=args.ablation,
@@ -231,8 +246,6 @@ def cmd_review(args: argparse.Namespace) -> int:
             "total_tokens={total_tokens}".format(**estimate)
         )
         print(f"[estimate] assumption: {estimate['assumption']}")
-        if args.dry_run:
-            return 0
         if estimate["total_tokens"] > args.preflight_tokens:
             print(
                 "error: estimated {} tokens exceeds --preflight-tokens {}; "
@@ -242,6 +255,62 @@ def cmd_review(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+
+    if args.dry_run:
+        import json
+
+        from evaluation.context_dry_run import build_context_dry_run
+        from evaluation.repos import ensure_repo
+
+        pipeline = ReviewPipeline(
+            mock_llm=True,
+            ablation=args.ablation,
+        )
+        try:
+            reports = []
+            for index, instance in enumerate(instances, start=1):
+                repo = ensure_repo(
+                    args.repo_cache,
+                    instance["repo"],
+                    instance.get("clone_url")
+                    or f"https://github.com/{instance['repo']}.git",
+                    instance["base_commit"],
+                    instance["head_commit"],
+                )
+                print(
+                    f"[dry-run {index}/{len(instances)}] "
+                    f"{instance['instance_id']}",
+                    file=sys.stderr,
+                )
+                reports.append(
+                    build_context_dry_run(
+                        instance,
+                        repo_path=repo,
+                        pipeline=pipeline,
+                    )
+                )
+        finally:
+            pipeline.close()
+
+        report = {
+            "llm_called": False,
+            "token_estimator": (
+                "openreview.review.token_budget.estimate_tokens "
+                "(heuristic, not provider tokenizer)"
+            ),
+            "instances": reports,
+            "final_prompt_tokens_estimate": sum(
+                item["final_prompt_tokens_estimate"] for item in reports
+            ),
+        }
+        rendered = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+        if args.dry_run_output:
+            args.dry_run_output.parent.mkdir(parents=True, exist_ok=True)
+            args.dry_run_output.write_text(rendered, encoding="utf-8")
+            print(f"[dry-run] detail report -> {args.dry_run_output}")
+        else:
+            print(rendered, end="")
+        return 0
 
     review_cache_dir = args.review_cache_dir
     if args.review_cache and not review_cache_dir:
@@ -568,7 +637,13 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument(
         "--dry-run",
         action="store_true",
-        help="只打印 preflight token 估算，不 clone 仓库、不调用 LLM",
+        help="准备真实仓库并检索上下文，输出逐段文本和 prompt 估算；不调用 LLM",
+    )
+    review.add_argument(
+        "--dry-run-output",
+        type=Path,
+        default=None,
+        help="dry-run JSON 详细报告路径；缺省输出到 stdout",
     )
     review.add_argument(
         "--preflight-tokens",

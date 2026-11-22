@@ -134,8 +134,8 @@ uv run python -m evaluation.cli gate \
 四档也可以一键串起来（review → metrics → gate → 可选 semantic → report）：
 
 ```bash
-# 先估算，不 clone、不调用 LLM
-./evaluation/run_ablation.sh --dry-run --split dev
+# 实际检索上下文并估算 prompt；必要时 clone/fetch，但不调用 LLM
+./evaluation/run_ablation.sh --dry-run --split dev --limit 1
 
 # 真实运行四档
 ./evaluation/run_ablation.sh \
@@ -158,10 +158,12 @@ gate 未通过时会继续跑完其余档位，最后以非零退出码提示。
 ```bash
 export OPENAI_API_KEY=...
 
-# 先看 token 估算，不 clone、不调用 LLM
+# 实际检索上下文并估算 prompt；可能 clone/fetch 仓库，但不调用 LLM
 uv run python -m evaluation.cli review \
   --split dev \
-  --dry-run
+  --limit 1 \
+  --dry-run \
+  --dry-run-output reports/context-dry-run.json
 
 # 再跑一条 smoke，确认 API、token 预算和结果落盘
 uv run python -m evaluation.cli review \
@@ -183,6 +185,11 @@ uv run python -m evaluation.cli review \
 
 两个 token 参数语义不同：
 
+- `--dry-run` 会确保仓库和 base/head commit 可用（必要时 clone/fetch），创建临时
+  worktree 并执行真实检索、上下文规划和 prompt 构建；不会调用 LLM，也不会写评测结果。
+  JSON 报告逐段包含 context 文本、类型、优先级、片段/注入段 token 估算，以及每个
+  batch 的 system/user/final prompt token 估算。文本会按实际 prompt 路径脱敏。
+  `estimate_tokens` 是启发式估算，不是 provider tokenizer；真实 token 用量只有模型响应后可知。
 - `--preflight-tokens` 是 **split 级预检**：用 manifest 的变更行数/评论数，
   并按 ablation 档位粗略加上检索上下文 token，超过上限就在任何 LLM 调用前退出。
   它是 lower bound：不模拟 batching、重试和真实 `max_context_tokens` 截断。

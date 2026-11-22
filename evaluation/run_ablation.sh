@@ -12,7 +12,7 @@
 # 注意：
 #   - 四档必须使用同一个 --model、同一份 manifest、同一个 --split。
 #   - --preflight-tokens 是整批预检；--run-budget-tokens 是单个 PR 的运行时上限。
-#   - --dry-run 只打印估算，不 clone 仓库、不调用 LLM。
+#   - --dry-run 会实际检索上下文并估算 prompt，必要时 clone/fetch；不会调用 LLM。
 
 set -euo pipefail
 
@@ -46,7 +46,7 @@ usage() {
   --preflight-tokens N       split 级 token 预检；超限则在调用 LLM 前退出
   --run-budget-tokens N      单个 PR run 的运行时输入 token 上限
   --budget-calls N           单个 PR run 的 LLM 调用上限
-  --dry-run                  只打印每档 token 估算，不 clone、不调用 LLM
+  --dry-run                  实际检索上下文并估算 prompt；不调用 LLM
   --resume                   跳过已成功的样本
   --semantic                 额外跑 AACR 官方语义评测
   --aacr-eval-dir DIR        AACR 的 evaluation/ 目录（--semantic 必需）
@@ -183,7 +183,7 @@ done
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo ""
-  echo "dry-run 完成：只打印了估算，没有 clone 仓库或调用 LLM。"
+  echo "dry-run 完成：已实际检索上下文并估算 prompt，没有调用 LLM。"
   exit 0
 fi
 
