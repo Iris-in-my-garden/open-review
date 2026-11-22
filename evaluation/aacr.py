@@ -20,10 +20,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 AACR_REPO_URL = "https://github.com/alibaba/aacr-bench"
 AACR_DATA_URL = (
-    "https://raw.githubusercontent.com/alibaba/aacr-bench/main/dataset/positive_samples.json"
+    "https://raw.githubusercontent.com/alibaba/aacr-bench/main/dataset/v2/positive_samples.json"
 )
 AACR_DATA_SHA256 = (
-    "02c8561f1c3994a26f427d479b2a3f6e6c8e6858161fbc903b45248fa2cb2097"
+    "3af6de43e6b5f79ae7cbf58207e3c5b2db02ffe51562e050b047503140297c61"
 )
 SUPPORTED_LANGUAGES = {"python": "Python", "go": "Go"}
 MANIFEST_VERSION = "aacr-pygo-v2"
