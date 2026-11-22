@@ -200,7 +200,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         DEFAULT_RESULTS_ROOT, manifest["version"], run_id
     )
 
-    if args.estimate_only or args.budget_tokens is not None:
+    if args.dry_run or args.preflight_tokens is not None:
         estimate = _estimate_aacr_review(
             instances,
             ablation=args.ablation,
@@ -211,13 +211,13 @@ def cmd_review(args: argparse.Namespace) -> int:
             "total_tokens={total_tokens}".format(**estimate)
         )
         print(f"[estimate] assumption: {estimate['assumption']}")
-        if args.estimate_only:
+        if args.dry_run:
             return 0
-        if estimate["total_tokens"] > args.budget_tokens:
+        if estimate["total_tokens"] > args.preflight_tokens:
             print(
-                "error: estimated {} tokens exceeds --budget-tokens {}; "
+                "error: estimated {} tokens exceeds --preflight-tokens {}; "
                 "abort before any LLM call.".format(
-                    estimate["total_tokens"], args.budget_tokens
+                    estimate["total_tokens"], args.preflight_tokens
                 ),
                 file=sys.stderr,
             )
@@ -232,6 +232,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         llm_base_url=args.base_url,
         ablation=args.ablation,
         budget_calls=args.budget_calls,
+        budget_tokens=args.run_budget_tokens,
         review_cache_enabled=bool(review_cache_dir),
         review_cache_dir=str(review_cache_dir) if review_cache_dir else None,
         llm_cache_dir=args.llm_cache_dir,
@@ -423,7 +424,7 @@ def cmd_synthetic(args: argparse.Namespace) -> int:
     estimates = [
         estimate_synthetic_run(cases, mode=mode) for mode in modes
     ]
-    if args.estimate_only or args.budget_tokens is not None:
+    if args.dry_run or args.preflight_tokens is not None:
         for estimate in estimates:
             print(
                 "[estimate] mode={mode} cases={cases} calls={llm_calls} "
@@ -432,14 +433,14 @@ def cmd_synthetic(args: argparse.Namespace) -> int:
                 "total_tokens={total_tokens}".format(**estimate)
             )
             print(f"[estimate] assumption: {estimate['assumption']}")
-        if args.estimate_only:
+        if args.dry_run:
             return 0
         total_estimate = sum(item["total_tokens"] for item in estimates)
-        if total_estimate > args.budget_tokens:
+        if total_estimate > args.preflight_tokens:
             print(
-                "error: estimated {} tokens exceeds --budget-tokens {}; "
+                "error: estimated {} tokens exceeds --preflight-tokens {}; "
                 "abort before creating repositories or calling LLMs.".format(
-                    total_estimate, args.budget_tokens
+                    total_estimate, args.preflight_tokens
                 ),
                 file=sys.stderr,
             )
@@ -459,7 +460,7 @@ def cmd_synthetic(args: argparse.Namespace) -> int:
             mock_llm=args.mock_llm,
             resume=args.resume,
             keep_worktrees=args.keep_worktrees,
-            budget_tokens=args.budget_tokens,
+            budget_tokens=args.run_budget_tokens,
             ablation=args.ablation,
             fail_fast=args.fail_fast,
         )
@@ -545,15 +546,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="跳过已有 status=ok 的结果；失败样本会重跑",
     )
     review.add_argument(
-        "--estimate-only",
+        "--dry-run",
         action="store_true",
-        help="只打印 token 估算，不 clone、不调用 LLM",
+        help="只打印 preflight token 估算，不 clone 仓库、不调用 LLM",
     )
     review.add_argument(
-        "--budget-tokens",
+        "--preflight-tokens",
         type=int,
         default=None,
-        help="preflight 估算的批次总 token 超过该值时退出",
+        help="按 manifest 估算整批 token；超过该值则在任何 LLM 调用前退出",
+    )
+    review.add_argument(
+        "--run-budget-tokens",
+        type=int,
+        default=0,
+        help="单个 PR run 的运行时输入 token 上限；0 表示不限制",
     )
     review.add_argument(
         "--review-cache",
@@ -606,15 +613,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     synthetic.add_argument(
-        "--estimate-only",
+        "--dry-run",
         action="store_true",
         help="只打印 preflight token 估算，不创建仓库、不调用 LLM",
     )
     synthetic.add_argument(
-        "--budget-tokens",
+        "--preflight-tokens",
         type=int,
         default=None,
-        help="preflight 估算或运行累计 token 超过该值时退出",
+        help="按 case 估算整批 token；超过该值则在创建仓库前退出",
+    )
+    synthetic.add_argument(
+        "--run-budget-tokens",
+        type=int,
+        default=None,
+        help="运行期累计 token 上限；超过后停止剩余 case；缺省不限制",
     )
     synthetic.set_defaults(func=cmd_synthetic)
 

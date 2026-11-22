@@ -69,11 +69,27 @@
 | `verifier` | AST + 代码图谱 | 开 | 全关 |
 
 ```bash
+# 一键跑四档：review -> metrics -> gate -> 可选 semantic -> report
+./evaluation/run_ablation.sh --split dev --model gpt-4o-mini \
+  --preflight-tokens 200000 --run-budget-tokens 20000
+
+# 只估算，不 clone、不调用 LLM
+./evaluation/run_ablation.sh --dry-run --split dev
+```
+
+也可以逐档手动跑：
+
+```bash
 uv run python -m evaluation.cli review --split dev --run-id dev-diff --ablation diff
 uv run python -m evaluation.cli review --split dev --run-id dev-ast --ablation ast
 uv run python -m evaluation.cli review --split dev --run-id dev-graph --ablation graph
 uv run python -m evaluation.cli review --split dev --run-id dev-verifier --ablation verifier
 ```
+
+两个 token 参数语义不同：
+
+- `--preflight-tokens`：split 级预检，按 manifest 估算整批 token，超限则在调用 LLM 前退出。
+- `--run-budget-tokens`：单个 PR run 的运行时输入 token 硬上限，超限后该 run 转为 `partial`。
 
 每档必须同时报告：语义质量、检索覆盖、调用数、token、延迟、不确定性。
 
@@ -131,8 +147,11 @@ uv run python -m evaluation.cli gate \
 # 4. 真实模型（按需）
 export OPENAI_API_KEY=...
 uv run python -m evaluation.cli review --split dev --limit 1 \
-  --run-id dev-smoke --model gpt-4o-mini --budget-tokens 20000
+  --run-id dev-smoke --model gpt-4o-mini \
+  --preflight-tokens 20000 --run-budget-tokens 20000
 ```
+
+完整四档对照直接跑 `./evaluation/run_ablation.sh --split dev --model gpt-4o-mini`。
 
 ## 7. 统计注意事项
 

@@ -131,6 +131,28 @@ uv run python -m evaluation.cli gate \
 - `--ablation graph`：AST + 代码图谱（Qualifier + Import）
 - `--ablation verifier`：graph 基础 + 后置防幻觉校验
 
+四档也可以一键串起来（review → metrics → gate → 可选 semantic → report）：
+
+```bash
+# 先估算，不 clone、不调用 LLM
+./evaluation/run_ablation.sh --dry-run --split dev
+
+# 真实运行四档
+./evaluation/run_ablation.sh \
+  --split dev \
+  --model gpt-4o-mini \
+  --preflight-tokens 200000 \
+  --run-budget-tokens 20000 \
+  --report-out reports/eval_dev.md
+
+# 加跑 AACR 官方语义评测
+./evaluation/run_ablation.sh --split dev --semantic \
+  --aacr-eval-dir /tmp/aacr-bench/evaluation
+```
+
+脚本会为每档生成 `dev-diff / dev-ast / dev-graph / dev-verifier` 四个 run-id；
+gate 未通过时会继续跑完其余档位，最后以非零退出码提示。
+
 ### 4. 真实模型（按需，消耗 token）
 
 ```bash
@@ -139,7 +161,7 @@ export OPENAI_API_KEY=...
 # 先看 token 估算，不 clone、不调用 LLM
 uv run python -m evaluation.cli review \
   --split dev \
-  --estimate-only
+  --dry-run
 
 # 再跑一条 smoke，确认 API、token 预算和结果落盘
 uv run python -m evaluation.cli review \
@@ -147,19 +169,26 @@ uv run python -m evaluation.cli review \
   --limit 1 \
   --run-id dev-gpt4o-mini-smoke \
   --model gpt-4o-mini \
-  --budget-tokens 20000
+  --preflight-tokens 20000 \
+  --run-budget-tokens 20000
 
 # 完整 dev
 uv run python -m evaluation.cli review \
   --split dev \
   --run-id dev-gpt4o-mini \
   --model gpt-4o-mini \
-  --budget-tokens 200000
+  --preflight-tokens 200000 \
+  --run-budget-tokens 20000
 ```
 
-`--budget-tokens` 是批次级 preflight：用 manifest 的变更行数/评论数估算
-input + output token，超过上限就在任何 LLM 调用前退出。实际 diff 大小和重试次数
-仍会影响最终用量；没有设置 token 预算时不要直接跑 `--split all`。
+两个 token 参数语义不同：
+
+- `--preflight-tokens` 是 **split 级预检**：用 manifest 的变更行数/评论数估算
+  整批 input + output token，超过上限就在任何 LLM 调用前退出。
+- `--run-budget-tokens` 是 **单个 PR run 的运行时硬上限**：每个 PR 独立计账，
+  估算输入超过该值就停止该 run 的后续调用，并把它标记为 `partial`。
+
+没有设置 `--preflight-tokens` 时不要直接跑 `--split all`。
 
 ### 5. 可选：AACR 官方语义评测
 

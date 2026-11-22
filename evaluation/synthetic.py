@@ -576,7 +576,7 @@ def estimate_synthetic_run(
     *,
     mode: str,
 ) -> Dict[str, Any]:
-    """不调用 LLM 的保守 token preflight，用于 --estimate-only / --budget-tokens。"""
+    """不调用 LLM 的保守 token preflight，用于 --dry-run / --preflight-tokens。"""
     if mode not in {"full", "baseline"}:
         raise ValueError(f"unknown mode: {mode}")
 
@@ -760,7 +760,7 @@ def run_synthetic_benchmark(
             ):
                 print(
                     f"[budget] estimated {cumulative_tokens} tokens exceeds "
-                    f"--budget-tokens {budget_tokens}; "
+                    f"--run-budget-tokens {budget_tokens}; "
                     "stopping before remaining cases."
                 )
                 stopped_by_budget = True
