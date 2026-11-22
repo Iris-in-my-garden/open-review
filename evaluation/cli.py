@@ -137,16 +137,20 @@ def _estimate_aacr_review(
     """AACR review 的保守 token preflight。
 
     不 clone 仓库，只看 manifest 里的 change_line_count / reference_comments。
-    真实 prompt 还受上下文检索和 token 预算影响，因此这里明确标注为估算。
+    检索上下文按 ablation 档位做粗估：``diff`` 不注入上下文，``ast`` 只注入
+    单文件折叠，``graph`` 额外注入跨文件图。真实 prompt 还受 batching、
+    ``max_context_tokens`` 与重试影响，因此这里明确标注为 lower bound。
     """
     from openreview.review.ablation import resolve_ablation
 
     spec = resolve_ablation(ablation) if ablation else None
     verifier = spec.verifier_enabled if spec else True
     mode_label = spec.label if spec else "production"
+    retrieval_mode = spec.retrieval_mode if spec else "graph"
 
     prompt_tokens = 0
     completion_tokens = 0
+    retrieval_tokens = 0
     calls = 0
     for instance in instances:
         lines = max(1, int(instance.get("change_line_count") or 0))
@@ -154,6 +158,19 @@ def _estimate_aacr_review(
         prompt_tokens += per_review_prompt
         completion_tokens += 450
         calls += 1
+        # 上下文粗估：AST 只注入变更所在函数/类，graph 还会注入 caller/callee/
+        # import 等跨文件证据。系数是启发式的，只用于“开跑前拦截明显超支”。
+        if retrieval_mode == "ast":
+            context = min(3000, 256 + lines * 4)
+        elif retrieval_mode == "graph":
+            context = min(6000, 512 + lines * 8)
+        else:
+            context = 0
+        if spec is None:
+            # 生产默认还开启 impact/static，留一点余量。
+            context += 1000
+        prompt_tokens += context
+        retrieval_tokens += context
         if verifier:
             prompt_tokens += 1500 + int(instance.get("reference_comments") or 1) * 250
             completion_tokens += 300
@@ -163,9 +180,11 @@ def _estimate_aacr_review(
         "llm_calls": calls,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
+        "retrieval_tokens": retrieval_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
         "assumption": (
-            f"{mode_label}; single-pass + ~12 tokens/change line + base context"
+            f"{mode_label}; patch ~12 tokens/change line + retrieval "
+            f"~{retrieval_tokens} tokens; lower bound (batching/retries excluded)"
         ),
     }
 
@@ -208,6 +227,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         print(
             "[estimate] instances={instances} calls={llm_calls} "
             "prompt_tokens={prompt_tokens} completion_tokens={completion_tokens} "
+            "retrieval_tokens={retrieval_tokens} "
             "total_tokens={total_tokens}".format(**estimate)
         )
         print(f"[estimate] assumption: {estimate['assumption']}")

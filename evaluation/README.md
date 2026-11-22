@@ -183,8 +183,9 @@ uv run python -m evaluation.cli review \
 
 两个 token 参数语义不同：
 
-- `--preflight-tokens` 是 **split 级预检**：用 manifest 的变更行数/评论数估算
-  整批 input + output token，超过上限就在任何 LLM 调用前退出。
+- `--preflight-tokens` 是 **split 级预检**：用 manifest 的变更行数/评论数，
+  并按 ablation 档位粗略加上检索上下文 token，超过上限就在任何 LLM 调用前退出。
+  它是 lower bound：不模拟 batching、重试和真实 `max_context_tokens` 截断。
 - `--run-budget-tokens` 是 **单个 PR run 的运行时硬上限**：每个 PR 独立计账，
   估算输入超过该值就停止该 run 的后续调用，并把它标记为 `partial`。
 

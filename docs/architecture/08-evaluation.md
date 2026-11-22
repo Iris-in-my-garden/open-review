@@ -88,7 +88,7 @@ uv run python -m evaluation.cli review --split dev --run-id dev-verifier --ablat
 
 两个 token 参数语义不同：
 
-- `--preflight-tokens`：split 级预检，按 manifest 估算整批 token，超限则在调用 LLM 前退出。
+- `--preflight-tokens`：split 级预检，按 manifest 与 ablation 档位粗略估算整批 token（lower bound），超限则在调用 LLM 前退出。
 - `--run-budget-tokens`：单个 PR run 的运行时输入 token 硬上限，超限后该 run 转为 `partial`。
 
 每档必须同时报告：语义质量、检索覆盖、调用数、token、延迟、不确定性。

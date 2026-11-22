@@ -11,6 +11,7 @@ from evaluation.aacr import (
     parse_github_pr,
     write_manifest,
 )
+from evaluation.cli import _estimate_aacr_review
 
 
 def _record(language: str, repo: str, index: int) -> dict:
@@ -124,3 +125,19 @@ def test_parse_github_pr():
         5711,
     )
     assert parse_github_pr("not a pr") is None
+
+
+def test_estimate_reflects_retrieval_ablation():
+    instances = [{"change_line_count": 100, "reference_comments": 3}]
+
+    diff = _estimate_aacr_review(instances, ablation="diff")
+    ast = _estimate_aacr_review(instances, ablation="ast")
+    graph = _estimate_aacr_review(instances, ablation="graph")
+    verifier = _estimate_aacr_review(instances, ablation="verifier")
+
+    assert diff["retrieval_tokens"] == 0
+    assert diff["total_tokens"] < ast["total_tokens"] < graph["total_tokens"]
+    assert graph["retrieval_tokens"] == verifier["retrieval_tokens"]
+    assert verifier["total_tokens"] > graph["total_tokens"]
+    assert diff["llm_calls"] == 1
+    assert verifier["llm_calls"] == 2
