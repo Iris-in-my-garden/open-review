@@ -165,6 +165,7 @@ class GraphRetriever:
                     kind="caller",
                     priority=ContextPriority.REFERENCE,
                     symbol=symbol,
+                    related_changed_symbols=[edge.callee_name],
                     start_line=start,
                     end_line=end,
                     context_id=make_context_id(
@@ -284,6 +285,12 @@ class GraphRetriever:
                     kind="callee",
                     priority=ContextPriority.DEFINITION,
                     symbol=definition.name,
+                    related_changed_symbols=[
+                        name
+                        for name in query.symbols
+                        if edge.caller_symbol == name
+                        or edge.caller_symbol.endswith(f".{name}")
+                    ],
                     start_line=definition.start_line,
                     end_line=definition.end_line,
                     context_id=make_context_id(

@@ -16,6 +16,7 @@ def test_context_dry_run_reports_context_and_prompt_estimates(tmp_path):
                 additions=1,
                 deletions=1,
                 patch="@@ -1 +1 @@\n-old()\n+new()",
+                changed_symbols=["new"],
             )
         ]
     )
@@ -26,6 +27,7 @@ def test_context_dry_run_reports_context_and_prompt_estimates(tmp_path):
         score=1.0,
         kind="enclosing",
         symbol="new",
+        related_changed_symbols=["new"],
         start_line=1,
         end_line=2,
         priority=ContextPriority.ENCLOSING,
@@ -95,6 +97,9 @@ def test_context_dry_run_reports_context_and_prompt_estimates(tmp_path):
     assert report["llm_called"] is False
     assert context_report["text"] == context.snippet
     assert context_report["type"] == "enclosing"
+    assert context_report["reason"] == "enclosing function"
+    assert context_report["related_changed_symbols"] == ["new"]
+    assert batch["changed_symbols"] == ["new"]
     assert context_report["priority"] == "P2"
     assert context_report["snippet_tokens_estimate"] > 0
     assert context_report["prompt_segment_tokens_estimate"] > 0

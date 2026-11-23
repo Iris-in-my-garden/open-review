@@ -30,6 +30,46 @@ logger = logging.getLogger(__name__)
 MAX_IMPACT_FINDINGS = 30
 MAX_IMPACT_CONTEXTS = 12
 MAX_SYMBOLS = 40
+LOW_INFORMATION_NAMES = {
+    "build",
+    "close",
+    "connect",
+    "create",
+    "delete",
+    "init",
+    "list",
+    "load",
+    "name",
+    "new",
+    "open",
+    "parse",
+    "render",
+    "save",
+    "start",
+    "status",
+    "stop",
+    "upgrade",
+    "validate",
+}
+SOURCE_SUFFIXES = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
+    ".go",
+    ".h",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".php",
+    ".py",
+    ".rb",
+    ".rs",
+    ".swift",
+    ".ts",
+    ".tsx",
+}
 COMMON_NAMES = {
     "main",
     "__init__",
@@ -88,6 +128,7 @@ class ImpactReport(BaseModel):
                     kind="impact",
                     priority=ContextPriority.REFERENCE,
                     symbol=item.symbol,
+                    related_changed_symbols=[item.symbol],
                     start_line=max(1, item.line - 6),
                     end_line=item.line + 6,
                     context_id=make_context_id(
@@ -123,7 +164,7 @@ class ImpactAnalyzer:
             repo_path, symbols, suffixes=None
         ).hits
 
-        findings: List[ImpactFinding] = []
+        candidates: List[ImpactFinding] = []
         seen: set[tuple[str, str, int]] = set()
         for path, line, code in raw_matches:
             if path in changed_files:
@@ -131,26 +172,30 @@ class ImpactAnalyzer:
             symbol = self._find_symbol_in_line(code, symbols)
             if symbol is None:
                 continue
+            if not self._is_useful_match(path, symbol, code):
+                continue
             key = (path, symbol, line)
             if key in seen:
                 continue
             seen.add(key)
-            findings.append(
+            candidates.append(
                 ImpactFinding(
                     symbol=symbol,
                     file=path,
                     line=line,
                     code=code.strip(),
-                    confidence=self._confidence(symbol, code),
+                    confidence=self._confidence(symbol, code, path),
                 )
             )
-            if len(findings) >= self.max_findings:
-                break
+        candidates.sort(
+            key=lambda item: (-item.confidence, item.file, item.line, item.symbol)
+        )
+        findings = candidates[: self.max_findings]
 
         return ImpactReport(
             findings=findings,
             changed_symbols=symbols,
-            truncated=len(findings) >= self.max_findings,
+            truncated=len(candidates) > self.max_findings,
         )
 
     @staticmethod
@@ -169,19 +214,40 @@ class ImpactAnalyzer:
 
     @staticmethod
     def _find_symbol_in_line(code: str, symbols: Iterable[str]) -> Optional[str]:
-        for symbol in symbols:
-            if re.search(rf"\b{re.escape(symbol)}\b", code):
-                return symbol
-        return None
+        matches = (
+            symbol for symbol in symbols if re.search(rf"\b{re.escape(symbol)}\b", code)
+        )
+        return max(matches, key=len, default=None)
 
     @staticmethod
-    def _confidence(symbol: str, code: str) -> float:
-        # 定义行/导入行通常比普通调用更有信息量；短名字降低置信度。
-        if re.match(r"\s*(def|class|func|type|import|from)\b", code):
+    def _is_useful_match(path: str, symbol: str, code: str) -> bool:
+        """Require code-like evidence for generic names; keep specific docs/config hits."""
+        if symbol.lower() not in LOW_INFORMATION_NAMES:
+            return True
+        if Path(path).suffix.lower() not in SOURCE_SUFFIXES:
+            return False
+        escaped = re.escape(symbol)
+        return bool(
+            re.search(
+                rf"(?:\b(?:def|func|function|class|type)\s+"
+                rf"(?:\([^)]*\)\s*)?{escaped}\b|"
+                rf"\b(?:\w+\s*\.\s*)?{escaped}\s*\(|"
+                rf"\bimport\b.*\b{escaped}\b)",
+                code,
+            )
+        )
+
+    @staticmethod
+    def _confidence(symbol: str, code: str, path: str) -> float:
+        if re.search(r"\b(?:def|func|function|class|type|import|from)\b", code):
             return 0.8
-        if len(symbol) <= 4:
-            return 0.55
-        return 0.75
+        if re.search(rf"\b(?:\w+\s*\.\s*)?{re.escape(symbol)}\s*\(", code):
+            return 0.78
+        if symbol.lower() in LOW_INFORMATION_NAMES:
+            return 0.62
+        if Path(path).suffix.lower() in SOURCE_SUFFIXES:
+            return 0.75
+        return 0.68
 
 
 def _read_snippet(repo_path: Path, filename: str, line: int, radius: int = 6) -> str:

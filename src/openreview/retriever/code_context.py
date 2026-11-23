@@ -4,7 +4,7 @@ import hashlib
 from enum import IntEnum
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ContextPriority(IntEnum):
@@ -59,6 +59,7 @@ class CodeContext(BaseModel):
     context_id: str = ""
     kind: str = "snippet"
     symbol: str = ""
+    related_changed_symbols: List[str] = Field(default_factory=list)
     start_line: Optional[int] = None
     end_line: Optional[int] = None
 

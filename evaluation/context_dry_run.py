@@ -68,6 +68,18 @@ def build_context_dry_run(
                 pipeline.config.max_context_tokens,
                 stats=state.retrieval_stats,
             )
+            batch_changed_symbols = sorted(
+                {
+                    symbol
+                    for file_diff in batch.files
+                    for symbol in (
+                        file_diff.changed_symbols
+                        + file_diff.removed_symbols
+                        + file_diff.enclosing_contexts
+                    )
+                    if symbol
+                }
+            )
             user_prompt = prompt_builder.build_user_prompt(
                 state.pr_info,
                 batch,
@@ -96,6 +108,10 @@ def build_context_dry_run(
                         "priority": f"P{int(context.priority)}",
                         "priority_order": int(context.priority),
                         "symbol": context.symbol,
+                        "reason": context.reason,
+                        "related_changed_symbols": list(
+                            dict.fromkeys(context.related_changed_symbols)
+                        ),
                         "revision": context.revision,
                         "start_line": context.start_line,
                         "end_line": context.end_line,
@@ -114,6 +130,7 @@ def build_context_dry_run(
                 {
                     "batch": index,
                     "files": [file.filename for file in batch.files],
+                    "changed_symbols": batch_changed_symbols,
                     "contexts": context_reports,
                     "patch_tokens_estimate": sum(
                         estimate_tokens(file.patch or "") for file in batch.files

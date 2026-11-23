@@ -61,6 +61,38 @@ def test_impact_skips_common_symbol_names(tmp_path: Path):
     assert report.changed_symbols == []
 
 
+def test_impact_filters_generic_prose_and_config_matches(tmp_path: Path):
+    _write(
+        tmp_path / "README.md",
+        "Connect to the server before starting.\nFeaturePolicy is enabled.",
+    )
+    _write(tmp_path / "Taskfile.yml", "tasks:\n  upgrade:\n    cmds: []\n")
+    _write(tmp_path / "web" / "quicktips.tsx", "<p>Connect to a remote server</p>\n")
+    _write(
+        tmp_path / "src" / "client.go",
+        "package client\n\nfunc caller() { Connect() }\n",
+    )
+
+    parsed = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="src/api.go",
+                status="modified",
+                changed_symbols=["Connect", "upgrade", "FeaturePolicy"],
+            )
+        ]
+    )
+
+    report = ImpactAnalyzer().analyze(parsed, tmp_path)
+
+    assert {(item.file, item.symbol) for item in report.findings} == {
+        ("src/client.go", "Connect"),
+        ("README.md", "FeaturePolicy"),
+    }
+    context = report.to_contexts(tmp_path)[0]
+    assert context.related_changed_symbols == ["Connect"]
+
+
 def test_impact_returns_empty_for_missing_repo(tmp_path: Path):
     parsed = ParsedDiff(
         files=[

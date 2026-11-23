@@ -247,6 +247,7 @@ class TreeSitterLocalRetriever:
                         priority=ContextPriority.ENCLOSING,
                         folded=folded,
                         symbol=display_name if name else "",
+                        related_changed_symbols=[name] if name else [],
                         start_line=start_row + 1,
                         end_line=end_row + 1,
                         context_id=make_context_id(
@@ -488,6 +489,7 @@ class TreeSitterLocalRetriever:
                         kind="base_definition",
                         priority=ContextPriority.DEFINITION,
                         symbol=name,
+                        related_changed_symbols=[name],
                         start_line=start_row + 1,
                         end_line=end_row + 1,
                         context_id=make_context_id(
@@ -567,6 +569,7 @@ class TreeSitterLocalRetriever:
                             kind="test",
                             priority=ContextPriority.TEST,
                             symbol=name,
+                            related_changed_symbols=[matched] if matched else [],
                             start_line=start_row + 1,
                             end_line=end_row + 1,
                             context_id=make_context_id(
@@ -799,6 +802,9 @@ class TreeSitterLocalRetriever:
                             else ContextPriority.REFERENCE
                         ),
                         symbol=matched_symbol,
+                        related_changed_symbols=(
+                            [matched_symbol] if matched_symbol else []
+                        ),
                         start_line=node_range[0] + 1,
                         end_line=node_range[1] + 1,
                         context_id=make_context_id(
