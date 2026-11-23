@@ -20,7 +20,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 PYTHON_BIN="${PYTHON_BIN:-uv run python}"
 read -r -a PYTHON <<< "$PYTHON_BIN"
-MANIFEST="evaluation/manifests/aacr_pygo_v2.json"
+MANIFEST="evaluation/manifests/aacr_pygo_v3.json"
 SPLIT="dev"
 MODEL=""
 LEVELS="diff ast graph verifier"

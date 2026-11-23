@@ -19,9 +19,9 @@
 
 使用 [AACR-Bench](https://github.com/alibaba/aacr-bench) 的 Python/Go 子集：
 
-- 21 个 Python PR + 22 个 Go PR = **43 个 PR**
+- 21 个 Python PR + 21 个 Go PR = **42 个 PR**
 - 覆盖 **10 个仓库**
-- 固定的语言分层、仓库互斥切分：**7 dev / 26 test / 10 holdout PR**，分别覆盖
+- 固定的语言分层、仓库互斥切分：**7 dev / 25 test / 10 holdout PR**，分别覆盖
   **2 / 6 / 2 个仓库**；每种语言都出现在每个 split。
 
 原始数据 SHA256 固定为：
@@ -30,7 +30,7 @@
 02c8561f1c3994a26f427d479b2a3f6e6c8e6858161fbc903b45248fa2cb2097
 ```
 
-`manifests/aacr_pygo_v2.json` 是提交到仓库的固定索引，包含每个实例的
+`manifests/aacr_pygo_v3.json` 是提交到仓库的固定索引，包含每个实例的
 `instance_id / split / base_commit / head_commit / clone_url`。同一仓库的所有 PR
 只会落入一个 split。每种语言各选一个 dev 仓库，再从剩余仓库中选一个 holdout
 仓库；所选仓库的 PR 数尽量接近该语言样本总数的 20%，其余仓库全部用于 test。
@@ -67,7 +67,7 @@ uv run python -m evaluation.cli prepare \
 uv run python -m evaluation.cli prepare --download
 ```
 
-默认写入 `evaluation/manifests/aacr_pygo_v2.json`。
+默认写入 `evaluation/manifests/aacr_pygo_v3.json`。
 
 如果用的是本地 fixture 或内网镜像（SHA256 与官方不同），加
 `--no-verify-source` 跳过校验。它只影响校验，不会把数据标记成官方版本；
@@ -95,10 +95,10 @@ uv run python -m evaluation.cli metrics \
 
 输出：
 
-- `evaluation/results/aacr-pygo-v2/dev-mock/<instance_id>.json`
-- `evaluation/results/aacr-pygo-v2/dev-mock/summary_openreview.json`
-- `evaluation/metrics/aacr-pygo-v2/dev-mock/deterministic_dev-mock.json`
-- `evaluation/metrics/aacr-pygo-v2/dev-mock/retrieval_dev-mock.json`
+- `evaluation/results/aacr-pygo-v3/dev-mock/<instance_id>.json`
+- `evaluation/results/aacr-pygo-v3/dev-mock/summary_openreview.json`
+- `evaluation/metrics/aacr-pygo-v3/dev-mock/deterministic_dev-mock.json`
+- `evaluation/metrics/aacr-pygo-v3/dev-mock/retrieval_dev-mock.json`
 
 `deterministic_*.json` 覆盖行号合法性、证据可定位性、维度归因与 token 用量；
 `retrieval_*.json` 是 Phase 1/2 的检索质量指标，完全不调用 LLM：
@@ -109,7 +109,7 @@ uv run python -m evaluation.cli metrics \
 
 ```bash
 uv run python -m evaluation.cli gate \
-  --metrics evaluation/metrics/aacr-pygo-v2/dev-mock/deterministic_dev-mock.json
+  --metrics evaluation/metrics/aacr-pygo-v3/dev-mock/deterministic_dev-mock.json
 ```
 
 默认硬阈值：结果不能有 error/missing，未知文件率、非法行号率、未 grounding
@@ -237,10 +237,10 @@ AACR OCR 兼容字段（`review.comments[].content`、`review.summary.input_toke
 
 ```bash
 uv run python -m evaluation.cli report \
-  --run diff=evaluation/metrics/aacr-pygo-v2/dev-diff \
-  --run ast=evaluation/metrics/aacr-pygo-v2/dev-ast \
-  --run graph=evaluation/metrics/aacr-pygo-v2/dev-graph \
-  --run verifier=evaluation/metrics/aacr-pygo-v2/dev-verifier \
+  --run diff=evaluation/metrics/aacr-pygo-v3/dev-diff \
+  --run ast=evaluation/metrics/aacr-pygo-v3/dev-ast \
+  --run graph=evaluation/metrics/aacr-pygo-v3/dev-graph \
+  --run verifier=evaluation/metrics/aacr-pygo-v3/dev-verifier \
   --out reports/eval_dev.md
 ```
 
@@ -404,7 +404,7 @@ schema 版本会分开标记，避免混合统计口径。根级 `metrics.schema
 ```
 
 建议按 `diff → ast → graph → verifier` 顺序逐档对照，每档使用同一份
-LLM record/replay 缓存。不要一次性展开太多维度，否则 43 个 PR 的样本量撑不住结论。
+LLM record/replay 缓存。不要一次性展开太多维度，否则 42 个 PR 的样本量撑不住结论。
 
 ### 录制 / 回放，避免重复付费
 
@@ -455,7 +455,7 @@ evaluation/
   report.py          # 多次 run -> Markdown Results 表
   cli.py             # prepare / review / metrics / semantic / report
   manifests/
-    aacr_pygo_v2.json
+    aacr_pygo_v3.json
 ```
 
 ---

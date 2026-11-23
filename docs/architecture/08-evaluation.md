@@ -99,7 +99,7 @@ uv run python -m evaluation.cli review --split dev --run-id dev-verifier --ablat
 
 ```bash
 uv run python -m evaluation.cli gate \
-  --metrics evaluation/metrics/aacr-pygo-v2/dev-mock/deterministic_dev-mock.json
+  --metrics evaluation/metrics/aacr-pygo-v3/dev-mock/deterministic_dev-mock.json
 ```
 
 默认硬阈值：
@@ -142,7 +142,7 @@ uv run python -m evaluation.cli metrics --split dev --run-id dev-mock
 
 # 3. CI gate
 uv run python -m evaluation.cli gate \
-  --metrics evaluation/metrics/aacr-pygo-v2/dev-mock/deterministic_dev-mock.json
+  --metrics evaluation/metrics/aacr-pygo-v3/dev-mock/deterministic_dev-mock.json
 
 # 4. 真实模型（按需）
 export OPENAI_API_KEY=...

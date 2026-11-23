@@ -26,9 +26,14 @@ AACR_DATA_SHA256 = (
     "3af6de43e6b5f79ae7cbf58207e3c5b2db02ffe51562e050b047503140297c61"
 )
 SUPPORTED_LANGUAGES = {"python": "Python", "go": "Go"}
-MANIFEST_VERSION = "aacr-pygo-v2"
+MANIFEST_VERSION = "aacr-pygo-v3"
 DEFAULT_SEED = 42
 _DEV_HOLDOUT_FRACTION = 0.2
+EXCLUDED_INSTANCES = {
+    "microsoft__typescript-go@100dbc5": (
+        "Pinned PR head is no longer available from the repository's Git refs."
+    )
+}
 
 _GITHUB_PR_PATTERN = re.compile(
     r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", re.IGNORECASE
@@ -263,6 +268,8 @@ def build_manifest(
 
     instances: List[Dict[str, Any]] = []
     for record in supported:
+        if record["_instance_id"] in EXCLUDED_INSTANCES:
+            continue
         split = split_by_id[record["_instance_id"]]
         instances.append(
             {
@@ -320,9 +327,13 @@ def build_manifest(
         "selection": {
             "dev": "每种语言选 1 个 PR 数最接近该语言总量 20% 的仓库",
             "holdout": "每种语言从剩余仓库中再选 1 个 PR 数最接近 20% 的仓库",
-            "test": "其余仓库的全部 PR",
+            "test": "其余仓库中可获取的全部 PR",
             "repository_disjoint": True,
         },
+        "exclusions": [
+            {"instance_id": instance_id, "reason": reason}
+            for instance_id, reason in sorted(EXCLUDED_INSTANCES.items())
+        ],
         "counts": {
             "total": len(instances),
             "dev": counts.get("dev", 0),

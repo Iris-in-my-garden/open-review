@@ -86,6 +86,50 @@ def test_build_manifest_is_deterministic_and_stratified():
     assert all(item["base_commit"] != item["head_commit"] for item in instances)
 
 
+def test_build_manifest_excludes_unavailable_pinned_instance():
+    record = _record("Go", "microsoft/typescript-go", 698)
+    record["target_commit"] = "100dbc5127e723c4108efc02a179d9aec5fce32a"
+    records = [*_records(), record]
+
+    manifest = build_manifest(records, seed=7)
+
+    assert manifest["version"] == "aacr-pygo-v3"
+    assert manifest["counts"]["total"] == 20
+    assert manifest["counts"]["by_language"] == {"Go": 10, "Python": 10}
+    assert all(
+        item["instance_id"] != "microsoft__typescript-go@100dbc5"
+        for item in manifest["instances"]
+    )
+    assert manifest["exclusions"] == [
+        {
+            "instance_id": "microsoft__typescript-go@100dbc5",
+            "reason": (
+                "Pinned PR head is no longer available from the repository's Git refs."
+            ),
+        }
+    ]
+
+
+def test_checked_in_v3_manifest_excludes_unavailable_pinned_instance():
+    manifest_path = (
+        Path(__file__).parents[1]
+        / "evaluation"
+        / "manifests"
+        / "aacr_pygo_v3.json"
+    )
+    manifest = load_manifest(manifest_path)
+
+    assert manifest["counts"]["total"] == 42
+    assert manifest["counts"]["dev"] == 7
+    assert manifest["counts"]["test"] == 25
+    assert manifest["counts"]["holdout"] == 10
+    assert manifest["counts"]["by_language"] == {"Go": 21, "Python": 21}
+    assert manifest["counts"]["by_split_language"]["test"]["Go"] == 12
+    assert manifest["exclusions"][0]["instance_id"] == (
+        "microsoft__typescript-go@100dbc5"
+    )
+
+
 def test_manifest_roundtrip_and_split_lookup(tmp_path: Path):
     manifest = build_manifest(_records(), seed=7)
     path = write_manifest(manifest, tmp_path / "manifest.json")
