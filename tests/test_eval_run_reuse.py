@@ -137,6 +137,36 @@ def test_prepare_repositories_collects_commit_failures_and_continues(
     assert "其余仓库/commit 已继续处理" in str(error.value)
 
 
+def test_prepare_repositories_fetches_missing_commit_from_pull_ref(
+    tmp_path, monkeypatch
+):
+    instance = _instance("one", "owner/first")
+    instance["pr_number"] = 42
+    fetched_refs = []
+    monkeypatch.setattr(
+        "evaluation.repos._ensure_repo_checkout",
+        lambda cache_dir, repo, clone_url, **kwargs: tmp_path / "repo",
+    )
+
+    def fake_ensure_commit(repo_path, commit, **kwargs):
+        if commit == "head-one":
+            raise RepoError("commit unavailable")
+
+    def fake_run_git(repo, *args, **kwargs):
+        fetched_refs.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("evaluation.repos.ensure_commit", fake_ensure_commit)
+    monkeypatch.setattr("evaluation.repos.run_git", fake_run_git)
+    monkeypatch.setattr(
+        "evaluation.repos._has_commit",
+        lambda repo_path, commit: commit == "head-one",
+    )
+
+    assert prepare_repositories([instance], cache_dir=tmp_path) == 1
+    assert fetched_refs == [("fetch", "origin", "refs/pull/42/head")]
+
+
 def test_prepare_repositories_uses_at_most_three_workers(tmp_path, monkeypatch):
     instances = [_instance(str(index), f"owner/repo-{index}") for index in range(6)]
     lock = threading.Lock()

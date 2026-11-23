@@ -123,6 +123,31 @@ def ensure_commit(repo: Path, commit: str, *, timeout: int = DEFAULT_TIMEOUT) ->
         raise RepoError(f"commit 不可用: {commit} (repo={repo})")
 
 
+def _ensure_commit_from_pull_ref(
+    repo: Path,
+    commit: str,
+    pull_number: int,
+    *,
+    timeout: int,
+) -> None:
+    """Fetch a PR ref as a fallback for commits omitted from branch refspecs."""
+    ref = f"refs/pull/{pull_number}/head"
+    result = run_git(
+        repo,
+        "fetch",
+        "origin",
+        ref,
+        timeout=timeout,
+        check=False,
+    )
+    if result.returncode == 0 and _has_commit(repo, commit):
+        return
+    raise RepoError(
+        f"commit {commit} is not available from origin {ref}"
+        + (f": {result.stderr.strip()}" if result.stderr.strip() else "")
+    )
+
+
 def ensure_repo(
     cache_dir: Path,
     repo: str,
@@ -195,11 +220,13 @@ def prepare_repositories(
         repo: str, repo_instances: List[Dict[str, Any]]
     ) -> List[str]:
         first = repo_instances[0]
-        commits = {
-            commit
-            for instance in repo_instances
-            for commit in (instance["base_commit"], instance["head_commit"])
-        }
+        commit_pull_numbers: Dict[str, set[int]] = {}
+        for instance in repo_instances:
+            pull_number = instance.get("pr_number")
+            for commit in (instance["base_commit"], instance["head_commit"]):
+                commit_pull_numbers.setdefault(commit, set())
+                if pull_number is not None:
+                    commit_pull_numbers[commit].add(int(pull_number))
         failures: List[str] = []
         try:
             repo_path = _ensure_repo_checkout(
@@ -211,11 +238,31 @@ def prepare_repositories(
         except RepoError as error:
             return [f"{repo}: clone/cache preparation failed: {error}"]
 
-        for commit in sorted(commits):
+        for commit, pull_numbers in sorted(commit_pull_numbers.items()):
             try:
                 ensure_commit(repo_path, commit, timeout=timeout)
             except RepoError as error:
-                failures.append(f"{repo} @ {commit}: {error}")
+                recovered = False
+                fallback_errors: List[str] = []
+                for pull_number in sorted(pull_numbers):
+                    try:
+                        _ensure_commit_from_pull_ref(
+                            repo_path,
+                            commit,
+                            pull_number,
+                            timeout=timeout,
+                        )
+                    except RepoError as fallback_error:
+                        fallback_errors.append(str(fallback_error))
+                    else:
+                        recovered = True
+                        break
+                if not recovered:
+                    detail = "; ".join(fallback_errors)
+                    failures.append(
+                        f"{repo} @ {commit}: {error}"
+                        + (f"; PR-ref fallback: {detail}" if detail else "")
+                    )
         return failures
 
     completed = 0
