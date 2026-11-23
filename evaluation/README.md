@@ -19,9 +19,9 @@
 
 使用 [AACR-Bench](https://github.com/alibaba/aacr-bench) 的 Python/Go 子集：
 
-- 21 个 Python PR + 21 个 Go PR = **42 个 PR**
+- 19 个 Python PR + 21 个 Go PR = **40 个 PR**
 - 覆盖 **10 个仓库**
-- 固定的语言分层、仓库互斥切分：**7 dev / 25 test / 10 holdout PR**，分别覆盖
+- 固定的语言分层、仓库互斥切分：**7 dev / 23 test / 10 holdout PR**，分别覆盖
   **2 / 6 / 2 个仓库**；每种语言都出现在每个 split。
 
 原始数据 SHA256 固定为：
@@ -404,7 +404,7 @@ schema 版本会分开标记，避免混合统计口径。根级 `metrics.schema
 ```
 
 建议按 `diff → ast → graph → verifier` 顺序逐档对照，每档使用同一份
-LLM record/replay 缓存。不要一次性展开太多维度，否则 42 个 PR 的样本量撑不住结论。
+LLM record/replay 缓存。不要一次性展开太多维度，否则 40 个 PR 的样本量撑不住结论。
 
 ### 录制 / 回放，避免重复付费
 

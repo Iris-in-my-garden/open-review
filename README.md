@@ -25,7 +25,7 @@ flowchart TD
 
 ## 评测状态
 
-评测工具支持从纯 Diff 到 AST、代码图谱和 Verifier 的固定对照（42 个 PR / 10 个仓库，按仓库互斥切分 dev/test/holdout）。**质量与成本评测尚未完成，空白不是 0，也不是结论。**指标定义、切分方法与复现步骤见[评测方法](docs/architecture/08-evaluation.md)。
+评测工具支持从纯 Diff 到 AST、代码图谱和 Verifier 的固定对照（40 个 PR / 10 个仓库，按仓库互斥切分 dev/test/holdout）。**质量与成本评测尚未完成，空白不是 0，也不是结论。**指标定义、切分方法与复现步骤见[评测方法](docs/architecture/08-evaluation.md)。
 
 ## Quickstart
 

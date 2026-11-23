@@ -87,30 +87,36 @@ def test_build_manifest_is_deterministic_and_stratified():
 
 
 def test_build_manifest_excludes_unavailable_pinned_instance():
-    record = _record("Go", "microsoft/typescript-go", 698)
-    record["target_commit"] = "100dbc5127e723c4108efc02a179d9aec5fce32a"
-    records = [*_records(), record]
+    excluded = [
+        ("microsoft/typescript-go", 698, "100dbc5127e723c4108efc02a179d9aec5fce32a"),
+        ("comfyanonymous/ComfyUI", 7952, "4936d01872b8719ede33f9a11dc8e898c33d39e4"),
+        ("comfyanonymous/ComfyUI", 9560, "cfc312296c0b9f255bba6b4b2789ac7bbc66a7cb"),
+    ]
+    records = _records()
+    for repo, pr_number, head in excluded:
+        record = _record("Python" if "ComfyUI" in repo else "Go", repo, pr_number)
+        record["target_commit"] = head
+        records.append(record)
 
     manifest = build_manifest(records, seed=7)
 
     assert manifest["version"] == "aacr-pygo-v3"
     assert manifest["counts"]["total"] == 20
     assert manifest["counts"]["by_language"] == {"Go": 10, "Python": 10}
-    assert all(
-        item["instance_id"] != "microsoft__typescript-go@100dbc5"
-        for item in manifest["instances"]
+    expected_exclusions = {
+        "microsoft__typescript-go@100dbc5",
+        "comfyanonymous__ComfyUI@4936d01",
+        "comfyanonymous__ComfyUI@cfc3122",
+    }
+    assert expected_exclusions.isdisjoint(
+        item["instance_id"] for item in manifest["instances"]
     )
-    assert manifest["exclusions"] == [
-        {
-            "instance_id": "microsoft__typescript-go@100dbc5",
-            "reason": (
-                "Pinned PR head is no longer available from the repository's Git refs."
-            ),
-        }
-    ]
+    assert {
+        item["instance_id"] for item in manifest["exclusions"]
+    } == expected_exclusions
 
 
-def test_checked_in_v3_manifest_excludes_unavailable_pinned_instance():
+def test_checked_in_v3_manifest_excludes_unavailable_pinned_instances():
     manifest_path = (
         Path(__file__).parents[1]
         / "evaluation"
@@ -119,15 +125,20 @@ def test_checked_in_v3_manifest_excludes_unavailable_pinned_instance():
     )
     manifest = load_manifest(manifest_path)
 
-    assert manifest["counts"]["total"] == 42
+    assert manifest["counts"]["total"] == 40
     assert manifest["counts"]["dev"] == 7
-    assert manifest["counts"]["test"] == 25
+    assert manifest["counts"]["test"] == 23
     assert manifest["counts"]["holdout"] == 10
-    assert manifest["counts"]["by_language"] == {"Go": 21, "Python": 21}
+    assert manifest["counts"]["by_language"] == {"Go": 21, "Python": 19}
     assert manifest["counts"]["by_split_language"]["test"]["Go"] == 12
-    assert manifest["exclusions"][0]["instance_id"] == (
-        "microsoft__typescript-go@100dbc5"
-    )
+    assert manifest["counts"]["by_split_language"]["test"]["Python"] == 11
+    assert {
+        item["instance_id"] for item in manifest["exclusions"]
+    } == {
+        "microsoft__typescript-go@100dbc5",
+        "comfyanonymous__ComfyUI@4936d01",
+        "comfyanonymous__ComfyUI@cfc3122",
+    }
 
 
 def test_manifest_roundtrip_and_split_lookup(tmp_path: Path):

@@ -18,13 +18,13 @@
     "repository_disjoint": true
   },
   "counts": {
-    "total": 42,
+    "total": 40,
     "dev": 7,
-    "test": 25,
+    "test": 23,
     "holdout": 10,
     "by_language": {
       "Go": 21,
-      "Python": 21
+      "Python": 19
     },
     "by_split_language": {
       "dev": {
@@ -33,7 +33,7 @@
       },
       "test": {
         "Go": 12,
-        "Python": 13
+        "Python": 11
       },
       "holdout": {
         "Go": 6,
@@ -370,20 +370,6 @@
       "category": "Code Style, Linting, Formatting Fixes"
     },
     {
-      "instance_id": "comfyanonymous__ComfyUI@4936d01",
-      "split": "test",
-      "repo": "comfyanonymous/ComfyUI",
-      "language": "Python",
-      "pr_number": 7952,
-      "base_commit": "924d771e18000f4cb223575189daa6d2c6c5a9c1",
-      "head_commit": "4936d01872b8719ede33f9a11dc8e898c33d39e4",
-      "github_pr_url": "https://github.com/comfyanonymous/ComfyUI/pull/7952",
-      "clone_url": "https://github.com/comfyanonymous/ComfyUI.git",
-      "reference_comments": 5,
-      "change_line_count": 323,
-      "category": "New Feature Additions"
-    },
-    {
       "instance_id": "comfyanonymous__ComfyUI@4dcd698",
       "split": "test",
       "repo": "comfyanonymous/ComfyUI",
@@ -409,20 +395,6 @@
       "clone_url": "https://github.com/comfyanonymous/ComfyUI.git",
       "reference_comments": 2,
       "change_line_count": 15,
-      "category": "Bug Fix"
-    },
-    {
-      "instance_id": "comfyanonymous__ComfyUI@cfc3122",
-      "split": "test",
-      "repo": "comfyanonymous/ComfyUI",
-      "language": "Python",
-      "pr_number": 9560,
-      "base_commit": "a86aaa430183068e2a264495c802c81d05eb350a",
-      "head_commit": "cfc312296c0b9f255bba6b4b2789ac7bbc66a7cb",
-      "github_pr_url": "https://github.com/comfyanonymous/ComfyUI/pull/9560",
-      "clone_url": "https://github.com/comfyanonymous/ComfyUI.git",
-      "reference_comments": 6,
-      "change_line_count": 319,
       "category": "Bug Fix"
     },
     {
@@ -637,6 +609,14 @@
     }
   ],
   "exclusions": [
+    {
+      "instance_id": "comfyanonymous__ComfyUI@4936d01",
+      "reason": "Pinned PR head is no longer available from the repository or PR refs."
+    },
+    {
+      "instance_id": "comfyanonymous__ComfyUI@cfc3122",
+      "reason": "Pinned PR head is no longer available from the repository or PR refs."
+    },
     {
       "instance_id": "microsoft__typescript-go@100dbc5",
       "reason": "Pinned PR head is no longer available from the repository's Git refs."

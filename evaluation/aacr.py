@@ -30,6 +30,12 @@ MANIFEST_VERSION = "aacr-pygo-v3"
 DEFAULT_SEED = 42
 _DEV_HOLDOUT_FRACTION = 0.2
 EXCLUDED_INSTANCES = {
+    "comfyanonymous__ComfyUI@4936d01": (
+        "Pinned PR head is no longer available from the repository or PR refs."
+    ),
+    "comfyanonymous__ComfyUI@cfc3122": (
+        "Pinned PR head is no longer available from the repository or PR refs."
+    ),
     "microsoft__typescript-go@100dbc5": (
         "Pinned PR head is no longer available from the repository's Git refs."
     )
