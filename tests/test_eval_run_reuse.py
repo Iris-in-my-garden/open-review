@@ -162,6 +162,21 @@ def test_prepare_repositories_uses_at_most_three_workers(tmp_path, monkeypatch):
     assert 1 < max_running <= 3
 
 
+def test_prepare_repositories_prints_progress_bar(tmp_path, monkeypatch, capsys):
+    instances = [_instance("one", "owner/first")]
+    monkeypatch.setattr(
+        "evaluation.repos._ensure_repo_checkout",
+        lambda cache_dir, repo, clone_url, **kwargs: tmp_path / "repo",
+    )
+    monkeypatch.setattr("evaluation.repos.ensure_commit", lambda *args, **kwargs: None)
+
+    prepare_repositories(instances, cache_dir=tmp_path)
+
+    output = capsys.readouterr().out
+    assert "[repo-cache] [------------------------] 0/1 repositories" in output
+    assert "[repo-cache] [########################] 1/1 repositories" in output
+
+
 def test_clone_enables_live_progress_and_inherits_stderr(tmp_path, monkeypatch):
     calls = []
 

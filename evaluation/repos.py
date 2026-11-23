@@ -161,6 +161,12 @@ def _ensure_repo_checkout(
     return path
 
 
+def _print_prepare_progress(completed: int, total: int, *, width: int = 24) -> None:
+    filled = round(width * completed / total)
+    bar = "#" * filled + "-" * (width - filled)
+    print(f"[repo-cache] [{bar}] {completed}/{total} repositories", flush=True)
+
+
 def prepare_repositories(
     instances: Sequence[Dict[str, Any]],
     *,
@@ -177,6 +183,13 @@ def prepare_repositories(
         return 0
     if max_workers < 1:
         raise ValueError("max_workers must be positive")
+    worker_count = min(max_workers, len(by_repo))
+    print(
+        f"[repo-cache] preparing {len(by_repo)} repositories "
+        f"({worker_count} concurrent workers)",
+        flush=True,
+    )
+    _print_prepare_progress(0, len(by_repo))
 
     def prepare_one(
         repo: str, repo_instances: List[Dict[str, Any]]
@@ -208,7 +221,7 @@ def prepare_repositories(
     completed = 0
     failures: List[str] = []
     with ThreadPoolExecutor(
-        max_workers=min(max_workers, len(by_repo)),
+        max_workers=worker_count,
         thread_name_prefix="repo-cache",
     ) as executor:
         futures = {
@@ -217,12 +230,16 @@ def prepare_repositories(
         }
         for future in as_completed(futures):
             repo = futures[future]
-            failures.extend(future.result())
+            repo_failures = future.result()
+            failures.extend(repo_failures)
             completed += 1
-            print(
-                f"[repo-cache] ({completed}/{len(by_repo)}) finished {repo}",
-                flush=True,
-            )
+            _print_prepare_progress(completed, len(by_repo))
+            if repo_failures:
+                print(
+                    f"[repo-cache] {repo}: {len(repo_failures)} failure(s), "
+                    "continuing",
+                    flush=True,
+                )
     if failures:
         failure_list = "\n".join(f"- {failure}" for failure in sorted(failures))
         raise RepoError(
