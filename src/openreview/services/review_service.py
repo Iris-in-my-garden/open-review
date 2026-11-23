@@ -82,6 +82,7 @@ class ReviewPipeline:
         seed: Optional[int] = None,
         index_cache_dir: Optional[str] = None,
         triage_enabled: bool = True,
+        file_filter_enabled: bool = True,
         impact_enabled: bool = True,
         static_analysis_enabled: bool = False,
         static_tools: Sequence[str] = ("ruff",),
@@ -122,6 +123,7 @@ class ReviewPipeline:
             seed=seed,
             index_cache_dir=index_cache_dir,
             triage_enabled=triage_enabled,
+            file_filter_enabled=file_filter_enabled,
             impact_enabled=impact_enabled,
             static_analysis_enabled=static_analysis_enabled,
             static_tools=static_tools,
@@ -334,6 +336,10 @@ class ReviewPipeline:
     @property
     def triage_enabled(self) -> bool:
         return self.config.triage_enabled
+
+    @property
+    def file_filter_enabled(self) -> bool:
+        return self.config.file_filter_enabled
 
     @property
     def impact_enabled(self) -> bool:

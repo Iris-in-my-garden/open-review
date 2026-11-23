@@ -329,6 +329,10 @@ class ReviewState:
     pr_info: Optional[PullRequestInfo] = None
     raw_files: List[ChangedFile] = field(default_factory=list)
     parsed_diff: Optional[ParsedDiff] = None
+    # 硬规则过滤前的完整 diff；报告/metrics 用它解释哪些文件没有进入 LLM。
+    raw_parsed_diff: Optional[ParsedDiff] = None
+    skipped_files: List[Dict[str, Any]] = field(default_factory=list)
+    file_filter_summary: str = ""
     local_repo_path: Optional[Path] = None
     base_path: Optional[Path] = None
     base_error: Optional[str] = None

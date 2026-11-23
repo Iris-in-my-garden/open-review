@@ -22,6 +22,7 @@ from openreview.review.ablation import (
     RETRIEVAL_MODES,
     resolve_ablation,
 )
+from openreview.review.file_filter import FILE_FILTER_POLICY_VERSION
 from openreview.review.token_budget import (
     DEFAULT_HARD_PROMPT_TOKENS,
     DEFAULT_SOFT_PROMPT_TOKENS,
@@ -77,6 +78,8 @@ class ReviewConfig:
     # 检索与证据增强
     index_cache_dir: Optional[str] = None
     triage_enabled: bool = True
+    # 在 triage / batching 前剔除 lockfile、图片、生成代码、纯数据/文档。
+    file_filter_enabled: bool = True
     impact_enabled: bool = True
     static_analysis_enabled: bool = False
     static_tools: Sequence[str] = ("ruff",)
@@ -174,6 +177,8 @@ class ReviewConfig:
             f"ablation={self.ablation or 'custom'}",
             f"retrieval={self.retrieval_mode}",
             f"triage={int(self.triage_enabled)}",
+            f"file_filter={int(self.file_filter_enabled)}",
+            f"file_filter_policy={FILE_FILTER_POLICY_VERSION}",
             f"impact={int(self.impact_enabled)}",
             f"static={int(self.static_analysis_enabled)}",
             f"static_tools={','.join(self.static_tools)}",

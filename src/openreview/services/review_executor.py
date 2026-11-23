@@ -40,6 +40,8 @@ from openreview.review.comment_builder import (
     select_inline_issues,
 )
 from openreview.review.config import ReviewConfig
+from openreview.review.context_filter import filter_redundant_base_contexts
+from openreview.review.file_filter import filter_parsed_diff, summarize_skipped
 from openreview.review.report_writer import ReportWriter
 from openreview.review.token_budget import estimate_tokens
 from openreview.review.triage import (
@@ -476,8 +478,44 @@ class ReviewExecutor:
         if state.parsed_diff is None or state.pr_info is None:
             raise RuntimeError("Parsed diff is missing.")
 
-        if self.config.triage_enabled:
+        state.raw_parsed_diff = state.parsed_diff
+        if self.config.file_filter_enabled:
+            filtered = filter_parsed_diff(state.raw_parsed_diff)
+            state.parsed_diff = filtered.diff
+            state.skipped_files = [
+                decision.as_dict() for decision in filtered.skipped
+            ]
+            state.file_filter_summary = filtered.skipped_summary()
+            if state.skipped_files:
+                state.add_note(
+                    "[filter] 硬规则跳过 "
+                    f"{len(state.skipped_files)} 个低价值文件"
+                    f"（{state.file_filter_summary}）"
+                )
+        else:
+            state.skipped_files = []
+            state.file_filter_summary = ""
+
+        if not state.parsed_diff.files:
+            if state.skipped_files:
+                reason = (
+                    "硬规则跳过了所有变更文件"
+                    f"（{state.file_filter_summary or '低价值文件'}），"
+                    "无需运行 LLM 审查"
+                )
+            else:
+                reason = "没有可审查的文件"
+            decision = TriageDecision([], True, reason)
+        elif self.config.triage_enabled:
             decision = triage(state.parsed_diff)
+            if state.skipped_files:
+                decision = TriageDecision(
+                    list(decision.aspects),
+                    decision.skip_llm,
+                    f"{decision.reason}；硬规则跳过 "
+                    f"{len(state.skipped_files)} 个文件"
+                    f"（{state.file_filter_summary}）",
+                )
         else:
             default_aspects = list(getattr(self.reviewer, "aspects", ALL_ASPECTS))
             decision = TriageDecision(
@@ -490,9 +528,15 @@ class ReviewExecutor:
         state.add_note(f"[triage] {decision.reason}")
 
         if decision.skip_llm:
+            report_diff = state.raw_parsed_diff or state.parsed_diff
             state.review_result = build_skipped_result(
-                state.pr_info, state.parsed_diff, decision
+                state.pr_info, report_diff, decision
             )
+            if state.skipped_files:
+                state.review_result.review_notes.append(
+                    "硬规则未送入 LLM 的文件："
+                    + summarize_skipped(state.skipped_files)
+                )
             logger.info("Triage skipped LLM review: %s", decision.reason)
 
     def _node_analyze(self, state: ReviewState) -> None:
@@ -549,6 +593,33 @@ class ReviewExecutor:
                         include_global_impact=index == 1,
                     )
                 )
+                if prompt_builder is not None and hasattr(
+                    prompt_builder, "fully_visible_patch_files"
+                ):
+                    visible_patch_files = prompt_builder.fully_visible_patch_files(
+                        batch
+                    )
+                    contexts, redundant = filter_redundant_base_contexts(
+                        contexts,
+                        batch,
+                        fully_visible_files=visible_patch_files,
+                    )
+                    if redundant:
+                        state.context_stats["redundant_base_contexts"] = (
+                            state.context_stats.get(
+                                "redundant_base_contexts", 0
+                            )
+                            + len(redundant)
+                        )
+                        state.context_stats["redundant_base_context_tokens"] = (
+                            state.context_stats.get(
+                                "redundant_base_context_tokens", 0
+                            )
+                            + sum(
+                                estimate_tokens(context.snippet)
+                                for context in redundant
+                            )
+                        )
                 contexts = plan_contexts(
                     contexts,
                     self.config.max_context_tokens,
@@ -745,6 +816,14 @@ class ReviewExecutor:
             )
             review_result.review_notes.append(note)
             state.add_note(f"[retrieval] {note}")
+        if state.skipped_files:
+            note = (
+                f"按硬规则跳过 {len(state.skipped_files)} 个低价值文件"
+                f"（{state.file_filter_summary or '见 metrics.filtering'}），"
+                "未送入 LLM；完整清单见 metrics.filtering。"
+            )
+            review_result.review_notes.append(note)
+            state.add_note(f"[filter] {note}")
         state.review_result = review_result
 
     def _collect_prompt_context_stats(self, state: ReviewState) -> Dict[str, int]:

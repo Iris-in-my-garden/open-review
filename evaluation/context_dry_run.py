@@ -7,6 +7,7 @@ from typing import Any, Dict
 
 from openreview.repo.local import LocalReviewInput
 from openreview.retriever.context_planner import plan_contexts
+from openreview.review.context_filter import filter_redundant_base_contexts
 from openreview.review.redaction import redact_text
 from openreview.review.single_shot import SINGLE_SHOT_INSTRUCTION
 from openreview.review.token_budget import estimate_tokens
@@ -62,6 +63,12 @@ def build_context_dry_run(
                     static_contexts,
                     include_global_impact=index == 1,
                 )
+            )
+            visible_patch_files = prompt_builder.fully_visible_patch_files(batch)
+            contexts, redundant_base_contexts = filter_redundant_base_contexts(
+                contexts,
+                batch,
+                fully_visible_files=visible_patch_files,
             )
             contexts = plan_contexts(
                 contexts,
@@ -131,6 +138,7 @@ def build_context_dry_run(
                     "batch": index,
                     "files": [file.filename for file in batch.files],
                     "changed_symbols": batch_changed_symbols,
+                    "redundant_base_contexts": len(redundant_base_contexts),
                     "contexts": context_reports,
                     "patch_tokens_estimate": sum(
                         estimate_tokens(file.patch or "") for file in batch.files

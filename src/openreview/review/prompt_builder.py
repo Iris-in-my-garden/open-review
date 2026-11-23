@@ -4,12 +4,17 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from openreview.domain.models import PullRequestInfo
-from openreview.repo.diff_parser import HUNK_RANGE_PATTERN, ParsedDiff
+from openreview.repo.diff_parser import (
+    HUNK_RANGE_PATTERN,
+    ParsedChangedFile,
+    ParsedDiff,
+)
 from openreview.retriever.code_context import CodeContext, merge_contexts
 from openreview.retriever.context_planner import (
     kind_token_cap,
     priority_token_cap,
 )
+from openreview.review.context_filter import filter_redundant_base_contexts
 from openreview.review.redaction import redact_text
 from openreview.review.token_budget import estimate_tokens, truncate_to_tokens
 
@@ -113,6 +118,8 @@ class PromptBuilder:
             "merged_contexts": 0,
             "used_context_tokens": 0,
             "omitted_context_tokens": 0,
+            "redundant_base_contexts": 0,
+            "redundant_base_context_tokens": 0,
         }
 
     def reset_context_stats(self) -> None:
@@ -208,11 +215,16 @@ class PromptBuilder:
             file_diff.filename,
         )
 
-    def _build_patch_section(
+    def _select_patch_files(
         self, parsed_diff: ParsedDiff
-    ) -> Tuple[List[Tuple[str, str]], List[str], List[str]]:
-        """返回 (filename, block) 列表；后面才能按文件就近挂 context。"""
-        blocks: List[Tuple[str, str]] = []
+    ) -> Tuple[List[Tuple[ParsedChangedFile, str]], List[str], List[str]]:
+        """Select and render patch blocks under the per-batch patch budget.
+
+        Returns ``(selected_files, truncated, skipped)``.  ``selected_files``
+        contains the file object so callers can reason about visibility, not
+        just the rendered text.
+        """
+        selected: List[Tuple[ParsedChangedFile, str]] = []
         truncated: List[str] = []
         skipped: List[str] = []
         remaining = self.max_patch_tokens
@@ -230,9 +242,9 @@ class PromptBuilder:
                     )
                     if was_truncated:
                         truncated.append(file_diff.filename)
-                    blocks.append(
+                    selected.append(
                         (
-                            file_diff.filename,
+                            file_diff,
                             f"### {file_diff.filename}\n```diff\n{annotated}\n```",
                         )
                     )
@@ -241,15 +253,36 @@ class PromptBuilder:
                 remaining = 0
                 continue
 
-            blocks.append(
+            selected.append(
                 (
-                    file_diff.filename,
+                    file_diff,
                     f"### {file_diff.filename}\n```diff\n{annotated}\n```",
                 )
             )
             remaining -= cost
 
-        return blocks, truncated, skipped
+        return selected, truncated, skipped
+
+    def _build_patch_section(
+        self, parsed_diff: ParsedDiff
+    ) -> Tuple[List[Tuple[str, str]], List[str], List[str]]:
+        """返回 (filename, block) 列表；后面才能按文件就近挂 context。"""
+        selected, truncated, skipped = self._select_patch_files(parsed_diff)
+        return (
+            [(file_diff.filename, block) for file_diff, block in selected],
+            truncated,
+            skipped,
+        )
+
+    def fully_visible_patch_files(self, parsed_diff: ParsedDiff) -> set[str]:
+        """Files whose entire patch is present in the prompt (not truncated)."""
+        selected, truncated, _ = self._select_patch_files(parsed_diff)
+        truncated_set = set(truncated)
+        return {
+            file_diff.filename
+            for file_diff, _ in selected
+            if file_diff.filename not in truncated_set
+        }
 
     @staticmethod
     def _render_context(ctx: CodeContext) -> str:
@@ -407,6 +440,19 @@ class PromptBuilder:
         )
 
         patch_blocks, truncated, skipped = self._build_patch_section(parsed_diff)
+        visible_patch_files = {
+            filename for filename, _ in patch_blocks
+        } - set(truncated)
+        contexts, redundant = filter_redundant_base_contexts(
+            contexts,
+            parsed_diff,
+            fully_visible_files=visible_patch_files,
+        )
+        if redundant:
+            self.context_stats["redundant_base_contexts"] += len(redundant)
+            self.context_stats["redundant_base_context_tokens"] += sum(
+                estimate_tokens(context.snippet) for context in redundant
+            )
         patch_str, context_str = self._build_context_sections(patch_blocks, contexts)
 
         note_lines = []

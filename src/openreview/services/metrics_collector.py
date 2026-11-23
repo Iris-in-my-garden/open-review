@@ -8,6 +8,7 @@ and evaluation.
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any, Dict, cast
 
 from openreview.domain.metrics import (
@@ -25,6 +26,7 @@ from openreview.domain.versions import (
     VERIFICATION_METRICS_SCHEMA_VERSION,
 )
 from openreview.review.config import ReviewConfig
+from openreview.review.file_filter import FILE_FILTER_POLICY_VERSION
 from openreview.review.token_budget import estimate_tokens
 from openreview.review.workflow import ReviewOutcome, ReviewState
 
@@ -49,6 +51,12 @@ class MetricsCollector:
             estimate_tokens(context.snippet) for context in state.all_contexts
         )
         diff_files = parsed_diff.files if parsed_diff else []
+        raw_diff = getattr(state, "raw_parsed_diff", None) or parsed_diff
+        raw_files = raw_diff.files if raw_diff else []
+        skipped_files = list(getattr(state, "skipped_files", []) or [])
+        skipped_categories = Counter(
+            str(item.get("category") or "other") for item in skipped_files
+        )
         changed_files = {file.filename for file in diff_files}
         context_files = {context.file_path for context in state.all_contexts}
         covered_files = changed_files & context_files
@@ -118,6 +126,21 @@ class MetricsCollector:
                 "languages": sorted(
                     {file.language for file in diff_files if file.language}
                 ),
+            },
+            "filtering": {
+                "enabled": config.file_filter_enabled,
+                "policy": FILE_FILTER_POLICY_VERSION,
+                "raw_files": len(raw_files),
+                "reviewable_files": len(diff_files),
+                "skipped_files": len(skipped_files),
+                "skipped_additions": sum(
+                    int(item.get("additions") or 0) for item in skipped_files
+                ),
+                "skipped_deletions": sum(
+                    int(item.get("deletions") or 0) for item in skipped_files
+                ),
+                "categories": dict(sorted(skipped_categories.items())),
+                "files": skipped_files[:100],
             },
             "retrieval": {
                 "contexts": len(state.all_contexts),

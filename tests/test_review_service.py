@@ -386,6 +386,70 @@ def test_pipeline_triage_skips_llm_for_docs_only_pr(tmp_path: Path):
     assert "**LLM Calls**: 0" in content
 
 
+def test_pipeline_filters_low_value_files_before_review(tmp_path: Path):
+    files = [
+        ChangedFile(
+            filename="src/app.py",
+            status="modified",
+            additions=1,
+            deletions=0,
+            changes=1,
+            patch="@@ -0,0 +1,1 @@\n+x = 1\n",
+        ),
+        ChangedFile(
+            filename="README.md",
+            status="modified",
+            additions=1,
+            deletions=0,
+            changes=1,
+            patch="@@ -0,0 +1,1 @@\n+docs\n",
+        ),
+        ChangedFile(
+            filename="package-lock.json",
+            status="modified",
+            additions=1,
+            deletions=1,
+            changes=2,
+            patch="@@ -1 +1 @@\n-a\n+b\n",
+        ),
+        ChangedFile(
+            filename="assets/logo.png",
+            status="added",
+            additions=0,
+            deletions=0,
+            changes=0,
+            patch=None,
+        ),
+    ]
+    pipeline = ReviewPipeline(mock_llm=True, max_batch_tokens=1)
+    pipeline.gh_client = FakeGitHubClient(files=files)
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+    pipeline.reviewer = FakeReviewer()
+
+    pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+
+    assert len(pipeline.reviewer.calls) == 1
+    reviewed_diff, _ = pipeline.reviewer.calls[0]
+    assert [file.filename for file in reviewed_diff.files] == ["src/app.py"]
+
+    metrics = pipeline.last_result.metrics
+    assert metrics["files"] == 1
+    filtering = metrics["filtering"]
+    assert filtering["enabled"] is True
+    assert filtering["raw_files"] == 4
+    assert filtering["reviewable_files"] == 1
+    assert filtering["skipped_files"] == 3
+    assert filtering["categories"] == {
+        "binary": 1,
+        "docs": 1,
+        "lockfile": 1,
+    }
+    assert "硬规则跳过 3 个低价值文件" in " ".join(
+        pipeline.last_result.review_notes
+    )
+
+
 def test_pipeline_degrades_gracefully_when_call_budget_runs_out(tmp_path: Path):
     pipeline = ReviewPipeline(mock_llm=True, max_batch_tokens=1, budget_calls=2)
     pipeline.gh_client = FakeGitHubClient()

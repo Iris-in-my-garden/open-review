@@ -1,5 +1,5 @@
 from openreview.github.client import PullRequestInfo
-from openreview.repo.diff_parser import DiffParser
+from openreview.repo.diff_parser import DiffParser, ParsedDiff
 from openreview.retriever.code_context import CodeContext, ContextPriority
 from openreview.review.prompt_builder import (
     UNTRUSTED_END,
@@ -352,3 +352,70 @@ def test_prompt_builder_merges_duplicate_contexts_before_injection():
     assert builder.context_stats["merged_contexts"] == 1
     assert prompt.count(enclosing.context_id) == 1
     assert duplicate.context_id not in prompt
+
+
+def _deletion_diff(extra_added_lines: int = 0) -> ParsedDiff:
+    added = "".join(f"+new_{index} = {index}\n" for index in range(extra_added_lines))
+    patch = (
+        "@@ -10,2 +9,"
+        f"{extra_added_lines} @@\n"
+        "-def old_func():\n"
+        "-    return 0\n"
+        f"{added}"
+    )
+    return DiffParser.parse_diff(
+        [
+            {
+                "filename": "src/utils.py",
+                "status": "modified",
+                "additions": extra_added_lines,
+                "deletions": 2,
+                "patch": patch,
+            }
+        ]
+    )
+
+
+def _removed_base_context() -> CodeContext:
+    return CodeContext(
+        file_path="src/utils.py",
+        reason="[base revision] removed definition",
+        snippet="def old_func():\n    return 0",
+        score=0.8,
+        revision="base",
+        kind="base_definition",
+        priority=ContextPriority.DEFINITION,
+        symbol="old_func",
+        start_line=10,
+        end_line=11,
+    )
+
+
+def test_base_definition_fully_covered_by_deleted_lines_is_skipped():
+    """Patch 已完整展示删除行时，base 定义不再重复进入 <base_branch_context>。"""
+    base = _removed_base_context()
+    base.ensure_context_id()
+    builder = PromptBuilder()
+
+    prompt = builder.build_user_prompt(_pr(), _deletion_diff(), [base])
+
+    assert base.context_id not in prompt
+    assert "<base_branch_context>\n以下代码" not in prompt
+    assert builder.context_stats["redundant_base_contexts"] == 1
+    assert builder.context_stats["redundant_base_context_tokens"] > 0
+
+
+def test_base_definition_is_kept_when_patch_is_truncated():
+    """Patch 被截断时删除行不再完整可见，base 定义必须保留作为唯一证据。"""
+    base = _removed_base_context()
+    base.ensure_context_id()
+    builder = PromptBuilder(max_patch_tokens=200)
+
+    prompt = builder.build_user_prompt(
+        _pr(), _deletion_diff(extra_added_lines=400), [base]
+    )
+
+    assert base.context_id in prompt
+    assert "<base_branch_context>" in prompt
+    assert "Patch 被截断" in prompt
+    assert builder.context_stats["redundant_base_contexts"] == 0

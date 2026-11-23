@@ -27,6 +27,18 @@ class DiffMetrics(TypedDict):
     languages: List[str]
 
 
+class FileFilteringMetrics(TypedDict):
+    enabled: bool
+    policy: str
+    raw_files: int
+    reviewable_files: int
+    skipped_files: int
+    skipped_additions: int
+    skipped_deletions: int
+    categories: Dict[str, int]
+    files: List[Dict[str, object]]
+
+
 class ContextGapMetrics(TypedDict, total=False):
     batch_context_occurrences: int
     cross_batch_duplicates: int
@@ -168,6 +180,7 @@ class RunMetrics(TypedDict, total=False):
     total_seconds: float
     files: int
     diff: DiffMetrics
+    filtering: FileFilteringMetrics
     retrieval: RetrievalMetrics
     batches: int
     ablation: str
