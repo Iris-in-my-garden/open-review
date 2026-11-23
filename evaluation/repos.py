@@ -12,7 +12,6 @@ import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from threading import Lock
 from typing import Any, Dict, List, Optional, Sequence
 
 DEFAULT_TIMEOUT = 1800
@@ -134,6 +133,24 @@ def ensure_repo(
     timeout: int = DEFAULT_TIMEOUT,
 ) -> Path:
     """返回包含所需 commits 的本地仓库；对象已缓存时不发起网络 fetch。"""
+    path = _ensure_repo_checkout(
+        cache_dir, repo, clone_url, timeout=timeout
+    )
+    # Cached commits need no network access. Fetch only when a required object
+    # is missing; ensure_commit falls back to a full fetch if a direct fetch fails.
+    ensure_commit(path, base_commit, timeout=timeout)
+    ensure_commit(path, head_commit, timeout=timeout)
+    return path
+
+
+def _ensure_repo_checkout(
+    cache_dir: Path,
+    repo: str,
+    clone_url: str,
+    *,
+    timeout: int,
+) -> Path:
+    """Clone a repository if needed, without checking any commit."""
     path = repo_cache_path(cache_dir, repo)
     if not (path / ".git").exists():
         if path.exists():
@@ -141,11 +158,6 @@ def ensure_repo(
             shutil.rmtree(path, ignore_errors=True)
         print(f"[repo] clone {repo} -> {path}")
         _clone(path, clone_url, timeout=timeout)
-
-    # Cached commits need no network access. Fetch only when a required object
-    # is missing; ensure_commit falls back to a full fetch if a direct fetch fails.
-    ensure_commit(path, base_commit, timeout=timeout)
-    ensure_commit(path, head_commit, timeout=timeout)
     return path
 
 
@@ -166,28 +178,35 @@ def prepare_repositories(
     if max_workers < 1:
         raise ValueError("max_workers must be positive")
 
-    def prepare_one(repo: str, repo_instances: List[Dict[str, Any]]) -> None:
+    def prepare_one(
+        repo: str, repo_instances: List[Dict[str, Any]]
+    ) -> List[str]:
         first = repo_instances[0]
-        repo_path = ensure_repo(
-            cache_dir,
-            repo,
-            first.get("clone_url") or f"https://github.com/{repo}.git",
-            first["base_commit"],
-            first["head_commit"],
-            timeout=timeout,
-        )
         commits = {
             commit
             for instance in repo_instances
             for commit in (instance["base_commit"], instance["head_commit"])
         }
-        commits.discard(first["base_commit"])
-        commits.discard(first["head_commit"])
+        failures: List[str] = []
+        try:
+            repo_path = _ensure_repo_checkout(
+                cache_dir,
+                repo,
+                first.get("clone_url") or f"https://github.com/{repo}.git",
+                timeout=timeout,
+            )
+        except RepoError as error:
+            return [f"{repo}: clone/cache preparation failed: {error}"]
+
         for commit in sorted(commits):
-            ensure_commit(repo_path, commit, timeout=timeout)
+            try:
+                ensure_commit(repo_path, commit, timeout=timeout)
+            except RepoError as error:
+                failures.append(f"{repo} @ {commit}: {error}")
+        return failures
 
     completed = 0
-    progress_lock = Lock()
+    failures: List[str] = []
     with ThreadPoolExecutor(
         max_workers=min(max_workers, len(by_repo)),
         thread_name_prefix="repo-cache",
@@ -198,13 +217,18 @@ def prepare_repositories(
         }
         for future in as_completed(futures):
             repo = futures[future]
-            future.result()
-            with progress_lock:
-                completed += 1
-                print(
-                    f"[repo-cache] ({completed}/{len(by_repo)}) ready {repo}",
-                    flush=True,
-                )
+            failures.extend(future.result())
+            completed += 1
+            print(
+                f"[repo-cache] ({completed}/{len(by_repo)}) finished {repo}",
+                flush=True,
+            )
+    if failures:
+        failure_list = "\n".join(f"- {failure}" for failure in sorted(failures))
+        raise RepoError(
+            f"仓库预热已完成，但有 {len(failures)} 项失败；其余仓库/commit 已继续处理：\n"
+            f"{failure_list}"
+        )
     return len(by_repo)
 
 

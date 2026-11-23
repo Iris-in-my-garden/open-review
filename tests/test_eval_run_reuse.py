@@ -3,7 +3,9 @@ import subprocess
 import threading
 import time
 
-from evaluation.repos import prepare_repositories
+import pytest
+
+from evaluation.repos import RepoError, prepare_repositories
 from evaluation.results import (
     has_reusable_results,
     result_path,
@@ -76,11 +78,11 @@ def test_prepare_repositories_once_per_unique_repo(tmp_path, monkeypatch):
     prepared = []
     checked_commits = []
 
-    def fake_ensure_repo(cache_dir, repo, clone_url, base_commit, head_commit, **kwargs):
-        prepared.append((repo, base_commit, head_commit))
+    def fake_checkout(cache_dir, repo, clone_url, **kwargs):
+        prepared.append(repo)
         return tmp_path / repo.replace("/", "__")
 
-    monkeypatch.setattr("evaluation.repos.ensure_repo", fake_ensure_repo)
+    monkeypatch.setattr("evaluation.repos._ensure_repo_checkout", fake_checkout)
     monkeypatch.setattr(
         "evaluation.repos.ensure_commit",
         lambda repo_path, commit, **kwargs: checked_commits.append(
@@ -91,8 +93,48 @@ def test_prepare_repositories_once_per_unique_repo(tmp_path, monkeypatch):
     count = prepare_repositories(instances, cache_dir=tmp_path)
 
     assert count == 2
-    assert {item[0] for item in prepared} == {"owner/first", "owner/second"}
-    assert len(checked_commits) == 2
+    assert set(prepared) == {"owner/first", "owner/second"}
+    assert len(checked_commits) == 6
+
+
+def test_prepare_repositories_collects_commit_failures_and_continues(
+    tmp_path, monkeypatch
+):
+    instances = [
+        _instance("one", "owner/first"),
+        _instance("two", "owner/first"),
+        _instance("three", "owner/second"),
+    ]
+    checked_commits = []
+
+    monkeypatch.setattr(
+        "evaluation.repos._ensure_repo_checkout",
+        lambda cache_dir, repo, clone_url, **kwargs: (
+            tmp_path / repo.replace("/", "__")
+        ),
+    )
+
+    def fake_ensure_commit(repo_path, commit, **kwargs):
+        checked_commits.append(commit)
+        if commit in {"base-one", "head-three"}:
+            raise RepoError(f"unavailable {commit}")
+
+    monkeypatch.setattr("evaluation.repos.ensure_commit", fake_ensure_commit)
+
+    with pytest.raises(RepoError, match="unavailable base-one") as error:
+        prepare_repositories(instances, cache_dir=tmp_path)
+
+    assert set(checked_commits) == {
+        "base-one",
+        "head-one",
+        "base-two",
+        "head-two",
+        "base-three",
+        "head-three",
+    }
+    assert "owner/first @ base-one" in str(error.value)
+    assert "owner/second @ head-three" in str(error.value)
+    assert "其余仓库/commit 已继续处理" in str(error.value)
 
 
 def test_prepare_repositories_uses_at_most_three_workers(tmp_path, monkeypatch):
@@ -101,7 +143,7 @@ def test_prepare_repositories_uses_at_most_three_workers(tmp_path, monkeypatch):
     running = 0
     max_running = 0
 
-    def fake_ensure_repo(cache_dir, repo, clone_url, base_commit, head_commit, **kwargs):
+    def fake_checkout(cache_dir, repo, clone_url, **kwargs):
         nonlocal running, max_running
         with lock:
             running += 1
@@ -111,7 +153,7 @@ def test_prepare_repositories_uses_at_most_three_workers(tmp_path, monkeypatch):
             running -= 1
         return tmp_path / repo.replace("/", "__")
 
-    monkeypatch.setattr("evaluation.repos.ensure_repo", fake_ensure_repo)
+    monkeypatch.setattr("evaluation.repos._ensure_repo_checkout", fake_checkout)
     monkeypatch.setattr("evaluation.repos.ensure_commit", lambda *args, **kwargs: None)
 
     count = prepare_repositories(instances, cache_dir=tmp_path)
