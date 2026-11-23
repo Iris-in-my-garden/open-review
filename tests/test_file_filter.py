@@ -34,11 +34,19 @@ def test_lockfile_is_skipped():
     assert decision.category == "lockfile"
 
 
-def test_image_without_text_patch_is_skipped_as_binary():
+def test_image_without_text_patch_is_classified_by_asset_extension():
     decision = classify_file(_file("assets/logo.png", patch=None, status="added"))
 
     assert decision.action == SKIP
-    assert decision.category == "binary"
+    assert decision.category == "asset"
+
+
+def test_missing_source_patch_is_unavailable_not_binary():
+    decision = classify_file(_file("src/important.py", patch=None))
+
+    assert decision.action == SKIP
+    assert decision.category == "unavailable_patch"
+    assert "未将其误判为二进制文件" in decision.reason
 
 
 def test_textual_static_asset_is_skipped():
@@ -89,6 +97,20 @@ def test_manifest_and_ci_yaml_are_kept():
     assert classify_file(_file("tsconfig.json")).action == REVIEW
     assert classify_file(_file(".github/workflows/ci.yml")).action == REVIEW
     assert classify_file(_file("k8s/deployment.yaml")).action == REVIEW
+
+
+def test_common_json_config_files_are_kept():
+    assert classify_file(_file("config.json")).action == REVIEW
+    assert classify_file(_file("src/settings/local.json")).action == REVIEW
+    assert classify_file(_file("appsettings.Production.json")).action == REVIEW
+    assert classify_file(_file("services/api/vitest.config.json")).action == REVIEW
+
+
+def test_config_without_patch_is_reported_as_unavailable():
+    decision = classify_file(_file("config/settings.json", patch=None))
+
+    assert decision.action == SKIP
+    assert decision.category == "unavailable_patch"
 
 
 def test_markdown_docs_are_skipped():

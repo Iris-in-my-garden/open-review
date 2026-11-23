@@ -488,8 +488,8 @@ class ReviewExecutor:
             state.file_filter_summary = filtered.skipped_summary()
             if state.skipped_files:
                 state.add_note(
-                    "[filter] 硬规则跳过 "
-                    f"{len(state.skipped_files)} 个低价值文件"
+                    "[filter] 文件策略未送入 LLM "
+                    f"{len(state.skipped_files)} 个文件"
                     f"（{state.file_filter_summary}）"
                 )
         else:
@@ -499,8 +499,8 @@ class ReviewExecutor:
         if not state.parsed_diff.files:
             if state.skipped_files:
                 reason = (
-                    "硬规则跳过了所有变更文件"
-                    f"（{state.file_filter_summary or '低价值文件'}），"
+                    "文件策略过滤/排除了所有变更文件"
+                    f"（{state.file_filter_summary or '无可审查 patch'}），"
                     "无需运行 LLM 审查"
                 )
             else:
@@ -512,7 +512,7 @@ class ReviewExecutor:
                 decision = TriageDecision(
                     list(decision.aspects),
                     decision.skip_llm,
-                    f"{decision.reason}；硬规则跳过 "
+                    f"{decision.reason}；文件策略未送入 LLM "
                     f"{len(state.skipped_files)} 个文件"
                     f"（{state.file_filter_summary}）",
                 )
@@ -534,7 +534,7 @@ class ReviewExecutor:
             )
             if state.skipped_files:
                 state.review_result.review_notes.append(
-                    "硬规则未送入 LLM 的文件："
+                    "文件策略未送入 LLM 的文件："
                     + summarize_skipped(state.skipped_files)
                 )
             logger.info("Triage skipped LLM review: %s", decision.reason)
@@ -818,9 +818,9 @@ class ReviewExecutor:
             state.add_note(f"[retrieval] {note}")
         if state.skipped_files:
             note = (
-                f"按硬规则跳过 {len(state.skipped_files)} 个低价值文件"
+                f"按文件策略未送入 LLM {len(state.skipped_files)} 个文件"
                 f"（{state.file_filter_summary or '见 metrics.filtering'}），"
-                "未送入 LLM；完整清单见 metrics.filtering。"
+                "完整清单见 metrics.filtering。"
             )
             review_result.review_notes.append(note)
             state.add_note(f"[filter] {note}")

@@ -441,11 +441,11 @@ def test_pipeline_filters_low_value_files_before_review(tmp_path: Path):
     assert filtering["reviewable_files"] == 1
     assert filtering["skipped_files"] == 3
     assert filtering["categories"] == {
-        "binary": 1,
+        "asset": 1,
         "docs": 1,
         "lockfile": 1,
     }
-    assert "硬规则跳过 3 个低价值文件" in " ".join(
+    assert "文件策略未送入 LLM 3 个文件" in " ".join(
         pipeline.last_result.review_notes
     )
 

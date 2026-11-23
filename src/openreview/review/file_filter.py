@@ -20,7 +20,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
 
-FILE_FILTER_POLICY_VERSION = "file-filter-v1"
+FILE_FILTER_POLICY_VERSION = "file-filter-v2"
 
 REVIEW = "review"
 SKIP = "skip"
@@ -258,6 +258,16 @@ CONFIG_BASENAMES = frozenset(
         "compose.yml",
         "compose.yaml",
         "manifest.json",
+        "config.json",
+        "settings.json",
+        "appsettings.json",
+        "firebase.json",
+        "angular.json",
+        "vercel.json",
+        "netlify.json",
+        "babel.json",
+        "deno.json",
+        "composer.json",
         "openapi.json",
         "openapi.yaml",
         "openapi.yml",
@@ -285,6 +295,10 @@ CONFIG_PATTERNS = (
     "constraints*.txt",
     "tsconfig*.json",
     "jsconfig*.json",
+    "*.config.json",
+    "config*.json",
+    "settings*.json",
+    "appsettings*.json",
     ".eslintrc*",
     "eslint.config.*",
     ".prettierrc*",
@@ -430,10 +444,19 @@ def _is_generated(filename: str, patch: str | None) -> bool:
 def _is_reviewable_config(filename: str) -> bool:
     name = _basename(filename)
     normalized = filename.replace("\\", "/").lower()
+    parts = _normalized_parts(filename)
     return (
         name in CONFIG_BASENAMES
         or _matches_any(name, CONFIG_PATTERNS)
         or normalized.startswith(".github/workflows/")
+        or (
+            Path(name).suffix in {".json", ".yaml", ".yml"}
+            and any(
+                part
+                in {"config", "configs", "settings", ".vscode", ".devcontainer"}
+                for part in parts[:-1]
+            )
+        )
     )
 
 
@@ -472,13 +495,6 @@ def classify_file(file_diff: ParsedChangedFile) -> FileFilterDecision:
             deletions=deletions,
         )
 
-    if not file_diff.patch:
-        return decision(
-            SKIP,
-            "binary",
-            "没有文本 patch（二进制、超大文件或 GitHub 未返回内容）",
-        )
-
     if _is_lockfile(filename):
         return decision(SKIP, "lockfile", "依赖锁文件，由包管理器/CI 校验")
 
@@ -493,6 +509,12 @@ def classify_file(file_diff: ParsedChangedFile) -> FileFilterDecision:
         )
 
     if _is_reviewable_config(filename):
+        if not file_diff.patch:
+            return decision(
+                SKIP,
+                "unavailable_patch",
+                "配置文件没有可用文本 patch，无法审查；未将其误判为二进制文件",
+            )
         return decision(REVIEW, "config", "工程配置/依赖清单/CI 配置，保留审查")
 
     if _is_docs(filename):
@@ -503,6 +525,13 @@ def classify_file(file_diff: ParsedChangedFile) -> FileFilterDecision:
             SKIP,
             "data",
             "纯 JSON/YAML/CSV/XML 数据或快照，不包含可推理的实现逻辑",
+        )
+
+    if not file_diff.patch:
+        return decision(
+            SKIP,
+            "unavailable_patch",
+            "没有可用文本 patch，无法审查；未将其误判为二进制文件",
         )
 
     if file_diff.is_test_file:
