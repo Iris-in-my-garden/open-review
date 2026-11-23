@@ -1,4 +1,7 @@
 import json
+import subprocess
+import threading
+import time
 
 from evaluation.repos import prepare_repositories
 from evaluation.results import (
@@ -88,8 +91,52 @@ def test_prepare_repositories_once_per_unique_repo(tmp_path, monkeypatch):
     count = prepare_repositories(instances, cache_dir=tmp_path)
 
     assert count == 2
-    assert [item[0] for item in prepared] == ["owner/first", "owner/second"]
+    assert {item[0] for item in prepared} == {"owner/first", "owner/second"}
     assert len(checked_commits) == 2
+
+
+def test_prepare_repositories_uses_at_most_three_workers(tmp_path, monkeypatch):
+    instances = [_instance(str(index), f"owner/repo-{index}") for index in range(6)]
+    lock = threading.Lock()
+    running = 0
+    max_running = 0
+
+    def fake_ensure_repo(cache_dir, repo, clone_url, base_commit, head_commit, **kwargs):
+        nonlocal running, max_running
+        with lock:
+            running += 1
+            max_running = max(max_running, running)
+        time.sleep(0.03)
+        with lock:
+            running -= 1
+        return tmp_path / repo.replace("/", "__")
+
+    monkeypatch.setattr("evaluation.repos.ensure_repo", fake_ensure_repo)
+    monkeypatch.setattr("evaluation.repos.ensure_commit", lambda *args, **kwargs: None)
+
+    count = prepare_repositories(instances, cache_dir=tmp_path)
+
+    assert count == len(instances)
+    assert 1 < max_running <= 3
+
+
+def test_clone_enables_live_progress_and_inherits_stderr(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("evaluation.repos.subprocess.run", fake_run)
+
+    from evaluation.repos import _clone
+
+    _clone(tmp_path / "cache" / "repo", "https://example.test/repo.git", timeout=10)
+
+    command, kwargs = calls[0]
+    assert "--progress" in command
+    assert kwargs["stdout"] == subprocess.DEVNULL
+    assert "stderr" not in kwargs
 
 
 def test_ensure_repo_does_not_fetch_when_required_commits_are_cached(

@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, List, Optional, Sequence
 
 DEFAULT_TIMEOUT = 1800
+MAX_PREPARE_WORKERS = 3
 
 
 class RepoError(RuntimeError):
@@ -64,14 +67,20 @@ def _clone(
     # `git grep`，partial clone 会为缺失的 blob 触发懒加载，轻则变慢，重则
     # 在无网 CI 上直接挂住。评测仓库是一次性准备，优先保证可预测。
     path.parent.mkdir(parents=True, exist_ok=True)
-    run_git(
-        None,
-        "clone",
-        "--no-checkout",
-        clone_url,
-        str(path),
-        timeout=timeout,
-    )
+    command = ["git", "clone", "--progress", "--no-checkout", clone_url, str(path)]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RepoError(f"git 命令超时: {' '.join(command)}") from error
+    if result.returncode != 0:
+        raise RepoError(
+            f"git 命令失败 ({result.returncode}): {' '.join(command)}"
+        )
 
 
 def _has_commit(repo: Path, commit: str) -> bool:
@@ -145,13 +154,19 @@ def prepare_repositories(
     *,
     cache_dir: Path,
     timeout: int = DEFAULT_TIMEOUT,
+    max_workers: int = MAX_PREPARE_WORKERS,
 ) -> int:
-    """Pre-populate repo caches and all requested base/head commits."""
+    """Pre-populate repo caches concurrently and ensure all requested commits."""
     by_repo: Dict[str, List[Dict[str, Any]]] = {}
     for instance in instances:
         by_repo.setdefault(instance["repo"], []).append(instance)
 
-    for repo, repo_instances in by_repo.items():
+    if not by_repo:
+        return 0
+    if max_workers < 1:
+        raise ValueError("max_workers must be positive")
+
+    def prepare_one(repo: str, repo_instances: List[Dict[str, Any]]) -> None:
         first = repo_instances[0]
         repo_path = ensure_repo(
             cache_dir,
@@ -170,6 +185,26 @@ def prepare_repositories(
         commits.discard(first["head_commit"])
         for commit in sorted(commits):
             ensure_commit(repo_path, commit, timeout=timeout)
+
+    completed = 0
+    progress_lock = Lock()
+    with ThreadPoolExecutor(
+        max_workers=min(max_workers, len(by_repo)),
+        thread_name_prefix="repo-cache",
+    ) as executor:
+        futures = {
+            executor.submit(prepare_one, repo, repo_instances): repo
+            for repo, repo_instances in by_repo.items()
+        }
+        for future in as_completed(futures):
+            repo = futures[future]
+            future.result()
+            with progress_lock:
+                completed += 1
+                print(
+                    f"[repo-cache] ({completed}/{len(by_repo)}) ready {repo}",
+                    flush=True,
+                )
     return len(by_repo)
 
 
