@@ -20,7 +20,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
 
-FILE_FILTER_POLICY_VERSION = "file-filter-v2"
+FILE_FILTER_POLICY_VERSION = "file-filter-v3"
 
 REVIEW = "review"
 SKIP = "skip"
@@ -165,6 +165,19 @@ DATA_PATH_PARTS = frozenset(
         "starter_projects",
     }
 )
+
+# Generated baseline/snapshot artifacts and vendored patches are not source
+# code. They are expected outputs (or third-party diffs) and reviewing them
+# line-by-line mostly produces noise; a deterministic note is enough.
+SNAPSHOT_PATH_PARTS = frozenset(
+    {"baselines", "snapshots", "__snapshots__"}
+)
+TESTDATA_PATH_PARTS = frozenset({"testdata", "test_data"})
+SNAPSHOT_EXTENSIONS = frozenset(
+    {".types", ".symbols", ".diff", ".snap", ".baseline"}
+)
+VENDORED_PATCH_EXTENSIONS = frozenset({".patch"})
+BUNDLED_PATH_PARTS = frozenset({"bundled"})
 
 DOCS_EXTENSIONS = frozenset({".md", ".mdx", ".rst", ".adoc", ".txt"})
 
@@ -479,6 +492,30 @@ def _is_data(filename: str) -> bool:
     return name in DATA_BASENAMES
 
 
+def _is_snapshot(filename: str) -> bool:
+    parts = _normalized_parts(filename)
+    if any(part in SNAPSHOT_PATH_PARTS for part in parts[:-1]):
+        return True
+    return Path(filename).suffix.lower() in SNAPSHOT_EXTENSIONS
+
+
+def _is_testdata(filename: str) -> bool:
+    parts = _normalized_parts(filename)
+    return any(part in TESTDATA_PATH_PARTS for part in parts[:-1])
+
+
+def _is_vendored_patch(filename: str) -> bool:
+    return Path(filename).suffix.lower() in VENDORED_PATCH_EXTENSIONS
+
+
+def _is_bundled_generated(filename: str) -> bool:
+    parts = _normalized_parts(filename)
+    return (
+        any(part in BUNDLED_PATH_PARTS for part in parts[:-1])
+        and _basename(filename).endswith(".d.ts")
+    )
+
+
 def classify_file(file_diff: ParsedChangedFile) -> FileFilterDecision:
     """Return a deterministic review/skip decision for one changed file."""
     filename = file_diff.filename
@@ -506,6 +543,34 @@ def classify_file(file_diff: ParsedChangedFile) -> FileFilterDecision:
             SKIP,
             "generated",
             "自动生成代码或构建产物，应修改生成源而不是直接审查",
+        )
+
+    if _is_snapshot(filename):
+        return decision(
+            SKIP,
+            "snapshot",
+            "生成的 baseline/快照预期输出，应由生成器或 CI 校验",
+        )
+
+    if _is_testdata(filename):
+        return decision(
+            SKIP,
+            "testdata",
+            "testdata/fixture 数据文件，不包含需要逐行审查的实现逻辑",
+        )
+
+    if _is_vendored_patch(filename):
+        return decision(
+            SKIP,
+            "vendored_patch",
+            "第三方/vendored patch 文件，不是本仓库的实现源码",
+        )
+
+    if _is_bundled_generated(filename):
+        return decision(
+            SKIP,
+            "bundled",
+            "bundled/generated 类型声明，应修改生成源而不是直接审查",
         )
 
     if _is_reviewable_config(filename):

@@ -171,3 +171,69 @@ def test_summarize_skipped_handles_serialized_decisions():
     )
 
     assert summary == "data 2、docs 1"
+
+
+def test_snapshot_testdata_and_vendored_artifacts_are_skipped():
+    assert classify_file(_file("testdata/baselines/reference/a.types")).category == "snapshot"
+    assert classify_file(_file("testdata/baselines/reference/a.js")).category == "snapshot"
+    assert classify_file(_file("snapshots/expected.json")).category == "snapshot"
+    assert classify_file(_file("testdata/fixtures/input.go")).category == "testdata"
+    assert classify_file(_file("llama/patches/0001-fix.patch")).category == "vendored_patch"
+    assert (
+        classify_file(_file("internal/bundled/libs/lib.dom.d.ts")).category
+        == "bundled"
+    )
+
+
+def test_real_cpp_and_cuda_sources_are_kept():
+    for filename in (
+        "csrc/cache_kernels.cu",
+        "csrc/cutlass_extensions/common.hpp",
+        "ml/backend/ggml/ggml/src/ggml-cuda/convert.cuh",
+        "backend/cpp/llama/grpc-server.cpp",
+        "src/kernel.c",
+        "include/api.h",
+    ):
+        decision = classify_file(_file(filename))
+        assert decision.action == REVIEW, filename
+        assert decision.category == "code", filename
+
+
+def test_filter_summary_includes_snapshot_categories():
+    diff = DiffParser.parse_diff(
+        [
+            {
+                "filename": "src/app.py",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 0,
+                "patch": "@@ -0,0 +1,1 @@\n+x = 1\n",
+            },
+            {
+                "filename": "testdata/baselines/a.types",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 0,
+                "patch": "@@ -0,0 +1,1 @@\n+a\n",
+            },
+            {
+                "filename": "llama/patches/0001.patch",
+                "status": "modified",
+                "additions": 1,
+                "deletions": 0,
+                "patch": "@@ -0,0 +1,1 @@\n+a\n",
+            },
+        ]
+    )
+
+    result = filter_parsed_diff(diff)
+
+    assert [file.filename for file in result.diff.files] == ["src/app.py"]
+    assert "snapshot 1" in result.skipped_summary()
+    assert "vendored_patch 1" in result.skipped_summary()
+
+
+def test_testdata_source_fixtures_are_skipped():
+    """testdata 是 fixture/快照，不是需要逐行审查的实现源码。"""
+    assert classify_file(_file("pkg/testdata/fixture.go")).category == "testdata"
+    assert classify_file(_file("pkg/test_data/fixture.py")).category == "testdata"

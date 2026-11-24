@@ -25,6 +25,12 @@
 > `LocalWorkspace.cleanup()` 只归还 slot，`pipeline.close()` 再统一删除。
 > 评测 CLI 的 `review` 默认开启；`--keep-worktrees` 仍走独立 worktree。
 
+> 文件过滤（`file-filter-v3`）在 triage 前跳过：锁文件、二进制/资产、生成代码、
+> baseline/snapshot、`testdata`/`test_data`、vendored `.patch`、bundled
+> `.d.ts` 以及 Markdown/文档。真实 C/C++/CUDA/Metal 源码保留。被跳过文件记录在
+> `skipped_files`；如果所有文件都被跳过，triage 直接 `skip_llm` 并生成说明，
+> 不调用 LLM。
+
 ## 2. `analyze` 内部顺序
 
 对每个 batch 严格执行以下顺序，任何一步失败都不会影响已完成的 batch：
