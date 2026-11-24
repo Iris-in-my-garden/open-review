@@ -14,11 +14,12 @@ Phase 1 的 ``HybridRetriever`` 已经能按符号名和 import 找上下文；�
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from openreview.retriever import ast_utils
-from openreview.retriever.ast_utils import read_line_range
+from openreview.retriever.ast_utils import FileLineCache
 from openreview.retriever.code_context import (
     CodeContext,
     ContextPriority,
@@ -39,6 +40,15 @@ CALL_SITE_RADIUS = 5
 MAX_PRIVATE_HELPER_LINES = 25
 
 
+@dataclass(frozen=True)
+class _FileImports:
+    modules: frozenset[str]
+    symbols: frozenset[str]
+
+
+_EMPTY_IMPORTS = _FileImports(frozenset(), frozenset())
+
+
 class GraphRetriever:
     """用 import/call 关系补充跨文件上下文。"""
 
@@ -48,11 +58,13 @@ class GraphRetriever:
         max_callees: int = MAX_CALLEE_CONTEXTS,
         max_dependencies: int = MAX_DEPENDENCY_CONTEXTS,
         python_calls_only: bool = True,
+        line_cache: Optional[FileLineCache] = None,
     ):
         self.max_callers = max(0, max_callers)
         self.max_callees = max(0, max_callees)
         self.max_dependencies = max(0, max_dependencies)
         self.python_calls_only = python_calls_only
+        self.line_cache = line_cache or FileLineCache()
 
     def retrieve(
         self,
@@ -150,7 +162,9 @@ class GraphRetriever:
             seen.add(key)
             start = max(1, edge.line - CALL_SITE_RADIUS)
             end = edge.line + CALL_SITE_RADIUS
-            snippet = read_line_range(repo_path / edge.caller_file, start, end)
+            snippet = self.line_cache.read_range(
+                repo_path / edge.caller_file, start, end
+            )
             if not snippet:
                 continue
             contexts.append(
@@ -183,10 +197,41 @@ class GraphRetriever:
         return contexts
 
     @staticmethod
+    def _imports_for_files(
+        index: RepoIndex, files: Sequence[str]
+    ) -> Dict[str, "_FileImports"]:
+        """Batch ``imports_of`` by caller file instead of one SQL per edge."""
+        unique = sorted({file for file in files if file})
+        if not unique:
+            return {}
+        imports_of = getattr(index, "imports_of", None)
+        if not callable(imports_of):
+            return {}
+        try:
+            edges = imports_of(unique)
+        except Exception as exc:  # noqa: BLE001 - import 图失败不应阻断 callee 检索
+            logger.debug("Batched import lookup failed: %s", exc)
+            return {}
+
+        modules: Dict[str, set[str]] = {}
+        symbols: Dict[str, set[str]] = {}
+        for item in edges:
+            modules.setdefault(item.src_file, set()).add(item.dst_module)
+            if item.symbol:
+                symbols.setdefault(item.src_file, set()).add(item.symbol)
+        return {
+            file: _FileImports(
+                frozenset(modules.get(file, ())),
+                frozenset(symbols.get(file, ())),
+            )
+            for file in unique
+        }
+
+    @staticmethod
     def _resolve_definition(
-        index: RepoIndex,
         edge,
         definitions: Sequence,
+        imported: "_FileImports",
     ):
         """在同名定义中消歧。
 
@@ -199,25 +244,13 @@ class GraphRetriever:
         if len(definitions) == 1:
             return definitions[0]
 
-        imports_of = getattr(index, "imports_of", None)
-        imported_modules: set[str] = set()
-        imported_symbols: set[str] = set()
-        if callable(imports_of):
-            try:
-                for item in imports_of([edge.caller_file]):
-                    imported_modules.add(item.dst_module)
-                    if item.symbol:
-                        imported_symbols.add(item.symbol)
-            except Exception:  # noqa: BLE001 - import 图失败不应阻断 callee 检索
-                pass
-
         def _rank(definition) -> float:
             score = float(getattr(definition, "score", 0.0) or 0.0)
             if definition.file_path == edge.caller_file:
                 score += 3.0
-            if module_name(definition.file_path) in imported_modules:
+            if module_name(definition.file_path) in imported.modules:
                 score += 2.0
-            if definition.name in imported_symbols:
+            if definition.name in imported.symbols:
                 score += 1.0
             return score
 
@@ -234,20 +267,25 @@ class GraphRetriever:
             return []
         contexts: List[CodeContext] = []
         seen: set[tuple[str, int]] = set()
-        for edge in index.callees_of(
+        edges = index.callees_of(
             query.symbols, limit=max(self.max_callees * 8, 32)
-        ):
+        )
+        imports_by_file = self._imports_for_files(
+            index, [edge.caller_file for edge in edges]
+        )
+        for edge in edges:
             if self.python_calls_only and not edge.caller_file.endswith(".py"):
                 continue
+            imported = imports_by_file.get(edge.caller_file, _EMPTY_IMPORTS)
             definitions = [
                 item
                 for item in index.search_symbols([edge.callee_name], limit=16)
                 if item.name == edge.callee_name
             ]
-            definition = self._resolve_definition(index, edge, definitions)
+            definition = self._resolve_definition(edge, definitions, imported)
             if definition is None:
                 continue
-            if not self._is_local_callee(index, edge, definition):
+            if not self._is_local_callee(edge, definition, imported):
                 # 标准库 / 第三方调用没有仓库内定义，直接跳过；同名仓库符号
                 # 的误匹配也在这里被 import 关系过滤掉。
                 continue
@@ -257,7 +295,7 @@ class GraphRetriever:
             seen.add(key)
             expanded = self._should_expand_helper(edge, definition)
             snippet = (
-                read_line_range(
+                self.line_cache.read_range(
                     repo_path / definition.file_path,
                     definition.start_line,
                     definition.end_line,
@@ -307,7 +345,7 @@ class GraphRetriever:
         return contexts
 
     @staticmethod
-    def _is_local_callee(index: RepoIndex, edge, definition) -> bool:
+    def _is_local_callee(edge, definition, imported: "_FileImports") -> bool:
         """只保留“仓库内、且调用方确实 import 了该模块”的 callee。
 
         这是标准库/第三方过滤的核心：索引里没有定义的名字自然被丢弃；
@@ -316,19 +354,10 @@ class GraphRetriever:
         """
         if definition.file_path == edge.caller_file:
             return True
-        imports_of = getattr(index, "imports_of", None)
-        if not callable(imports_of):
-            return False
-        try:
-            imported = {
-                item.dst_module for item in imports_of([edge.caller_file])
-            }
-        except Exception:  # noqa: BLE001 - import 图失败时保守跳过
-            return False
-        if not imported:
+        if not imported.modules:
             return False
         target = module_name(definition.file_path)
-        for module in imported:
+        for module in imported.modules:
             if not module:
                 continue
             if module == target:
@@ -356,13 +385,18 @@ class GraphRetriever:
             == Path(edge.caller_file).parent
         )
 
-    @staticmethod
-    def _callee_signature_snippet(repo_path: Path, definition) -> str:
+    def _callee_signature_snippet(self, repo_path: Path, definition) -> str:
         """只保留签名 + docstring + raise 语句，而不是完整函数体。"""
-        parsed = ast_utils.parse_file(repo_path / definition.file_path)
+        path = repo_path / definition.file_path
+        # Reuse the run-scoped line cache: the same file is often read again
+        # for the full body or for neighbouring call sites.
+        lines = self.line_cache.lines(path)
+        if not lines:
+            return definition.signature or ""
+        parsed = ast_utils.parse_text("\n".join(lines), path.suffix)
         if parsed is None:
             return definition.signature or ""
-        text, source, tree = parsed
+        _, source, tree = parsed
         node = ast_utils.find_enclosing_definition(tree, definition.start_line - 1)
         if node is None:
             return definition.signature or ""
@@ -372,7 +406,6 @@ class GraphRetriever:
             root = root.parent
         body = node.child_by_field_name("body")
         header_end = body.start_point[0] if body is not None else node.end_point[0] + 1
-        lines = text.splitlines()
         header = "\n".join(lines[root.start_point[0] : header_end])
 
         parts = [header]
@@ -412,7 +445,7 @@ class GraphRetriever:
         for symbol in index.definitions_in_modules(
             query.imports, limit=max(self.max_dependencies * 2, self.max_dependencies)
         ):
-            snippet = read_line_range(
+            snippet = self.line_cache.read_range(
                 repo_path / symbol.file_path, symbol.start_line, symbol.end_line
             )
             if not snippet:

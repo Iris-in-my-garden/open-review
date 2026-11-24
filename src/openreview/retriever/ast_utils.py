@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -189,10 +190,68 @@ def enclosing_definition_span(path: Path, line: int) -> Optional[Tuple[int, int]
     return start_line + 1, end_line + 1
 
 
+class FileLineCache:
+    """Bounded, thread-safe file line cache shared by one retriever run.
+
+    Graph retrieval reads the same caller/callee/dependency files repeatedly
+    (and AST retrieval may read them in parallel). Caching the split lines
+    avoids re-reading and re-splitting the same file for every context edge.
+    Entries are invalidated by ``(mtime_ns, size)`` so a rewritten file in the
+    same path is still picked up.
+    """
+
+    def __init__(self, max_files: int = 256):
+        self.max_files = max(1, max_files)
+        self._cache: "OrderedDict[Path, Tuple[int, int, List[str]]]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def lines(self, path: Path) -> List[str]:
+        path = Path(path)
+        try:
+            stat = path.stat()
+            stamp = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return []
+
+        with self._lock:
+            cached = self._cache.get(path)
+            if cached is not None and cached[0] == stamp[0] and cached[1] == stamp[1]:
+                self._cache.move_to_end(path)
+                return cached[2]
+
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return []
+        lines = text.splitlines()
+
+        with self._lock:
+            self._cache[path] = (stamp[0], stamp[1], lines)
+            self._cache.move_to_end(path)
+            while len(self._cache) > self.max_files:
+                self._cache.popitem(last=False)
+        return lines
+
+    def read_range(self, path: Path, start_line: int, end_line: int) -> str:
+        """Read a 1-based, inclusive source range from the cache."""
+        lines = self.lines(path)
+        if not lines:
+            return ""
+        start = max(0, start_line - 1)
+        end = min(len(lines), end_line)
+        return "\n".join(lines[start:end])
+
+
 def read_line_range(
-    path: Path, start_line: int, end_line: int
+    path: Path,
+    start_line: int,
+    end_line: int,
+    *,
+    line_cache: Optional[FileLineCache] = None,
 ) -> str:
     """读取 1-based、闭区间的源码行；越界时自动裁剪。"""
+    if line_cache is not None:
+        return line_cache.read_range(path, start_line, end_line)
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:

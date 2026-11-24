@@ -1,6 +1,7 @@
 # openreview/prompt_builder.py
 import logging
 import re
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from openreview.domain.models import PullRequestInfo
@@ -101,6 +102,16 @@ ASPECT_SYSTEM_PROMPTS = {
 }
 
 
+@dataclass(frozen=True)
+class _PatchPlan:
+    """Per-batch patch selection result, reused by every aspect prompt."""
+
+    patch_blocks: List[Tuple[str, str]]
+    truncated: List[str]
+    skipped: List[str]
+    visible_files: frozenset[str]
+
+
 class PromptBuilder:
     def __init__(
         self,
@@ -121,6 +132,10 @@ class PromptBuilder:
             "redundant_base_contexts": 0,
             "redundant_base_context_tokens": 0,
         }
+        # Patch 选择/渲染只依赖 parsed_diff，且同一 batch 的多个 aspect 会重复
+        # 调用；缓存最后一次计划即可（batch 内复用，跨 batch 自动失效）。
+        self._patch_plan: Optional[_PatchPlan] = None
+        self._patch_plan_source: Optional[ParsedDiff] = None
 
     def reset_context_stats(self) -> None:
         for key in self.context_stats:
@@ -263,26 +278,42 @@ class PromptBuilder:
 
         return selected, truncated, skipped
 
+    def _plan_patch(self, parsed_diff: ParsedDiff) -> _PatchPlan:
+        """Render/select patches once per batch and reuse across aspects."""
+        if (
+            self._patch_plan is not None
+            and self._patch_plan_source is parsed_diff
+        ):
+            return self._patch_plan
+
+        selected, truncated, skipped = self._select_patch_files(parsed_diff)
+        truncated_set = set(truncated)
+        plan = _PatchPlan(
+            patch_blocks=[
+                (file_diff.filename, block) for file_diff, block in selected
+            ],
+            truncated=list(truncated),
+            skipped=list(skipped),
+            visible_files=frozenset(
+                file_diff.filename
+                for file_diff, _ in selected
+                if file_diff.filename not in truncated_set
+            ),
+        )
+        self._patch_plan = plan
+        self._patch_plan_source = parsed_diff
+        return plan
+
     def _build_patch_section(
         self, parsed_diff: ParsedDiff
     ) -> Tuple[List[Tuple[str, str]], List[str], List[str]]:
         """返回 (filename, block) 列表；后面才能按文件就近挂 context。"""
-        selected, truncated, skipped = self._select_patch_files(parsed_diff)
-        return (
-            [(file_diff.filename, block) for file_diff, block in selected],
-            truncated,
-            skipped,
-        )
+        plan = self._plan_patch(parsed_diff)
+        return list(plan.patch_blocks), list(plan.truncated), list(plan.skipped)
 
     def fully_visible_patch_files(self, parsed_diff: ParsedDiff) -> set[str]:
         """Files whose entire patch is present in the prompt (not truncated)."""
-        selected, truncated, _ = self._select_patch_files(parsed_diff)
-        truncated_set = set(truncated)
-        return {
-            file_diff.filename
-            for file_diff, _ in selected
-            if file_diff.filename not in truncated_set
-        }
+        return set(self._plan_patch(parsed_diff).visible_files)
 
     @staticmethod
     def _render_context(ctx: CodeContext) -> str:
@@ -439,14 +470,14 @@ class PromptBuilder:
             else "No files changed."
         )
 
-        patch_blocks, truncated, skipped = self._build_patch_section(parsed_diff)
-        visible_patch_files = {
-            filename for filename, _ in patch_blocks
-        } - set(truncated)
+        plan = self._plan_patch(parsed_diff)
+        patch_blocks = plan.patch_blocks
+        truncated = plan.truncated
+        skipped = plan.skipped
         contexts, redundant = filter_redundant_base_contexts(
             contexts,
             parsed_diff,
-            fully_visible_files=visible_patch_files,
+            fully_visible_files=set(plan.visible_files),
         )
         if redundant:
             self.context_stats["redundant_base_contexts"] += len(redundant)

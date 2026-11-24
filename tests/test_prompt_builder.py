@@ -419,3 +419,30 @@ def test_base_definition_is_kept_when_patch_is_truncated():
     assert "<base_branch_context>" in prompt
     assert "Patch 被截断" in prompt
     assert builder.context_stats["redundant_base_contexts"] == 0
+
+
+def test_patch_plan_is_rendered_once_per_batch(monkeypatch):
+    """同一 batch 的 visible 检查 + 多 aspect 不应重复渲染 patch。"""
+    diff = _diff()
+    builder = PromptBuilder()
+    calls: list[str] = []
+    original = PromptBuilder.format_patch_with_line_numbers
+
+    def counting(patch: str) -> str:
+        calls.append(patch)
+        return original(patch)
+
+    monkeypatch.setattr(
+        PromptBuilder, "format_patch_with_line_numbers", staticmethod(counting)
+    )
+
+    builder.fully_visible_patch_files(diff)
+    builder.build_user_prompt(_pr(), diff, [])
+    builder.build_user_prompt_for_aspect("bugs", _pr(), diff, [])
+    builder.build_user_prompt_for_aspect("security", _pr(), diff, [])
+
+    assert len(calls) == 1
+
+    # 新 batch（不同 ParsedDiff 对象）必须重新计划，不能复用旧 patch。
+    builder.build_user_prompt(_pr(), _diff(), [])
+    assert len(calls) == 2

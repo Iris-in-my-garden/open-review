@@ -72,6 +72,8 @@ class HybridRetriever:
         repo_path: Path,
         parsed_diff: ParsedDiff,
         base_path: Optional[Path] = None,
+        *,
+        plan: bool = True,
     ) -> List[CodeContext]:
         repo_path = Path(repo_path).resolve()
         stats: Dict[str, float] = {
@@ -88,9 +90,13 @@ class HybridRetriever:
                 repo_path, parsed_diff, base_path, allow_global_fallback=False
             )
             self._merge_ast_stats(stats)
-            ranked = self._plan(contexts, stats)
+            selected = (
+                self._plan(contexts, stats)
+                if plan
+                else self._prepare_candidates(contexts, stats)
+            )
             self.last_stats = stats
-            return ranked
+            return selected
 
         # 关键顺序：先刷新索引，再并行 AST / graph；这样 AST 能知道索引是
         # 否可用，从而只在索引崩溃时启用全局 grep 兜底。
@@ -164,7 +170,12 @@ class HybridRetriever:
         contexts = self._drop_test_file_p4_contexts(parsed_diff, contexts)
         stats.update(graph_stats)
 
-        ranked = self._plan(contexts, stats)
+        if plan:
+            ranked = self._plan(contexts, stats)
+        else:
+            # 调用方（executor）会把 impact/static 合并后统一规划，这里只
+            # 负责去重并报告候选数，避免同一批上下文被规划两次。
+            ranked = self._prepare_candidates(contexts, stats)
         self.last_stats = stats
         return ranked
 
@@ -331,14 +342,23 @@ class HybridRetriever:
         )
         return index
 
+    def _prepare_candidates(
+        self,
+        contexts: Sequence[CodeContext],
+        stats: Dict[str, float],
+    ) -> List[CodeContext]:
+        """Dedupe candidates without spending the final token budget."""
+        deduped = dedupe_contexts(contexts)
+        stats["contexts_candidates"] = len(contexts)
+        stats["contexts_deduped"] = len(contexts) - len(deduped)
+        return deduped
+
     def _plan(
         self,
         contexts: Sequence[CodeContext],
         stats: Dict[str, float],
     ) -> List[CodeContext]:
-        deduped = dedupe_contexts(contexts)
-        stats["contexts_candidates"] = len(contexts)
-        stats["contexts_deduped"] = len(contexts) - len(deduped)
+        deduped = self._prepare_candidates(contexts, stats)
         selected = plan_contexts(
             deduped, self.max_context_tokens, stats=stats
         )

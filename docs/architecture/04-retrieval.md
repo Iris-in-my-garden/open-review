@@ -46,6 +46,31 @@ FileLock(index.lock)
 - `git_blob_sha` 与 git 一致（`blob <len>\0<data>` 的 SHA-1），避免 mtime 误判。
 - 同一仓库的多次 review 复用同一个 SQLite 文件。
 
+### 2.3 跨 HEAD 的 baseline 快照
+
+每个 HEAD 仍是独立 SQLite（并发隔离），但首次构建会尝试从同仓库的
+baseline 快照 `seed-<repo_key>.sqlite3` 复制：
+
+```text
+if 目标库为空 and seed 可用:
+    seed_head = seed.meta.head_sha
+    changes = git diff seed_head..HEAD
+    if changes 不可用 or 变化文件占比 > OPENREVIEW_INDEX_SEED_MAX_RATIO:
+        放弃 seed，走全量
+    else:
+        sqlite backup(seed → 目标库)
+        交给既有 ensure() 只应用 seed_head..HEAD 的差集
+构建成功后:
+    把当前库备份回 seed（原子替换），作为下一次的 baseline
+```
+
+- `OPENREVIEW_INDEX_SEED`（默认开）控制是否启用 seed；
+- `OPENREVIEW_INDEX_SEED_MAX_RATIO`（默认 `0.35`）是差集文件数 / seed 文件数的
+  上限，超过时全量重建更划算；
+- seed commit 不在当前 clone、schema 版本不一致、差集过大时都自动回退全量；
+- seed 是 pinned baseline：参与 age GC，但不参与索引缓存的大小淘汰；使用时会
+  刷新 mtime。
+
 ## 3. Hybrid 编排
 
 ```mermaid

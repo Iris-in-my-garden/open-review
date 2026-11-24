@@ -14,7 +14,6 @@ SQLite 文件，按 head SHA 做增量更新。
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import logging
 import os
@@ -45,6 +44,37 @@ _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # every review leave another multi-megabyte database behind.
 INDEX_CACHE_MAX_BYTES = 2 * 1024**3
 INDEX_CACHE_MAX_AGE_SECONDS = 30 * 24 * 3600
+# Baseline snapshot: copy the latest fully-built index, then let ``ensure()``
+# apply only ``seed_head..HEAD``. Fall back to a full build when the seed is
+# missing, stale, or the diff is too large to be cheaper than re-indexing.
+INDEX_SEED_MAX_RATIO = 0.35
+_SEED_PREFIX = "seed-"
+
+
+def _seed_enabled() -> bool:
+    value = os.getenv("OPENREVIEW_INDEX_SEED")
+    if value is None:
+        return True
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _seed_max_ratio() -> float:
+    value = os.getenv("OPENREVIEW_INDEX_SEED_MAX_RATIO")
+    if not value:
+        return INDEX_SEED_MAX_RATIO
+    try:
+        ratio = float(value)
+    except ValueError:
+        return INDEX_SEED_MAX_RATIO
+    return ratio if ratio > 0 else INDEX_SEED_MAX_RATIO
+
+
+def _bump_mtime(path: Path) -> None:
+    try:
+        os.utime(path, None)
+    except OSError:
+        pass
+
 
 
 def default_index_cache_dir() -> Path:
@@ -104,6 +134,23 @@ def index_cache_key(repo_path: str | Path) -> str:
     common, head = _git_identity(resolved)
     raw = f"{common}\0{head}" if head else str(resolved)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def repo_cache_key(repo_path: str | Path) -> str:
+    """Stable key for a repository across revisions (used for seed snapshots)."""
+    resolved = Path(repo_path).expanduser().resolve()
+    common, _head = _git_identity(resolved)
+    raw = common or str(resolved)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _seed_path(cache_root: Path, repo_path: Path) -> Path:
+    return cache_root / f"{_SEED_PREFIX}{repo_cache_key(repo_path)}.sqlite3"
+
+
+def _seed_lock_path(seed_path: Path) -> Path:
+    return seed_path.with_suffix(seed_path.suffix + ".lock")
+
 
 
 def _index_db_sidecars(db_path: Path) -> list[Path]:
@@ -183,7 +230,12 @@ def prune_index_cache(
         except OSError:
             # Another concurrent prune may have removed it already.
             continue
-        total += size
+        # Seed snapshots are pinned against size-based eviction: they are the
+        # baseline that makes cross-PR incremental indexing cheap. Age-based GC
+        # still applies, and ``_try_seed``/``_refresh_seed`` bump their mtime.
+        is_seed = db_path.name.startswith(_SEED_PREFIX)
+        if not is_seed:
+            total += size
         if db_path.resolve() in excluded:
             continue
         candidates.append((mtime, size, db_path))
@@ -196,7 +248,8 @@ def prune_index_cache(
                 continue
             if _remove_index_db(db_path):
                 removed += 1
-                total -= size
+                if not db_path.name.startswith(_SEED_PREFIX):
+                    total -= size
                 candidates = [item for item in candidates if item[2] != db_path]
 
     if max_bytes <= 0 or total <= max_bytes:
@@ -205,6 +258,8 @@ def prune_index_cache(
     for _, size, db_path in sorted(candidates, key=lambda item: item[0]):
         if total <= max_bytes:
             break
+        if db_path.name.startswith(_SEED_PREFIX):
+            continue
         if _remove_index_db(db_path):
             removed += 1
             total -= size
@@ -259,6 +314,78 @@ class CallEdge:
     callee_qualifier: str = ""
 
 
+@dataclass(frozen=True)
+class _SeedInfo:
+    head_sha: str
+    schema_version: str
+    file_count: int
+    indexed_at: float
+
+
+@dataclass(frozen=True)
+class _SeedResult:
+    head_sha: str
+    changed_files: int
+
+
+def _read_seed_info(db_path: Path) -> Optional[_SeedInfo]:
+    """Read seed metadata without modifying the snapshot.
+
+    The caller holds the seed lock, so a normal read-write connection is safe
+    even for WAL databases (read-only opens can fail when ``-shm`` is absent).
+    """
+    if not db_path.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=30)
+    except sqlite3.Error:
+        return None
+    try:
+        conn.row_factory = sqlite3.Row
+        meta = {
+            str(row["key"]): str(row["value"])
+            for row in conn.execute("SELECT key, value FROM meta").fetchall()
+        }
+        file_row = conn.execute("SELECT COUNT(*) AS n FROM files").fetchone()
+        file_count = int(file_row["n"]) if file_row is not None else 0
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+    head = meta.get("head_sha")
+    if not head or head == "unknown":
+        return None
+    try:
+        indexed_at = float(meta.get("indexed_at", "0") or 0)
+    except ValueError:
+        indexed_at = 0.0
+    return _SeedInfo(
+        head_sha=head,
+        schema_version=meta.get("schema_version", ""),
+        file_count=file_count,
+        indexed_at=indexed_at,
+    )
+
+
+def _copy_sqlite(src_path: Path, dst: sqlite3.Connection) -> bool:
+    """Copy one SQLite database into an open connection via the backup API."""
+    try:
+        src = sqlite3.connect(str(src_path), timeout=30)
+    except sqlite3.Error as exc:
+        logger.debug("Could not open seed index %s: %s", src_path, exc)
+        return False
+    try:
+        src.backup(dst)
+        dst.commit()
+        return True
+    except sqlite3.Error as exc:
+        logger.warning("Could not copy seed index %s: %s", src_path, exc)
+        return False
+    finally:
+        src.close()
+
+
 class RepoIndex:
     """一个仓库一个 SQLite 索引；连接生命周期由调用方管理。"""
 
@@ -293,7 +420,21 @@ class RepoIndex:
         db_path = cache_root / f"{key}.sqlite3"
         index = cls(db_path)
         try:
+            head_sha = _git_head(repo_path) or "unknown"
+            seed = index._try_seed(
+                repo_path, cache_root, head_sha, force=force
+            )
             index.ensure(repo_path, force=force)
+            if seed is not None:
+                index.last_stats.update(
+                    {
+                        "index_seeded": 1,
+                        "index_seed_head": seed.head_sha,
+                        "index_seed_diff_files": seed.changed_files,
+                    }
+                )
+            if not int(index.last_stats.get("index_reused", 0)):
+                index._refresh_seed(repo_path, cache_root)
         except BaseException:
             index.close()
             raise
@@ -312,6 +453,163 @@ class RepoIndex:
             prune_index_cache(cache_root, exclude=(active_db,))
         except Exception:  # noqa: BLE001 - cache GC must never fail a review
             logger.debug("Index cache pruning failed", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # baseline snapshot seed
+    # ------------------------------------------------------------------
+    def _try_seed(
+        self,
+        repo_path: Path,
+        cache_root: Path,
+        head_sha: str,
+        *,
+        force: bool,
+    ) -> Optional[_SeedResult]:
+        """Copy the latest seed DB, then let ``ensure`` apply only the diff."""
+        if force or head_sha == "unknown" or not _seed_enabled():
+            return None
+        if self._meta("head_sha") is not None:
+            # The target already has an index (possibly for this same HEAD).
+            return None
+
+        seed_path = _seed_path(cache_root, repo_path)
+        if not seed_path.is_file():
+            return None
+
+        lock = FileLock(str(_seed_lock_path(seed_path)))
+        try:
+            lock.acquire(timeout=0)
+        except Timeout:
+            logger.debug("Seed index is busy: %s", seed_path)
+            return None
+
+        try:
+            info = _read_seed_info(seed_path)
+            if info is None:
+                return None
+            if info.schema_version and info.schema_version != INDEX_SCHEMA_VERSION:
+                return None
+            if info.file_count <= 0:
+                return None
+            if info.head_sha == head_sha:
+                changes: List[Tuple[str, str, str]] = []
+            else:
+                diff = _git_changes(repo_path, info.head_sha, head_sha)
+                if diff is None:
+                    # Seed commit missing (shallow/foreign clone) or git failed.
+                    return None
+                changes = diff
+
+            changed = sum(
+                1
+                for status, old_path, new_path in changes
+                if _is_indexable(old_path if status == "D" else new_path)
+            )
+            ratio = changed / max(info.file_count, 1)
+            if ratio > _seed_max_ratio():
+                logger.debug(
+                    "Skip seed %s: diff ratio %.3f > %.3f",
+                    seed_path,
+                    ratio,
+                    _seed_max_ratio(),
+                )
+                return None
+
+            if not _copy_sqlite(seed_path, self._conn):
+                # A failed backup can leave a partially written destination.
+                self._recreate_connection()
+                return None
+        finally:
+            lock.release()
+
+        _bump_mtime(seed_path)
+        logger.info(
+            "Seeded index from %s (diff files=%d)", info.head_sha[:12], changed
+        )
+        return _SeedResult(head_sha=info.head_sha, changed_files=changed)
+
+    def _refresh_seed(self, repo_path: Path, cache_root: Path) -> bool:
+        """Publish this successfully indexed HEAD as the new baseline snapshot."""
+        if not _seed_enabled():
+            return False
+        head_sha = _git_head(repo_path)
+        if not head_sha:
+            return False
+
+        seed_path = _seed_path(cache_root, repo_path)
+        lock = FileLock(str(_seed_lock_path(seed_path)))
+        try:
+            lock.acquire(timeout=0)
+        except Timeout:
+            return False
+
+        try:
+            existing = _read_seed_info(seed_path) if seed_path.is_file() else None
+            if existing is not None and existing.head_sha == head_sha:
+                return False
+            try:
+                active_ts = float(self._meta("indexed_at") or 0)
+            except (TypeError, ValueError):
+                active_ts = 0.0
+            if existing is not None and existing.indexed_at > active_ts:
+                # A concurrent build already published a newer baseline.
+                return False
+
+            tmp_path = seed_path.with_name(
+                f"{seed_path.name}.tmp-{os.getpid()}-{time.time_ns()}"
+            )
+            try:
+                dest = sqlite3.connect(str(tmp_path), timeout=30)
+                try:
+                    self._conn.backup(dest)
+                    dest.commit()
+                    # Publish a standalone snapshot: no WAL dependency, so a
+                    # later copy/open never needs stale ``-wal``/``-shm`` files.
+                    dest.execute("PRAGMA journal_mode=DELETE")
+                finally:
+                    dest.close()
+                os.replace(tmp_path, seed_path)
+                # Remove sidecars left by an older WAL-mode seed file.
+                for sidecar in (
+                    seed_path.with_name(seed_path.name + "-wal"),
+                    seed_path.with_name(seed_path.name + "-shm"),
+                ):
+                    try:
+                        sidecar.unlink()
+                    except OSError:
+                        pass
+            except (sqlite3.Error, OSError) as exc:
+                logger.debug("Could not refresh seed index %s: %s", seed_path, exc)
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+                return False
+        finally:
+            lock.release()
+
+        _bump_mtime(seed_path)
+        logger.info("Refreshed seed index at %s", head_sha[:12])
+        return True
+
+    def _recreate_connection(self) -> None:
+        """Recreate an empty database after a failed seed copy."""
+        try:
+            self._conn.close()
+        except sqlite3.Error:
+            pass
+        for path in _index_db_sidecars(self.db_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+        self._conn = sqlite3.connect(
+            str(self.db_path), timeout=30, check_same_thread=False
+        )
+        self._conn.row_factory = sqlite3.Row
+        self._init_schema()
 
     def close(self) -> None:
         try:
@@ -555,7 +853,7 @@ class RepoIndex:
                 )
 
             if suffix == ".py":
-                imports, calls = _python_imports_and_calls(text)
+                imports, calls = _python_imports_and_calls(tree, source)
             elif suffix == ".go":
                 imports, calls = _go_imports_and_calls(tree, source)
 
@@ -853,84 +1151,129 @@ def _row_to_symbol(row: sqlite3.Row, score: float) -> IndexedSymbol:
     )
 
 
+_PYTHON_DEFINITION_TYPES = {"function_definition", "class_definition"}
+
+
 def _python_imports_and_calls(
-    text: str,
+    tree: Any, source: bytes
 ) -> Tuple[List[Tuple[str, str, int]], List[Tuple[str, str, str, int]]]:
+    """Extract imports/calls from the tree-sitter tree built for symbols.
+
+    The index already parses every Python file with tree-sitter. Parsing the
+    same text again with :mod:`ast` doubled indexing CPU, so both views are
+    derived from the same tree here.
+    """
     imports: List[Tuple[str, str, int]] = []
     calls: List[Tuple[str, str, str, int]] = []
-    try:
-        tree = ast.parse(text)
-    except SyntaxError:
-        return imports, calls
+    definitions: List[str] = []
+    stack: List[Tuple[Any, bool]] = [(tree.root_node, False)]
 
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                imports.append((alias.name, alias.asname or "", node.lineno))
-        elif isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            for alias in node.names:
-                imports.append((module, alias.name, node.lineno))
+    while stack:
+        node, exiting = stack.pop()
+        if exiting:
+            definitions.pop()
+            continue
 
-    class _CallVisitor(ast.NodeVisitor):
-        def __init__(self) -> None:
-            self.stack: List[str] = []
-            self.items: List[Tuple[str, str, str, int]] = []
+        node_type = node.type
+        if node_type in _PYTHON_DEFINITION_TYPES:
+            name_node = node.child_by_field_name("name")
+            definitions.append(
+                ast_utils.node_text(name_node, source) if name_node is not None else ""
+            )
+            stack.append((node, True))
+            stack.extend((child, False) for child in reversed(node.children))
+            continue
 
-        def _visit_def(self, node: ast.AST) -> None:
-            name = getattr(node, "name", "")
-            self.stack.append(name)
-            self.generic_visit(node)
-            self.stack.pop()
-
-        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-            self._visit_def(node)
-
-        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-            self._visit_def(node)
-
-        def visit_ClassDef(self, node: ast.ClassDef) -> None:
-            self._visit_def(node)
-
-        def visit_Call(self, node: ast.Call) -> None:
-            raw = _call_name(node.func)
+        if node_type == "import_statement":
+            imports.extend(_python_import_statement(node, source))
+        elif node_type == "import_from_statement":
+            imports.extend(_python_import_from_statement(node, source))
+        elif node_type == "call":
+            raw = _tree_call_name(node.child_by_field_name("function"), source)
             if raw:
                 parts = raw.split(".")
-                self.items.append(
+                calls.append(
                     (
-                        ".".join(self.stack),
+                        ".".join(definitions),
                         parts[-1],
                         ".".join(parts[:-1]),
-                        node.lineno,
+                        node.start_point[0] + 1,
                     )
                 )
-            self.generic_visit(node)
 
-    visitor = _CallVisitor()
-    visitor.visit(tree)
-    calls.extend(visitor.items)
+        stack.extend((child, False) for child in reversed(node.children))
+
     return imports, calls
 
 
-def _call_name(node: ast.AST) -> str:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        parts: List[str] = []
-        current: ast.AST = node
-        while isinstance(current, ast.Attribute):
-            parts.append(current.attr)
-            current = current.value
-        if isinstance(current, ast.Name):
-            parts.append(current.id)
-        elif parts:
-            # 例如 func().attr：保留可读的尾部，但 qualifier 只到最后一个点。
-            parts.append(_call_name(current))
-        return ".".join(reversed(parts))
-    try:
-        return ast.unparse(node)
-    except Exception:  # noqa: BLE001
+def _python_import_statement(
+    node: Any, source: bytes
+) -> List[Tuple[str, str, int]]:
+    result: List[Tuple[str, str, int]] = []
+    line = node.start_point[0] + 1
+    for child in node.children:
+        if child.type == "dotted_name":
+            module = ast_utils.node_text(child, source)
+            if module:
+                result.append((module, "", line))
+        elif child.type == "aliased_import":
+            name_node = child.child_by_field_name("name")
+            alias_node = child.child_by_field_name("alias")
+            module = (
+                ast_utils.node_text(name_node, source) if name_node is not None else ""
+            )
+            alias = (
+                ast_utils.node_text(alias_node, source) if alias_node is not None else ""
+            )
+            if module:
+                result.append((module, alias, line))
+    return result
+
+
+def _python_import_from_statement(
+    node: Any, source: bytes
+) -> List[Tuple[str, str, int]]:
+    result: List[Tuple[str, str, int]] = []
+    line = node.start_point[0] + 1
+    module_node = node.child_by_field_name("module_name")
+    # stdlib ``ast`` strips the leading dots and exposes the remaining module
+    # (``from .pkg import x`` -> module ``pkg``); match that here.
+    module = (
+        ast_utils.node_text(module_node, source).lstrip(".")
+        if module_node is not None
+        else ""
+    )
+    for child in node.children:
+        if child is module_node:
+            continue
+        if child.type == "dotted_name":
+            name = ast_utils.node_text(child, source)
+            if name:
+                result.append((module, name, line))
+        elif child.type == "aliased_import":
+            name_node = child.child_by_field_name("name")
+            name = (
+                ast_utils.node_text(name_node, source) if name_node is not None else ""
+            )
+            if name:
+                result.append((module, name, line))
+    return result
+
+
+def _tree_call_name(node: Any, source: bytes) -> str:
+    if node is None:
         return ""
+    if node.type == "identifier":
+        return ast_utils.node_text(node, source)
+    if node.type == "attribute":
+        obj = node.child_by_field_name("object")
+        attr = node.child_by_field_name("attribute")
+        left = _tree_call_name(obj, source)
+        right = ast_utils.node_text(attr, source) if attr is not None else ""
+        if left and right:
+            return f"{left}.{right}"
+        return right or left
+    return ast_utils.node_text(node, source).strip()
 
 
 def _go_imports_and_calls(

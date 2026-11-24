@@ -118,6 +118,8 @@ mock
 | `OPENAI_BASE_URL` | OpenAI 兼容服务地址 |
 | `GITHUB_TOKEN` | 私有仓库/更高 API 限额（可选） |
 | `OPENREVIEW_INDEX_DIR` | 索引目录 |
+| `OPENREVIEW_INDEX_SEED` | 是否用 baseline 快照做跨 HEAD 增量索引（默认开） |
+| `OPENREVIEW_INDEX_SEED_MAX_RATIO` | seed 差集占比上限，超过则全量重建（默认 `0.35`） |
 | `OPENREVIEW_CACHE_DIR` | 仓库缓存目录 |
 | `OPENREVIEW_REVIEW_CACHE_DIR` | Review cache 目录 |
 

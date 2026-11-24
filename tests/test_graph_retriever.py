@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from openreview.retriever.ast_utils import FileLineCache
 from openreview.retriever.code_context import (
     CodeContext,
     ContextPriority,
@@ -467,3 +468,100 @@ def test_long_private_helper_keeps_signature_only(tmp_path: Path):
         assert "signature" in callee.reason
     finally:
         index.close()
+
+
+def test_callee_imports_are_batched_by_caller_file(tmp_path: Path):
+    """多个 callee 边共享同一个 caller 时应只查一次 imports。"""
+    root = tmp_path / "repo"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "util.py").write_text(
+        "def helper():\n    return 1\n", encoding="utf-8"
+    )
+    for name in ("a", "b", "c"):
+        (root / "pkg" / f"{name}.py").write_text(
+            "from pkg.util import helper\n"
+            "\n"
+            f"def run_{name}():\n"
+            "    return helper()\n",
+            encoding="utf-8",
+        )
+    _init_repo(root)
+
+    index = RepoIndex.for_worktree(root, cache_dir=tmp_path / "idx")
+    calls: list[list[str]] = []
+
+    class RecordingIndex:
+        def __init__(self, inner: RepoIndex) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str):
+            return getattr(self._inner, name)
+
+        def imports_of(self, files):
+            calls.append(list(files))
+            return self._inner.imports_of(files)
+
+    try:
+        GraphRetriever(max_callees=8).retrieve(
+            root,
+            RecordingIndex(index),  # type: ignore[arg-type]
+            RetrievalQuery(
+                symbols=["run_a", "run_b", "run_c"],
+                files=["pkg/a.py", "pkg/b.py", "pkg/c.py"],
+            ),
+        )
+    finally:
+        index.close()
+
+    # 三个 caller 文件 -> 一次批量查询，而不是三条 SQL。
+    assert len(calls) == 1
+    assert set(calls[0]) == {"pkg/a.py", "pkg/b.py", "pkg/c.py"}
+
+
+def test_file_line_cache_reads_once_per_path(tmp_path: Path, monkeypatch):
+    path = tmp_path / "a.py"
+    path.write_text("one\ntwo\nthree\n", encoding="utf-8")
+
+    reads: list[Path] = []
+    original = Path.read_text
+
+    def counting_read_text(self, *args, **kwargs):
+        reads.append(self)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counting_read_text)
+
+    cache = FileLineCache()
+    assert cache.read_range(path, 1, 1) == "one"
+    assert cache.read_range(path, 2, 3) == "two\nthree"
+    assert cache.lines(path) == ["one", "two", "three"]
+
+    assert reads.count(path) == 1
+
+
+def test_graph_retriever_uses_injected_line_cache(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_repo(root)
+    _init_repo(root)
+
+    class RecordingCache(FileLineCache):
+        def __init__(self) -> None:
+            super().__init__()
+            self.paths: list[Path] = []
+
+        def lines(self, path: Path):
+            self.paths.append(Path(path))
+            return super().lines(path)
+
+    cache = RecordingCache()
+    index = RepoIndex.for_worktree(root, cache_dir=tmp_path / "idx")
+    try:
+        GraphRetriever(line_cache=cache).retrieve(root, index, _query())
+    finally:
+        index.close()
+
+    names = {path.name for path in cache.paths}
+    # caller / callee / dependency 都来自共享缓存，不再各自直接读文件。
+    assert {"api.py", "util.py", "models.py"} <= names
+

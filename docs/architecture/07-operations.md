@@ -64,7 +64,7 @@
 | 没有 finding | `validation`、`verifier` | 置信度阈值过高、证据不足、Verifier 拒绝 | 看 `validation.dropped_*` 与 `verifier.rejected` |
 | 行号大量缺失 | `validation.missing_line` | 模型未给行号或行号不在 diff 可见行 | 检查 prompt/模型；不要放宽校验 |
 | 上下文很少 | `retrieval.context_gap`、`retrieval.stats` | 索引失败/预算 cap/大文件挤占 | 看 `index_error`、`contexts_omitted_by_cap` |
-| 索引很慢 | `stages_seconds.prepare_repo`、`index_build_seconds` | 首次全量/大仓库 | 预热索引；检查 `OPENREVIEW_INDEX_DIR` |
+| 索引很慢 | `stages_seconds.prepare_repo`、`index_build_seconds` | 首次全量/大仓库 | 预热索引；检查 `OPENREVIEW_INDEX_DIR`；确认 seed 已生成且差集未超阈值 |
 | 成本异常 | `budget`、`llm_calls_detail` | 重试/verifier/大 batch | 降低 `max_batch_tokens` 或预算 |
 | 评论重复 | `cache`、GitHub review marker | upsert 未生效/权限不足 | 检查 token 权限与 `upsert_review` |
 | 结果不可复现 | `versions`、`cache`、LLM cache 模式 | 模型/版本/温度/seed 变化 | 固定 model/temperature/seed，用 replay |
@@ -92,6 +92,8 @@ uv run openreview review <pr_url> --llm-cache-dir .cache/llm --llm-cache-mode re
 | 关闭 review cache | 默认关闭 | 避免旧结果掩盖改动 |
 | 指定 cache 目录 | `--cache-dir` | 多 run 共享时注意锁 |
 | 清空索引 | 删除 `OPENREVIEW_INDEX_DIR` | 下次全量重建 |
+| 关闭 seed 增量 | `OPENREVIEW_INDEX_SEED=0` | 每个新 HEAD 都全量构建 |
+| 调整 seed 差集阈值 | `OPENREVIEW_INDEX_SEED_MAX_RATIO` | 默认 `0.35`；调小更保守 |
 | 强制重建索引 | 修改 `INDEX_SCHEMA_VERSION` 或删除 DB | 会变慢 |
 | 清理仓库缓存 | 删除平台缓存目录 | 下次重新 clone |
 

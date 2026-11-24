@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import subprocess
 from pathlib import Path
 
 from openreview.repo.diff_parser import DiffParser, ParsedChangedFile, ParsedDiff
 from openreview.retriever import index as index_module
 from openreview.retriever.hybrid import HybridRetriever
-from openreview.retriever.index import RepoIndex, _iter_source_files
+from openreview.retriever.index import RepoIndex, _iter_source_files, repo_cache_key
 from openreview.retriever.pathing import is_source_file
 from openreview.retriever.query import MAX_ADDED_LINE_IDENTIFIERS, QueryBuilder
 from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
@@ -464,6 +465,60 @@ def test_hybrid_reports_candidates_deduped_and_truncated(tmp_path: Path):
     assert retriever.last_stats["ast_contexts_truncated"] == 1
 
 
+def test_hybrid_plan_false_returns_unplanned_candidates(tmp_path: Path):
+    """executor 统一规划时，retriever 只返回去重后的候选。"""
+    from openreview.retriever.code_context import CodeContext, ContextPriority
+
+    class _FakeAstRetriever:
+        last_stats = {"ast_contexts": 4}
+
+        def retrieve(self, repo_path, parsed_diff, base_path=None):
+            return [
+                CodeContext(
+                    file_path="pkg/app.py",
+                    reason=f"definition {line}",
+                    snippet=f"def f{line}(): pass",
+                    score=0.9 - line / 100,
+                    kind="definition",
+                    priority=ContextPriority.DEFINITION,
+                    start_line=line,
+                    end_line=line,
+                )
+                for line in range(1, 5)
+            ]
+
+    retriever = HybridRetriever(
+        ast_retriever=_FakeAstRetriever(),
+        enabled=False,
+        max_context_tokens=60,
+    )
+
+    contexts = retriever.retrieve(tmp_path, ParsedDiff(files=[]), plan=False)
+
+    assert len(contexts) == 4
+    assert retriever.last_stats["contexts_candidates"] == 4
+    assert retriever.last_stats["contexts_deduped"] == 0
+    # 未规划就不能提前报告预算淘汰/选中数，否则 executor 会重复计数。
+    assert "contexts_truncated" not in retriever.last_stats
+    assert "contexts_selected" not in retriever.last_stats
+
+
+def test_supports_plan_detects_optional_keyword(tmp_path: Path):
+    from openreview.retriever.base import supports_plan
+
+    class OldRetriever:
+        def retrieve(self, repo_path, parsed_diff, base_path=None):
+            return []
+
+    class NewRetriever:
+        def retrieve(self, repo_path, parsed_diff, base_path=None, *, plan=True):
+            return []
+
+    assert supports_plan(NewRetriever()) is True
+    assert supports_plan(OldRetriever()) is False
+    assert supports_plan(object()) is False
+
+
 def test_index_cache_is_reused_across_linked_worktrees(tmp_path: Path):
     """Per-run worktrees at the same commit must share one SQLite index."""
     root = tmp_path / "repo"
@@ -524,3 +579,178 @@ def test_prune_index_cache_respects_exclude_size_and_age(tmp_path: Path):
     assert not aged.exists()
     assert keep.exists()
 
+
+
+def _commit(root: Path, message: str) -> None:
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=a@b.c", "-c", "user.name=t", "commit", "-qm", message],
+        cwd=root,
+        check=True,
+    )
+
+
+def _write_many_files(root: Path, count: int = 12) -> None:
+    (root / "pkg").mkdir(parents=True, exist_ok=True)
+    for index in range(count):
+        (root / "pkg" / f"m{index}.py").write_text(
+            f"def f{index}():\n    return {index}\n\n"
+            f"def g{index}():\n    return f{index}()\n",
+            encoding="utf-8",
+        )
+
+
+def test_index_seeds_from_latest_head_and_indexes_only_diff(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_many_files(root)
+    _init_repo(root)
+    cache_dir = tmp_path / "idx"
+
+    first = RepoIndex.for_worktree(root, cache_dir=cache_dir)
+    try:
+        first_symbols = first.count("symbols")
+        assert first_symbols == 24
+        assert first.last_stats.get("index_seeded") is None
+    finally:
+        first.close()
+
+    seed_path = cache_dir / f"seed-{repo_cache_key(root)}.sqlite3"
+    assert seed_path.is_file()
+
+    for index in (0, 1):
+        (root / "pkg" / f"m{index}.py").write_text(
+            f"def f{index}():\n    return {index + 100}\n\n"
+            f"def g{index}():\n    return f{index}()\n",
+            encoding="utf-8",
+        )
+    _commit(root, "small change")
+
+    second = RepoIndex.for_worktree(root, cache_dir=cache_dir)
+    try:
+        # 只复制 seed + 应用 2 个文件的差集，不再全量扫描 12 个文件。
+        assert second.last_stats["index_seeded"] == 1
+        assert second.last_stats["index_seed_diff_files"] == 2
+        assert second.last_stats["index_files_indexed"] == 2
+        assert second.count("symbols") == first_symbols
+        assert any(symbol.name == "f1" for symbol in second.search_symbols(["f1"]))
+    finally:
+        second.close()
+
+
+def test_index_skips_seed_when_diff_is_too_large(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_many_files(root, count=10)
+    _init_repo(root)
+    cache_dir = tmp_path / "idx"
+
+    first = RepoIndex.for_worktree(root, cache_dir=cache_dir)
+    first.close()
+
+    # 8/10 文件变化，ratio 0.8 > 默认 0.35，复制 seed 不划算，应全量重建。
+    for index in range(8):
+        (root / "pkg" / f"m{index}.py").write_text(
+            f"def f{index}():\n    return {index + 100}\n\n"
+            f"def g{index}():\n    return f{index}()\n",
+            encoding="utf-8",
+        )
+    _commit(root, "large change")
+
+    second = RepoIndex.for_worktree(root, cache_dir=cache_dir)
+    try:
+        assert second.last_stats.get("index_seeded") is None
+        assert second.last_stats["index_files_indexed"] == 10
+        assert second.count("symbols") == 20
+    finally:
+        second.close()
+
+
+def test_index_seed_can_be_disabled_by_env(tmp_path: Path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_many_files(root, count=6)
+    _init_repo(root)
+    cache_dir = tmp_path / "idx"
+
+    RepoIndex.for_worktree(root, cache_dir=cache_dir).close()
+
+    monkeypatch.setenv("OPENREVIEW_INDEX_SEED", "0")
+    (root / "pkg" / "m0.py").write_text(
+        "def f0():\n    return 100\n\n"
+        "def g0():\n    return f0()\n",
+        encoding="utf-8",
+    )
+    _commit(root, "small change")
+
+    second = RepoIndex.for_worktree(root, cache_dir=cache_dir)
+    try:
+        assert second.last_stats.get("index_seeded") is None
+        # 关闭 seed 后，新 HEAD 仍是全量扫描。
+        assert second.last_stats["index_files_indexed"] == 6
+    finally:
+        second.close()
+
+
+def test_index_seed_falls_back_when_seed_commit_is_missing(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_many_files(root, count=6)
+    _init_repo(root)
+    cache_dir = tmp_path / "idx"
+
+    RepoIndex.for_worktree(root, cache_dir=cache_dir).close()
+
+    # 模拟 seed 来自另一个 clone：head_sha 在当前仓库不存在。
+    seed_path = cache_dir / f"seed-{repo_cache_key(root)}.sqlite3"
+    conn = sqlite3.connect(str(seed_path))
+    try:
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'head_sha'",
+            ("0" * 40,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    (root / "pkg" / "m0.py").write_text(
+        "def f0():\n    return 100\n\n"
+        "def g0():\n    return f0()\n",
+        encoding="utf-8",
+    )
+    _commit(root, "small change")
+
+    second = RepoIndex.for_worktree(root, cache_dir=cache_dir)
+    try:
+        assert second.last_stats.get("index_seeded") is None
+        assert second.last_stats["index_files_indexed"] == 6
+        assert second.count("symbols") == 12
+    finally:
+        second.close()
+
+
+def test_prune_index_cache_pins_seed_from_size_but_not_age(tmp_path: Path):
+    cache_dir = tmp_path / "idx"
+    cache_dir.mkdir()
+    seed = cache_dir / "seed-abc.sqlite3"
+    normal = cache_dir / "normal.sqlite3"
+    seed.write_bytes(b"x" * 4096)
+    normal.write_bytes(b"x" * 4096)
+    os.utime(seed, (1, 1))
+    os.utime(normal, (2, 2))
+
+    removed = index_module.prune_index_cache(
+        cache_dir, max_bytes=1, max_age_seconds=0
+    )
+    assert removed == 1
+    assert seed.exists()  # seed 不参与大小淘汰
+    assert not normal.exists()
+
+    removed = index_module.prune_index_cache(
+        cache_dir,
+        max_bytes=10**9,
+        max_age_seconds=60,
+        now=10**6,
+    )
+    assert removed == 1
+    assert not seed.exists()  # 长期未使用仍会被 age GC

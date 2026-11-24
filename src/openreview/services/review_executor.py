@@ -31,6 +31,7 @@ from openreview.repo.local import (
     prepare_local_workspace,
 )
 from openreview.repo.manager import RepoCommandError
+from openreview.retriever.base import supports_plan
 from openreview.retriever.code_context import context_identity
 from openreview.retriever.context_planner import plan_contexts
 from openreview.review.cache import ReviewCache
@@ -574,8 +575,11 @@ class ReviewExecutor:
                     f"Running AI Code Reviewer "
                     f"(batch {index}/{len(batches)}, {len(batch.files)} files)...",
                 )
+                retrieve_kwargs: Dict[str, Any] = {"base_path": state.base_path}
+                if supports_plan(self.retriever):
+                    retrieve_kwargs["plan"] = False
                 contexts = self.retriever.retrieve(
-                    state.local_repo_path, batch, base_path=state.base_path
+                    state.local_repo_path, batch, **retrieve_kwargs
                 )
                 # HybridRetriever 的索引命中/构建耗时按批次累加，供评测分析。
                 retrieval_stats = getattr(self.retriever, "last_stats", None)
@@ -624,6 +628,15 @@ class ReviewExecutor:
                     contexts,
                     self.config.max_context_tokens,
                     stats=state.retrieval_stats,
+                )
+                # 统一规划后回填兼容 metrics：retriever 在 plan=False 时只报
+                # 候选/去重，最终预算淘汰和选中数在这里按批累加。
+                state.retrieval_stats["contexts_truncated"] = int(
+                    state.retrieval_stats.get("contexts_omitted_by_priority", 0)
+                )
+                state.retrieval_stats["contexts_selected"] = (
+                    int(state.retrieval_stats.get("contexts_selected", 0))
+                    + len(contexts)
                 )
                 state.context_stats["batch_context_occurrences"] = (
                     state.context_stats.get("batch_context_occurrences", 0)

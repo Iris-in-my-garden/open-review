@@ -8,12 +8,34 @@ guessing arbitrary attribute names.
 
 from __future__ import annotations
 
+import inspect
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Protocol, Set, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, Set, runtime_checkable
 
 from openreview.repo.diff_parser import ParsedDiff
 from openreview.retriever.code_context import CodeContext
+
+
+def supports_plan(retriever: object) -> bool:
+    """Whether ``retriever.retrieve`` accepts the optional ``plan`` keyword.
+
+    Older/custom retrievers only implement the three positional arguments; the
+    executor must not pass ``plan`` to those.
+    """
+    retrieve = getattr(retriever, "retrieve", None)
+    if not callable(retrieve):
+        return False
+    try:
+        parameters = inspect.signature(retrieve).parameters
+    except (TypeError, ValueError):  # pragma: no cover - builtins/extensions
+        return False
+    if "plan" in parameters:
+        return True
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 @runtime_checkable
@@ -52,6 +74,8 @@ class EmptyRetriever:
         repo_path: Path,
         parsed_diff: ParsedDiff,
         base_path: Optional[Path] = None,
+        *,
+        plan: bool = True,
     ) -> List[CodeContext]:
         self.last_stats = {}
         return []
@@ -77,10 +101,15 @@ class ScopedRetriever:
         repo_path: Path,
         parsed_diff: ParsedDiff,
         base_path: Optional[Path] = None,
+        *,
+        plan: bool = True,
     ) -> List[CodeContext]:
         with self._lock:
+            kwargs: Dict[str, Any] = {"base_path": base_path}
+            if supports_plan(self.inner):
+                kwargs["plan"] = plan
             contexts = self.inner.retrieve(
-                repo_path, parsed_diff, base_path=base_path
+                repo_path, parsed_diff, **kwargs
             )
             stats = getattr(self.inner, "last_stats", None)
             self.last_stats = dict(stats) if isinstance(stats, dict) else {}
