@@ -1276,33 +1276,52 @@ def _tree_call_name(node: Any, source: bytes) -> str:
     return ast_utils.node_text(node, source).strip()
 
 
+_GO_DEFINITION_TYPES = {
+    "function_declaration",
+    "method_declaration",
+    "type_declaration",
+}
+
+
 def _go_imports_and_calls(
     tree: Any, source: bytes
 ) -> Tuple[List[Tuple[str, str, int]], List[Tuple[str, str, str, int]]]:
     imports: List[Tuple[str, str, int]] = []
     calls: List[Tuple[str, str, str, int]] = []
-    stack = [tree.root_node]
+    definitions: List[str] = []
+    # Track the enclosing definition while walking once. The previous version
+    # called ``find_enclosing_definition`` (a full tree traversal) for every
+    # call expression, which was quadratic: a 457 KB generated Go test file
+    # with ~8k calls took ~9s to index.
+    stack: List[Tuple[Any, bool]] = [(tree.root_node, False)]
     while stack:
-        node = stack.pop()
-        if node.type == "import_spec":
+        node, exiting = stack.pop()
+        if exiting:
+            definitions.pop()
+            continue
+
+        node_type = node.type
+        if node_type in _GO_DEFINITION_TYPES:
+            name = ast_utils.definition_name(node, source)
+            definitions.append(name or "")
+            stack.append((node, True))
+            stack.extend(
+                (child, False) for child in reversed(node.children)
+            )
+            continue
+
+        if node_type == "import_spec":
             path_node = node.child_by_field_name("path")
             if path_node is not None:
                 raw = ast_utils.node_text(path_node, source).strip().strip('"')
                 if raw:
                     imports.append((raw, "", node.start_point[0] + 1))
-        elif node.type == "call_expression":
+        elif node_type == "call_expression":
             fn = node.child_by_field_name("function")
             if fn is not None:
                 raw = ast_utils.node_text(fn, source).strip()
                 if raw:
-                    enclosing = ast_utils.find_enclosing_definition(
-                        tree, node.start_point[0]
-                    )
-                    caller = (
-                        ast_utils.definition_qualname(enclosing, source)
-                        if enclosing is not None
-                        else ""
-                    )
+                    caller = ".".join(name for name in definitions if name)
                     calls.append(
                         (
                             caller,
@@ -1311,7 +1330,7 @@ def _go_imports_and_calls(
                             node.start_point[0] + 1,
                         )
                     )
-        stack.extend(node.children)
+        stack.extend((child, False) for child in reversed(node.children))
     return imports, calls
 
 

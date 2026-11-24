@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from openreview.repo.local import LocalReviewInput
+from openreview.retriever.base import supports_plan
 from openreview.retriever.context_planner import plan_contexts
 from openreview.review.context_filter import filter_redundant_base_contexts
 from openreview.review.redaction import redact_text
@@ -53,8 +54,13 @@ def build_context_dry_run(
 
         for index, batch in enumerate(batches, start=1):
             prompt_builder.reset_context_stats()
+            retrieve_kwargs: Dict[str, Any] = {"base_path": state.base_path}
+            if supports_plan(session.retriever):
+                # 与 executor 一致：先取候选，合并 impact/static 后统一规划，
+                # 避免同一批上下文被 Hybrid 和这里各规划一次。
+                retrieve_kwargs["plan"] = False
             contexts = session.retriever.retrieve(
-                state.local_repo_path, batch, base_path=state.base_path
+                state.local_repo_path, batch, **retrieve_kwargs
             )
             contexts.extend(
                 executor.evidence_pipeline.extra_contexts(

@@ -754,3 +754,75 @@ def test_prune_index_cache_pins_seed_from_size_but_not_age(tmp_path: Path):
     )
     assert removed == 1
     assert not seed.exists()  # 长期未使用仍会被 age GC
+
+
+def test_go_index_extracts_imports_and_qualified_callers(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "pkg").mkdir()
+    (root / "pkg" / "main.go").write_text(
+        "package pkg\n"
+        "\n"
+        'import "fmt"\n'
+        "\n"
+        "func helper() {\n"
+        '    fmt.Println("x")\n'
+        "}\n"
+        "\n"
+        "func Run() {\n"
+        "    helper()\n"
+        "    helper()\n"
+        "}\n"
+        "\n"
+        "func (s *Server) Do() {\n"
+        "    helper()\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    _init_repo(root)
+
+    index = RepoIndex.for_worktree(root, cache_dir=tmp_path / "idx")
+    try:
+        imports = index.imports_of(["pkg/main.go"])
+        assert [(edge.dst_module, edge.line) for edge in imports] == [("fmt", 3)]
+
+        run_calls = index.callees_of(["Run"])
+        assert {(edge.callee_name, edge.line) for edge in run_calls} == {
+            ("helper", 10),
+            ("helper", 11),
+        }
+        assert {edge.caller_symbol for edge in run_calls} == {"Run"}
+
+        method_calls = index.callees_of(["Do"])
+        assert {(edge.callee_name, edge.line) for edge in method_calls} == {
+            ("helper", 15)
+        }
+        assert {edge.caller_symbol for edge in method_calls} == {"Do"}
+    finally:
+        index.close()
+
+
+def test_go_call_extraction_does_not_rescan_tree_per_call(monkeypatch):
+    """回归保护：Go calls 必须单次遍历，不能再逐 call 全树查找。"""
+    from openreview.retriever import ast_utils
+    from openreview.retriever.index import _go_imports_and_calls
+
+    parsed = ast_utils.parse_text(
+        "package pkg\n"
+        "\n"
+        "func Run() {\n"
+        "    helper()\n"
+        "}\n",
+        ".go",
+    )
+    assert parsed is not None
+    _, source, tree = parsed
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("find_enclosing_definition is O(tree) per call")
+
+    monkeypatch.setattr(ast_utils, "find_enclosing_definition", _boom)
+
+    imports, calls = _go_imports_and_calls(tree, source)
+    assert imports == []
+    assert calls == [("Run", "helper", "", 4)]

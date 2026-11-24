@@ -17,7 +17,7 @@ P0/P1 的约束：
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from tree_sitter import Node, Tree
 
@@ -85,8 +85,13 @@ def collect_referenced_fields_from_tree(
     *,
     changed_lines: Optional[Sequence[int]] = None,
     window_radius: int = DEFAULT_FIELD_WINDOW_RADIUS,
+    cache: Optional[Dict[str, Any]] = None,
 ) -> List[FieldDefinition]:
-    """复用已解析的 tree，避免每个方法重复 parse 同一文件。"""
+    """复用已解析的 tree，避免每个方法重复 parse 同一文件。
+
+    ``cache`` 由同一个文件的多个作用域共享，用于复用整棵树的 Go 类型/字段
+    扫描结果；不同文件必须使用独立缓存。
+    """
     if not text:
         return []
     function = _find_enclosing_scope(tree, max(0, start_line - 1))
@@ -99,13 +104,13 @@ def collect_referenced_fields_from_tree(
     if suffix == ".py":
         candidates = _python_field_candidates(tree, function, source, lines)
     elif suffix == ".go":
-        candidates = _go_field_candidates(tree, function, source, lines)
+        candidates = _go_field_candidates(tree, function, source, lines, cache)
     else:
         return []
 
     scan_ranges = _scan_ranges(function, changed_lines, window_radius)
     references = _collect_scoped_references(
-        function, source, suffix, scan_ranges
+        function, source, suffix, scan_ranges, cache
     )
     if not references:
         return []
@@ -217,11 +222,12 @@ def _collect_scoped_references(
     source: bytes,
     suffix: str,
     scan_ranges: Sequence[Tuple[int, int]],
+    cache: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Set[Optional[str]]]:
     if suffix == ".py":
         return _python_references(scope, source, scan_ranges)
     if suffix == ".go":
-        return _go_references(scope, source, scan_ranges)
+        return _go_references(scope, source, scan_ranges, cache)
     return {}
 
 
@@ -301,9 +307,12 @@ def _go_references(
     function: Node,
     source: bytes,
     scan_ranges: Sequence[Tuple[int, int]],
+    cache: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Set[Optional[str]]]:
     local_names = _go_local_names(function, source)
-    type_env, struct_fields, package_types = _go_type_context(function, source)
+    type_env, struct_fields, package_types = _go_type_context(
+        function, source, cache
+    )
     references: Dict[str, Set[Optional[str]]] = {}
 
     stack = [function]
@@ -509,7 +518,13 @@ def _go_field_candidates(
     function: Node,
     source: bytes,
     lines: List[str],
+    cache: Optional[Dict[str, Any]] = None,
 ) -> List[FieldDefinition]:
+    if cache is not None:
+        cached = cache.get("go_field_candidates")
+        if cached is not None:
+            return cached
+
     candidates: List[FieldDefinition] = []
 
     for type_decl in _walk_type(tree.root_node, "type_declaration"):
@@ -574,6 +589,8 @@ def _go_field_candidates(
                         kind=kind,
                     )
                 )
+    if cache is not None:
+        cache["go_field_candidates"] = candidates
     return candidates
 
 
@@ -622,52 +639,60 @@ def _go_decl_initializer_type(spec: Node, source: bytes) -> str:
 def _go_type_context(
     function: Node,
     source: bytes,
+    cache: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]], Dict[str, str]]:
     root = function
     while root.parent is not None:
         root = root.parent
 
-    struct_fields: Dict[str, Dict[str, str]] = {}
-    package_types: Dict[str, str] = {}
+    cached_types = cache.get("go_type_context") if cache is not None else None
+    if cached_types is None:
+        struct_fields: Dict[str, Dict[str, str]] = {}
+        package_types: Dict[str, str] = {}
 
-    for type_decl in _walk_type(root, "type_declaration"):
-        for type_spec in type_decl.children:
-            if type_spec.type != "type_spec":
-                continue
-            name_node = type_spec.child_by_field_name("name")
-            struct_type = type_spec.child_by_field_name("type")
-            if (
-                name_node is None
-                or struct_type is None
-                or struct_type.type != "struct_type"
-            ):
-                continue
-            fields: Dict[str, str] = {}
-            for field in _walk_type(struct_type, "field_declaration"):
-                field_type = field.child_by_field_name("type")
-                if field_type is None:
+        for type_decl in _walk_type(root, "type_declaration"):
+            for type_spec in type_decl.children:
+                if type_spec.type != "type_spec":
                     continue
-                raw_type = node_text(field_type, source)
-                for identifier in field.children:
-                    if identifier.type == "field_identifier":
-                        fields[node_text(identifier, source)] = raw_type
-            struct_fields[node_text(name_node, source)] = fields
+                name_node = type_spec.child_by_field_name("name")
+                struct_type = type_spec.child_by_field_name("type")
+                if (
+                    name_node is None
+                    or struct_type is None
+                    or struct_type.type != "struct_type"
+                ):
+                    continue
+                fields: Dict[str, str] = {}
+                for field in _walk_type(struct_type, "field_declaration"):
+                    field_type = field.child_by_field_name("type")
+                    if field_type is None:
+                        continue
+                    raw_type = node_text(field_type, source)
+                    for identifier in field.children:
+                        if identifier.type == "field_identifier":
+                            fields[node_text(identifier, source)] = raw_type
+                struct_fields[node_text(name_node, source)] = fields
 
-    for child in root.children:
-        if child.type not in {"const_declaration", "var_declaration"}:
-            continue
-        for spec in child.children:
-            if spec.type not in {"const_spec", "var_spec"}:
+        for child in root.children:
+            if child.type not in {"const_declaration", "var_declaration"}:
                 continue
-            type_node = spec.child_by_field_name("type")
-            raw_type = (
-                node_text(type_node, source)
-                if type_node is not None
-                else _go_decl_initializer_type(spec, source)
-            )
-            for identifier in spec.children:
-                if identifier.type == "identifier":
-                    package_types[node_text(identifier, source)] = raw_type
+            for spec in child.children:
+                if spec.type not in {"const_spec", "var_spec"}:
+                    continue
+                type_node = spec.child_by_field_name("type")
+                raw_type = (
+                    node_text(type_node, source)
+                    if type_node is not None
+                    else _go_decl_initializer_type(spec, source)
+                )
+                for identifier in spec.children:
+                    if identifier.type == "identifier":
+                        package_types[node_text(identifier, source)] = raw_type
+
+        if cache is not None:
+            cache["go_type_context"] = (struct_fields, package_types)
+    else:
+        struct_fields, package_types = cached_types
 
     type_env: Dict[str, str] = {}
     for parameters_field in ("receiver", "parameters"):

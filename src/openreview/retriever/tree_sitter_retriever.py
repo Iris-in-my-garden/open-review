@@ -15,7 +15,7 @@
 import logging
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from tree_sitter import Language, Node, Parser, Tree
 
@@ -70,6 +70,30 @@ TEST_PREFIXES = {
 LoadedFile = Tuple[str, List[str], bytes, Tree]
 # (file, start_row, end_row, revision)：base/head 同一行范围是不同证据。
 NodeRangeKey = Tuple[str, int, int, str]
+
+
+def _symbol_search_pattern(symbols: Set[str]) -> Optional[re.Pattern[str]]:
+    """Compile one alternation for "does this body reference any symbol".
+
+    ``_collect_test_contexts`` used to run one regex per symbol for every test
+    function. Large linked test files with many symbols turned that into tens
+    of thousands of scans; a single alternation keeps it linear.
+    """
+    targets = sorted(
+        {
+            target
+            for symbol in symbols
+            if symbol and (target := symbol.rsplit(".", 1)[-1])
+        },
+        key=len,
+        reverse=True,
+    )
+    if not targets:
+        return None
+    return re.compile(
+        r"\b(?:" + "|".join(re.escape(target) for target in targets) + r")\b"
+    )
+
 
 
 class TreeSitterLocalRetriever:
@@ -316,16 +340,36 @@ class TreeSitterLocalRetriever:
             text, _, source, tree = loaded
             fields: List[FieldDefinition] = []
             seen_fields: Set[Tuple[str, str, int, int]] = set()
+            # Per-file cache: Go field candidates and package type maps depend
+            # only on the tree, so reuse them across all changed-line scopes.
+            field_cache: Dict[str, Any] = {}
+            # Group changed lines by enclosing definition. Calling the field
+            # collector once per line re-scanned the whole tree (and rebuilt
+            # the Go type graph) for every line; a generated 480 KB Go file
+            # with ~100 changed lines made this the dominant retrieval cost.
+            field_lines: Dict[Tuple[int, int], List[int]] = {}
             for line_number in file_diff.changed_lines:
+                node = ast_utils.find_enclosing_definition(
+                    tree, max(0, line_number - 1)
+                )
+                scope_key = (
+                    (node.start_point[0], node.end_point[0])
+                    if node is not None
+                    else (line_number, line_number)
+                )
+                field_lines.setdefault(scope_key, []).append(line_number)
+
+            for group_lines in field_lines.values():
                 for field in collect_referenced_fields_from_tree(
                     text,
                     source,
                     tree,
                     suffix,
-                    line_number,
-                    line_number,
-                    changed_lines=[line_number],
+                    min(group_lines),
+                    max(group_lines),
+                    changed_lines=group_lines,
                     window_radius=DEFAULT_FIELD_WINDOW_RADIUS,
+                    cache=field_cache,
                 ):
                     key = (
                         field.parent_type,
@@ -518,6 +562,7 @@ class TreeSitterLocalRetriever:
         symbols = self._extract_search_targets(parsed_diff) | enclosing_names
         if not symbols:
             return []
+        symbol_pattern = _symbol_search_pattern(symbols)
 
         source_files = [
             file_diff.filename
@@ -542,7 +587,7 @@ class TreeSitterLocalRetriever:
 
                 _, lines, source, tree = loaded
                 for node, name in self._iter_test_functions(tree, source, test_file):
-                    if not self._references_any(node, source, symbols):
+                    if not self._references_any(node, source, symbol_pattern):
                         continue
                     key = (
                         test_file,
@@ -653,15 +698,12 @@ class TreeSitterLocalRetriever:
             stack.extend(reversed(node.children))
 
     @staticmethod
-    def _references_any(node: Node, source: bytes, symbols: Set[str]) -> bool:
-        body = ast_utils.node_text(node, source)
-        for symbol in symbols:
-            target = symbol.rsplit(".", 1)[-1]
-            if not target:
-                continue
-            if re.search(rf"\b{re.escape(target)}\b", body):
-                return True
-        return False
+    def _references_any(
+        node: Node, source: bytes, pattern: Optional[re.Pattern[str]]
+    ) -> bool:
+        if pattern is None:
+            return False
+        return bool(pattern.search(ast_utils.node_text(node, source)))
 
     def _matched_symbol(
         self,

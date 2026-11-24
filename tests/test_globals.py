@@ -156,3 +156,53 @@ def test_go_large_package_literal_is_truncated_to_type_signature():
         field.parent_type == "testFile" and field.name == "name"
         for field in fields
     )
+
+
+def test_go_field_candidates_are_cached_across_scopes(monkeypatch):
+    """同一文件的多个作用域共享缓存，不重复扫描整棵 Go tree。"""
+    from openreview.retriever import globals as globals_module
+    from openreview.retriever.ast_utils import parse_text
+
+    source_text = (
+        "package pkg\n"
+        "\n"
+        "type Service struct {\n"
+        "    timeout int\n"
+        "}\n"
+        "\n"
+        "func (s *Service) First() int {\n"
+        "    return s.timeout\n"
+        "}\n"
+        "\n"
+        "func (s *Service) Second() int {\n"
+        "    return s.timeout\n"
+        "}\n"
+    )
+    parsed = parse_text(source_text, ".go")
+    assert parsed is not None
+    text, source, tree = parsed
+
+    calls: list[int] = []
+    original = globals_module._go_field_candidates
+
+    def counting(*args, **kwargs):
+        cache = kwargs.get("cache")
+        if cache is None and len(args) > 4:
+            cache = args[4]
+        if cache is None or "go_field_candidates" not in cache:
+            calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(globals_module, "_go_field_candidates", counting)
+
+    cache: dict = {}
+    first = globals_module.collect_referenced_fields_from_tree(
+        text, source, tree, ".go", 8, 8, changed_lines=[8], cache=cache
+    )
+    second = globals_module.collect_referenced_fields_from_tree(
+        text, source, tree, ".go", 12, 12, changed_lines=[12], cache=cache
+    )
+
+    assert len(calls) == 1
+    assert {field.name for field in first} == {"timeout"}
+    assert {field.name for field in second} == {"timeout"}

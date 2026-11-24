@@ -250,6 +250,23 @@ def _parse_name_status(output: str) -> List[Tuple[str, str]]:
     return result
 
 
+def _split_patch_by_file(patch: str) -> List[str]:
+    """Split a combined ``git diff --patch`` output into per-file chunks."""
+    if not patch:
+        return []
+    chunks: List[str] = []
+    current: List[str] = []
+    for line in patch.splitlines(keepends=True):
+        if line.startswith("diff --git ") and current:
+            chunks.append("".join(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
 def collect_local_changes(
     repo_path: str | Path,
     base_sha: str,
@@ -282,23 +299,50 @@ def collect_local_changes(
     ).stdout
 
     stats = _parse_numstat(numstat)
+    entries = _parse_name_status(name_status)
+    # Render every patch in one git process. The previous per-file loop issued
+    # one `git diff` per changed file, which dominated large local reviews.
+    combined_patch = _git(
+        repo_root,
+        "diff",
+        "--no-renames",
+        "--patch",
+        "--no-color",
+        "--no-ext-diff",
+        "--unified=3",
+        base,
+        head,
+    ).stdout
+    chunks = _split_patch_by_file(combined_patch)
+    # `git diff --name-status` and `git diff --patch` walk the same tree in the
+    # same order, so chunks align one-to-one with entries. Fall back to
+    # per-file diffs only if that assumption does not hold (e.g. git version
+    # differences or unusual path handling).
+    patch_by_path = (
+        dict(zip((path for _, path in entries), chunks, strict=True))
+        if len(chunks) == len(entries)
+        else {}
+    )
+
     changed: List[ChangedFile] = []
-    for raw_status, path in _parse_name_status(name_status):
+    for raw_status, path in entries:
         status = _STATUS_MAP.get(raw_status[:1], "modified")
         additions, deletions = stats.get(path, (0, 0))
-        patch = _git(
-            repo_root,
-            "diff",
-            "--no-renames",
-            "--patch",
-            "--no-color",
-            "--no-ext-diff",
-            "--unified=3",
-            base,
-            head,
-            "--",
-            path,
-        ).stdout
+        patch = patch_by_path.get(path)
+        if patch is None:
+            patch = _git(
+                repo_root,
+                "diff",
+                "--no-renames",
+                "--patch",
+                "--no-color",
+                "--no-ext-diff",
+                "--unified=3",
+                base,
+                head,
+                "--",
+                path,
+            ).stdout
         changed.append(
             ChangedFile(
                 filename=path,
