@@ -452,7 +452,7 @@ def test_hybrid_reports_candidates_deduped_and_truncated(tmp_path: Path):
     retriever = HybridRetriever(
         ast_retriever=_FakeAstRetriever(),
         enabled=False,
-        max_context_tokens=60,
+        max_context_tokens=130,
     )
 
     contexts = retriever.retrieve(tmp_path, ParsedDiff(files=[]))

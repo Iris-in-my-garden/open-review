@@ -16,6 +16,10 @@ CONFIG_EXTENSIONS = {
     ".xml",
     ".conf",
 }
+# Reference expansion (callers / callees / impact hits) from these paths is
+# almost always benchmark or test scaffolding, not actionable review evidence.
+LOW_VALUE_REFERENCE_DIRS = {"test", "tests", "__tests__", "benchmark", "benchmarks"}
+LOW_VALUE_REFERENCE_NAMES = {"setup.py", "conftest.py"}
 LANGUAGE_MAP = {
     ".py": "python",
     ".js": "javascript",
@@ -126,6 +130,25 @@ class DiffParser:
     def is_test_path(filename: str) -> bool:
         """公开的测试文件判断，供检索器与测试缺口分析复用。"""
         return DiffParser._is_test_file(filename)
+
+    @staticmethod
+    def is_low_value_reference_path(filename: str) -> bool:
+        """Whether references from this path are low-value expansion noise.
+
+        Call graph / impact expansion should not spend prompt budget on
+        benchmark, test, setup or conftest scaffolding. Source definitions are
+        still kept; this only filters *reference sites* and low-value target
+        definitions.
+        """
+        if not filename:
+            return False
+        if DiffParser.is_test_path(filename):
+            return True
+        path = Path(filename)
+        parts = {part.lower() for part in path.parts if part not in (".", "")}
+        if parts & LOW_VALUE_REFERENCE_DIRS:
+            return True
+        return path.name.lower() in LOW_VALUE_REFERENCE_NAMES
 
     @staticmethod
     def is_linked_test(source_file: str, test_path: str) -> bool:

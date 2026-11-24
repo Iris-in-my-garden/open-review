@@ -33,7 +33,10 @@ from openreview.repo.local import (
 )
 from openreview.repo.manager import RepoCommandError
 from openreview.retriever.base import supports_plan
-from openreview.retriever.code_context import context_identity
+from openreview.retriever.code_context import (
+    cap_repeated_contexts,
+    context_identity,
+)
 from openreview.retriever.context_planner import plan_contexts
 from openreview.review.cache import ReviewCache
 from openreview.review.comment_builder import (
@@ -571,6 +574,9 @@ class ReviewExecutor:
         # 跨 batch 去重只影响 state/metrics/verifier 的“本次唯一上下文”，
         # 不改变每个 batch 自己的 prompt：后一个 batch 仍然需要它自己的上下文。
         seen_context_keys: set[tuple] = set()
+        # callee/dependency/impact 在同一 run 内可能被多个 batch 反复检索到；
+        # 保留前 MAX 次，避免共享 helper / benchmark 代码占满后续 batch 预算。
+        repeated_context_counts: Dict[tuple, int] = {}
         with self._timed(state, "retrieve_and_review"):
             for index, batch in enumerate(batches, start=1):
                 self._log(
@@ -628,6 +634,14 @@ class ReviewExecutor:
                                 for context in redundant
                             )
                         )
+                before_cap = len(contexts)
+                contexts = cap_repeated_contexts(contexts, repeated_context_counts)
+                capped = before_cap - len(contexts)
+                if capped:
+                    state.retrieval_stats["contexts_repeated_capped"] = (
+                        int(state.retrieval_stats.get("contexts_repeated_capped", 0))
+                        + capped
+                    )
                 contexts = plan_contexts(
                     contexts,
                     self.config.max_context_tokens,

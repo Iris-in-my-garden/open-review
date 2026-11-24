@@ -565,3 +565,61 @@ def test_graph_retriever_uses_injected_line_cache(tmp_path: Path):
     # caller / callee / dependency 都来自共享缓存，不再各自直接读文件。
     assert {"api.py", "util.py", "models.py"} <= names
 
+
+
+def test_graph_skips_low_value_reference_paths(tmp_path: Path):
+    root = tmp_path / "repo"
+    (root / "pkg").mkdir(parents=True)
+    (root / "benchmarks").mkdir()
+    (root / "pkg" / "auth.py").write_text(
+        "def login(user):\n    return user\n", encoding="utf-8"
+    )
+    (root / "pkg" / "api.py").write_text(
+        "from pkg.auth import login\n"
+        "\n"
+        "def handle(user):\n"
+        "    return login(user)\n",
+        encoding="utf-8",
+    )
+    (root / "benchmarks" / "bench.py").write_text(
+        "from pkg.auth import login\n"
+        "\n"
+        "def bench(user):\n"
+        "    return login(user)\n",
+        encoding="utf-8",
+    )
+    (root / "benchmarks" / "helpers.py").write_text(
+        "def bench_helper():\n    return 1\n", encoding="utf-8"
+    )
+    (root / "pkg" / "runner.py").write_text(
+        "from benchmarks.helpers import bench_helper\n"
+        "\n"
+        "def run():\n"
+        "    return bench_helper()\n",
+        encoding="utf-8",
+    )
+    _init_repo(root)
+
+    index = RepoIndex.for_worktree(root, cache_dir=tmp_path / "idx")
+    try:
+        contexts = GraphRetriever().retrieve(
+            root,
+            index,
+            RetrievalQuery(
+                symbols=["run"],
+                files=["pkg/runner.py"],
+                signature_changed_symbols=["login"],
+            ),
+        )
+
+        caller_files = {
+            context.file_path for context in contexts if context.kind == "caller"
+        }
+        assert caller_files == {"pkg/api.py"}
+        assert not any(
+            context.kind == "callee"
+            and context.file_path == "benchmarks/helpers.py"
+            for context in contexts
+        )
+    finally:
+        index.close()

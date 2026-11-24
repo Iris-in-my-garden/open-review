@@ -383,3 +383,32 @@ def test_merge_contexts_does_not_mix_base_and_head_ranges():
     merged = merge_contexts([head, base])
 
     assert {item.revision for item in merged} == {"head", "base"}
+
+
+def test_cap_repeated_contexts_limits_expansion_per_run():
+    from openreview.retriever.code_context import cap_repeated_contexts
+
+    repeated = [
+        _context(
+            "src/shared.py",
+            priority=ContextPriority.DEFINITION,
+            kind="callee",
+            start_line=10,
+            end_line=12,
+        )
+        for _ in range(4)
+    ]
+    enclosing = _context(
+        "src/e.py",
+        priority=ContextPriority.ENCLOSING,
+        kind="enclosing",
+        start_line=1,
+        end_line=2,
+    )
+    counts: dict = {}
+
+    kept = cap_repeated_contexts([*repeated, enclosing], counts)
+
+    assert sum(1 for item in kept if item.kind == "callee") == 2
+    assert any(item.kind == "enclosing" for item in kept)
+    assert counts

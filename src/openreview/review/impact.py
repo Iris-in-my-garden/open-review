@@ -17,7 +17,7 @@ from typing import Iterable, List, Optional
 
 from pydantic import BaseModel, Field
 
-from openreview.repo.diff_parser import ParsedDiff
+from openreview.repo.diff_parser import DiffParser, ParsedDiff
 from openreview.retriever.code_context import (
     CodeContext,
     ContextPriority,
@@ -168,6 +168,8 @@ class ImpactAnalyzer:
         seen: set[tuple[str, str, int]] = set()
         for path, line, code in raw_matches:
             if path in changed_files:
+                continue
+            if DiffParser.is_low_value_reference_path(path):
                 continue
             symbol = self._find_symbol_in_line(code, symbols)
             if symbol is None:

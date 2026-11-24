@@ -7,6 +7,7 @@ from typing import Any, Dict
 
 from openreview.repo.local import LocalReviewInput
 from openreview.retriever.base import supports_plan
+from openreview.retriever.code_context import cap_repeated_contexts
 from openreview.retriever.context_planner import plan_contexts
 from openreview.review.context_filter import filter_redundant_base_contexts
 from openreview.review.redaction import redact_text
@@ -51,6 +52,7 @@ def build_context_dry_run(
         prompt_builder = session.reviewer.prompt_builder
         system_prompt = prompt_builder.build_system_prompt()
         batch_reports = []
+        repeated_context_counts: Dict[tuple, int] = {}
 
         for index, batch in enumerate(batches, start=1):
             prompt_builder.reset_context_stats()
@@ -76,6 +78,9 @@ def build_context_dry_run(
                 batch,
                 fully_visible_files=visible_patch_files,
             )
+            before_cap = len(contexts)
+            contexts = cap_repeated_contexts(contexts, repeated_context_counts)
+            repeated_contexts_capped = before_cap - len(contexts)
             contexts = plan_contexts(
                 contexts,
                 pipeline.config.max_context_tokens,
@@ -145,6 +150,7 @@ def build_context_dry_run(
                     "files": [file.filename for file in batch.files],
                     "changed_symbols": batch_changed_symbols,
                     "redundant_base_contexts": len(redundant_base_contexts),
+                    "repeated_contexts_capped": repeated_contexts_capped,
                     "contexts": context_reports,
                     "patch_tokens_estimate": sum(
                         estimate_tokens(file.patch or "") for file in batch.files

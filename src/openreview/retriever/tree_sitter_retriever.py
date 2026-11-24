@@ -44,9 +44,10 @@ MAX_SEARCH_TARGETS = 50
 MAX_REFERENCE_CONTEXTS = 200
 MAX_TEST_FUNCTION_CONTEXTS = 2
 # 单个 enclosing 方法超过该 token 数时做 AST 折叠；折叠会保留全部变更行。
-MAX_ENCLOSING_SNIPPET_TOKENS = 1600
-# 函数体小于该行数且整段都已出现在 diff hunk 里时，P2 片段完全是重复内容。
-MIN_ENCLOSING_BODY_LINES = 5
+# 分档：测试函数和 type/class 声明通常只需要局部语义，分别用更低的上限。
+MAX_ENCLOSING_SNIPPET_TOKENS = 1200
+MAX_ENCLOSING_SNIPPET_TOKENS_TEST = 800
+MAX_ENCLOSING_SNIPPET_TOKENS_TYPE = 500
 
 # 打分：变更行所在的函数/类 > 符号定义 > 关联测试 > 符号引用 > base 侧历史代码
 SCORE_ENCLOSING = 0.95
@@ -219,13 +220,14 @@ class TreeSitterLocalRetriever:
                     definition_names.add(name)
 
                 start_row, end_row = node.start_point[0], node.end_point[0]
-                # 微小型 enclosing 如果整段都已出现在 hunk 上下文里，
-                # 注入 P2 只是重复 diff 内容，直接跳过。
-                if self._is_fully_visible_tiny_enclosing(
+                # 如果整个定义都已出现在 hunk/visible lines 里，注入 P2
+                # 只是重复 diff 内容，直接跳过（不再限制为“微小型”）。
+                if self._is_fully_visible_enclosing(
                     file_diff, start_row, end_row
                 ):
-                    self.last_stats["tiny_enclosing_skipped"] = (
-                        self.last_stats.get("tiny_enclosing_skipped", 0) + 1
+                    self.last_stats["fully_visible_enclosing_skipped"] = (
+                        self.last_stats.get("fully_visible_enclosing_skipped", 0)
+                        + 1
                     )
                     continue
 
@@ -241,14 +243,17 @@ class TreeSitterLocalRetriever:
 
                 snippet = "\n".join(lines[start_row : end_row + 1])
                 folded = False
-                if estimate_tokens(snippet) > MAX_ENCLOSING_SNIPPET_TOKENS:
+                token_cap = self._enclosing_token_cap(
+                    file_diff, node.type, name or ""
+                )
+                if estimate_tokens(snippet) > token_cap:
                     snippet, folded = fold_snippet(
                         text,
                         Path(file_diff.filename).suffix,
                         start_row + 1,
                         end_row + 1,
                         file_diff.changed_lines,
-                        MAX_ENCLOSING_SNIPPET_TOKENS,
+                        token_cap,
                     )
                     if folded:
                         self.last_stats["folded_contexts"] = (
@@ -286,15 +291,12 @@ class TreeSitterLocalRetriever:
         return contexts, definition_names
 
     @staticmethod
-    def _is_fully_visible_tiny_enclosing(
+    def _is_fully_visible_enclosing(
         file_diff: ParsedChangedFile,
         start_row: int,
         end_row: int,
     ) -> bool:
-        """函数体 < ``MIN_ENCLOSING_BODY_LINES`` 且整段都在 hunk 上下文里。"""
-        body_lines = end_row - start_row  # 去掉声明行
-        if body_lines >= MIN_ENCLOSING_BODY_LINES:
-            return False
+        """Whether the whole enclosing definition is already visible in the patch."""
         visible = set(file_diff.visible_lines or [])
         if not visible:
             return False
@@ -302,6 +304,26 @@ class TreeSitterLocalRetriever:
         return all(
             line in visible for line in range(start_row + 1, end_row + 2)
         )
+
+    @staticmethod
+    def _enclosing_token_cap(
+        file_diff: ParsedChangedFile,
+        definition_type: str,
+        name: str,
+    ) -> int:
+        """Tiered folding budget for enclosing definitions.
+
+        Type/class declarations and test functions are usually scaffolding:
+        the patch already shows the changed fields/lines, so keep their
+        surrounding context much smaller than a core production function.
+        """
+        if definition_type in {"type_declaration", "class_definition"}:
+            return MAX_ENCLOSING_SNIPPET_TOKENS_TYPE
+        if file_diff.is_test_file or name.startswith(
+            ("test_", "Test", "Benchmark", "Example", "Fuzz")
+        ):
+            return MAX_ENCLOSING_SNIPPET_TOKENS_TEST
+        return MAX_ENCLOSING_SNIPPET_TOKENS
 
     # ------------------------------------------------------------------
     # P5 fields

@@ -95,7 +95,10 @@ flowchart TD
 
 - **先刷新索引，再并行 AST/Graph**，这样 AST 知道索引是否可用，只在索引/图不可用时启用全局 grep。
 - Graph 运行期失败时，补一次 grep fallback，避免跨文件证据完全消失。
-- 测试文件不注入 P4 引用上下文（caller 在测试里噪声大）。
+- 测试、benchmark、`setup.py` / `conftest.py` 不注入 P4 引用，也不作为
+  callee/dependency/impact 的扩展目标（`DiffParser.is_low_value_reference_path`）。
+- 同一 run 内 `callee` / `dependency` / `impact` 的相同代码范围最多注入
+  2 次，避免共享 helper 在多个 batch 反复占用预算。
 - `base` revision 的上下文只用于解释删除代码，不能作为新文件 finding 的引用证据。
 
 ## 4. 六级优先级与 cap
@@ -103,7 +106,7 @@ flowchart TD
 | 优先级 | Kind | 内容 | 默认 cap |
 |---:|---|---|---:|
 | P1 | `static` | ruff/mypy 等确定性信号（仅 changed lines） | 500 tokens |
-| P2 | `enclosing` | 变更行所在函数/类（必要时 AST 折叠） | 与 P3 共享总预算 |
+| P2 | `enclosing` | 变更行所在函数/类（必要时 AST 折叠） | 普通 1200 / test 800 / type-class 500 tokens |
 | P3 | `definition` | callee / dependency / base 被删除定义 | 与 P2 共享；`dependency` 单独 1000 |
 | P4 | `reference` | caller / impact / grep 兜底引用 | 总预算 |
 | P5 | `field` | 被引用的类/结构体字段、模块常量 | 1000 tokens |
@@ -114,7 +117,7 @@ flowchart TD
 1. 先 `merge_contexts` 去重（相同范围 / 同一 AST 节点 / P2 包含 P5）。
 2. 按 priority 升序填充。
 3. P2/P3 按文件 **round-robin**：每个文件先出一个，再进入下一轮，避免大文件饿死其他变更。
-4. 每条上下文成本 = `estimate_tokens(snippet) + 24`。
+4. 每条上下文成本 = `estimate_tokens(snippet) + 56`（覆盖渲染后的 ctx header 与 code fence）。
 5. 超过 `max_context_tokens`（默认 8192）或 priority/kind cap 的上下文被丢弃，并写入 `context_gap` 统计。
 
 ## 5. Token 估算

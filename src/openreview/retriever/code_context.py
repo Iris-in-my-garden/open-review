@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from enum import IntEnum
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, MutableMapping, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -135,6 +135,39 @@ def dedupe_contexts(
             # P6 import 行），优先级相同时再比较 score。
             best[key] = context
     return [best[key] for key in order]
+
+
+REPEAT_CAPPED_KINDS = frozenset({"callee", "dependency", "impact"})
+REPEAT_CAP_OCCURRENCES = 2
+
+
+def cap_repeated_contexts(
+    contexts: Iterable[CodeContext],
+    counts: MutableMapping[tuple, int],
+    *,
+    max_occurrences: int = REPEAT_CAP_OCCURRENCES,
+    kinds: Iterable[str] = REPEAT_CAPPED_KINDS,
+) -> List[CodeContext]:
+    """Limit how often the same expansion evidence is injected per run.
+
+    A shared callee/import/impact snippet can legitimately appear in several
+    batches, but the long tail (benchmark helpers, setup.py, shared utilities)
+    is usually noise. ``counts`` is a per-run mutable counter owned by the
+    caller; the first ``max_occurrences`` occurrences are kept.
+    """
+    if max_occurrences < 1:
+        return list(contexts)
+    capped_kinds = set(kinds)
+    kept: List[CodeContext] = []
+    for context in contexts:
+        if context.kind in capped_kinds:
+            key = context_identity(context)
+            seen = counts.get(key, 0)
+            if seen >= max_occurrences:
+                continue
+            counts[key] = seen + 1
+        kept.append(context)
+    return kept
 
 
 # 这些 kind 抽取的是“定义节点”，同一个节点可能被 AST / index / graph

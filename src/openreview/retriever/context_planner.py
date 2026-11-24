@@ -30,7 +30,10 @@ from openreview.retriever.code_context import (
 )
 from openreview.review.token_budget import estimate_tokens
 
-CONTEXT_OVERHEAD_TOKENS = 24
+CONTEXT_OVERHEAD_TOKENS = 56
+# 实测 PromptBuilder 渲染后的 header + code fence 平均比 snippet 多 ~53
+# tokens（含其固定 +20）。24 会低估约 29 tokens/条，导致 planner 选中一批
+# 最终装不进 prompt 的 context；56 与真实成本对齐并留少量余量。
 ROUND_ROBIN_PRIORITIES = {
     ContextPriority.ENCLOSING,
     ContextPriority.DEFINITION,

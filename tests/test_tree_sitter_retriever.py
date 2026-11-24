@@ -69,7 +69,7 @@ def test_body_only_change_returns_enclosing_function(sample_repo: Path):
 
 
 def test_tiny_enclosing_fully_covered_by_hunk_is_skipped(sample_repo: Path):
-    """函数体 <5 行且整段都在 hunk 里时，P2 只是重复 diff 内容。"""
+    """函数整段都在 hunk 里时，P2 只是重复 diff 内容。"""
     diff = ParsedDiff(
         files=[
             ParsedChangedFile(
@@ -85,7 +85,37 @@ def test_tiny_enclosing_fully_covered_by_hunk_is_skipped(sample_repo: Path):
     contexts = retriever.retrieve(sample_repo, diff)
 
     assert not any(context.kind == "enclosing" for context in contexts)
-    assert retriever.last_stats["tiny_enclosing_skipped"] == 1
+    assert retriever.last_stats["fully_visible_enclosing_skipped"] == 1
+
+
+def test_large_fully_visible_enclosing_is_also_skipped(tmp_path: Path):
+    """大函数只要整段在 patch 可见，也不应重复注入 P2。"""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    body = "\n".join(f"    value_{index} = {index}" for index in range(10))
+    (pkg / "big.py").write_text(
+        "def big(x):\n"
+        f"{body}\n"
+        "    return x\n",
+        encoding="utf-8",
+    )
+    _init_repo(tmp_path)
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="pkg/big.py",
+                status="modified",
+                changed_lines=[5],
+                visible_lines=list(range(1, 13)),
+            )
+        ]
+    )
+    retriever = TreeSitterLocalRetriever()
+
+    contexts = retriever.retrieve(tmp_path, diff)
+
+    assert not any(context.kind == "enclosing" for context in contexts)
+    assert retriever.last_stats["fully_visible_enclosing_skipped"] == 1
 
 
 def test_tiny_enclosing_not_fully_visible_is_kept(sample_repo: Path):
@@ -105,7 +135,7 @@ def test_tiny_enclosing_not_fully_visible_is_kept(sample_repo: Path):
     contexts = retriever.retrieve(sample_repo, diff)
 
     assert any(context.kind == "enclosing" for context in contexts)
-    assert "tiny_enclosing_skipped" not in retriever.last_stats
+    assert "fully_visible_enclosing_skipped" not in retriever.last_stats
 
 
 def test_reference_is_not_misclassified_as_definition(sample_repo: Path):
@@ -413,3 +443,34 @@ def test_p5_fields_from_same_struct_are_grouped(tmp_path: Path):
     assert "type Service struct {" in field_contexts[0].snippet
     assert "timeout int" in field_contexts[0].snippet
     assert "retries int" in field_contexts[0].snippet
+
+
+def test_enclosing_token_caps_are_tiered():
+    from openreview.repo.diff_parser import ParsedChangedFile
+    from openreview.retriever.tree_sitter_retriever import (
+        MAX_ENCLOSING_SNIPPET_TOKENS,
+        MAX_ENCLOSING_SNIPPET_TOKENS_TEST,
+        MAX_ENCLOSING_SNIPPET_TOKENS_TYPE,
+    )
+
+    normal = ParsedChangedFile(filename="pkg/mod.py", status="modified")
+    test_file = ParsedChangedFile(filename="tests/test_mod.py", status="modified")
+
+    assert (
+        TreeSitterLocalRetriever._enclosing_token_cap(
+            normal, "function_definition", "target"
+        )
+        == MAX_ENCLOSING_SNIPPET_TOKENS
+    )
+    assert (
+        TreeSitterLocalRetriever._enclosing_token_cap(
+            test_file, "function_definition", "test_target"
+        )
+        == MAX_ENCLOSING_SNIPPET_TOKENS_TEST
+    )
+    assert (
+        TreeSitterLocalRetriever._enclosing_token_cap(
+            normal, "type_declaration", "Config"
+        )
+        == MAX_ENCLOSING_SNIPPET_TOKENS_TYPE
+    )

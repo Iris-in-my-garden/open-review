@@ -193,3 +193,15 @@ def test_split_patch_into_hunks_keeps_preamble_with_first_hunk():
     assert hunks[0].startswith("diff --git")
     assert "@@ -10,1 +11,2 @@" in hunks[1]
     assert "".join(hunks) == patch
+
+def test_low_value_reference_paths():
+    assert DiffParser.is_low_value_reference_path("tests/test_main.py")
+    assert DiffParser.is_low_value_reference_path("pkg/mod_test.go")
+    assert DiffParser.is_low_value_reference_path("benchmarks/kernels/bench.py")
+    assert DiffParser.is_low_value_reference_path("benchmark/run.py")
+    assert DiffParser.is_low_value_reference_path("setup.py")
+    assert DiffParser.is_low_value_reference_path("conftest.py")
+
+    assert not DiffParser.is_low_value_reference_path("src/core.py")
+    assert not DiffParser.is_low_value_reference_path("benchmarks2/keep.py")
+    assert not DiffParser.is_low_value_reference_path("scripts/tool.py")

@@ -184,10 +184,11 @@ class HybridRetriever:
         parsed_diff: ParsedDiff,
         contexts: Sequence[CodeContext],
     ) -> List[CodeContext]:
-        """P0：测试文件不注入 P4 引用（当前主要是 caller）。
+        """P0：测试/benchmark/setup 文件不注入 P4 引用（当前主要是 caller/impact）。
 
-        caller 上下文只在签名变更时产生，本质是跨文件拓扑证据。测试文件里
-        的调用点既多又和线上行为无关，整类跳过可以显著降低噪声。
+        caller 上下文只在签名变更时产生，本质是跨文件拓扑证据。测试、
+        benchmark 和 setup 里的调用点既多又和线上行为无关，整类跳过可以
+        显著降低噪声。
         """
         only_tests = bool(parsed_diff.files) and all(
             file.is_test_file for file in parsed_diff.files
@@ -195,7 +196,8 @@ class HybridRetriever:
         result: List[CodeContext] = []
         for context in contexts:
             if context.priority == ContextPriority.REFERENCE and (
-                only_tests or DiffParser.is_test_path(context.file_path)
+                only_tests
+                or DiffParser.is_low_value_reference_path(context.file_path)
             ):
                 continue
             result.append(context)

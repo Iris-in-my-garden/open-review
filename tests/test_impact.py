@@ -132,3 +132,36 @@ def test_impact_works_when_repo_lives_under_excluded_dir_name(tmp_path: Path):
     report = ImpactAnalyzer().analyze(parsed, repo_root)
 
     assert any(item.file == "src/caller.py" for item in report.findings)
+
+
+def test_impact_skips_benchmark_and_setup_references(tmp_path: Path):
+    _write(
+        tmp_path / "src" / "core.py",
+        "def helper(value):\n    return value\n",
+    )
+    _write(
+        tmp_path / "src" / "caller.py",
+        "from core import helper\n\nresult = helper(1)\n",
+    )
+    _write(
+        tmp_path / "benchmarks" / "bench.py",
+        "from core import helper\n\nresult = helper(2)\n",
+    )
+    _write(
+        tmp_path / "setup.py",
+        "from src.core import helper\n\nhelper(3)\n",
+    )
+
+    parsed = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="src/core.py",
+                status="modified",
+                changed_symbols=["helper"],
+            )
+        ]
+    )
+
+    report = ImpactAnalyzer().analyze(parsed, tmp_path)
+
+    assert {item.file for item in report.findings} == {"src/caller.py"}

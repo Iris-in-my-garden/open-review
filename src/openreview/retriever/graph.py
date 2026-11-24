@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+from openreview.repo.diff_parser import DiffParser
 from openreview.retriever import ast_utils
 from openreview.retriever.ast_utils import FileLineCache
 from openreview.retriever.code_context import (
@@ -155,6 +156,8 @@ class GraphRetriever:
         ):
             if self.python_calls_only and not edge.caller_file.endswith(".py"):
                 continue
+            if DiffParser.is_low_value_reference_path(edge.caller_file):
+                continue
             symbol = edge.caller_symbol or edge.callee_name
             key = (edge.caller_file, symbol)
             if key in seen:
@@ -284,6 +287,8 @@ class GraphRetriever:
             ]
             definition = self._resolve_definition(edge, definitions, imported)
             if definition is None:
+                continue
+            if DiffParser.is_low_value_reference_path(definition.file_path):
                 continue
             if not self._is_local_callee(edge, definition, imported):
                 # 标准库 / 第三方调用没有仓库内定义，直接跳过；同名仓库符号
@@ -445,6 +450,8 @@ class GraphRetriever:
         for symbol in index.definitions_in_modules(
             query.imports, limit=max(self.max_dependencies * 2, self.max_dependencies)
         ):
+            if DiffParser.is_low_value_reference_path(symbol.file_path):
+                continue
             snippet = self.line_cache.read_range(
                 repo_path / symbol.file_path, symbol.start_line, symbol.end_line
             )
