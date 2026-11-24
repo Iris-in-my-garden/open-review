@@ -303,6 +303,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         pipeline = ReviewPipeline(
             mock_llm=True,
             ablation=args.ablation,
+            local_worktree_reuse=True,
         )
         try:
             reports = []
@@ -374,6 +375,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         review_cache_dir=str(review_cache_dir) if review_cache_dir else None,
         llm_cache_dir=args.llm_cache_dir,
         llm_cache_mode=args.llm_cache_mode,
+        local_worktree_reuse=True,
     )
     try:
         rows = run_reviews(

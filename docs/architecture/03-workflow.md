@@ -20,6 +20,11 @@
 | 12 | `post_comments` | `post_comments and not cache_hit and not local_mode` | `review_result`、`pr_ref`、`pr_info` | GitHub Review（upsert） | 抛异常 → `failed`（报告已落盘） |
 | 13 | `finalize` | 总是 | 全部 state | `outcome`、`review_result.metrics`、review cache、debug | 抛异常 → `failed` |
 
+> 本地模式可以用 `ReviewPipeline(local_worktree_reuse=True)` 开启
+> `WorktreePool`：`prepare_local` 从池中复用 detached worktree，
+> `LocalWorkspace.cleanup()` 只归还 slot，`pipeline.close()` 再统一删除。
+> 评测 CLI 的 `review` 默认开启；`--keep-worktrees` 仍走独立 worktree。
+
 ## 2. `analyze` 内部顺序
 
 对每个 batch 严格执行以下顺序，任何一步失败都不会影响已完成的 batch：

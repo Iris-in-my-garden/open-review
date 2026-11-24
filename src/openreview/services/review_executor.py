@@ -27,6 +27,7 @@ from openreview.domain.policies import merge_review_results
 from openreview.github.pr_url import parse_pr_url
 from openreview.repo.local import (
     LocalReviewInput,
+    WorktreePool,
     collect_local_changes,
     prepare_local_workspace,
 )
@@ -104,6 +105,7 @@ class ReviewExecutor:
         budgeted_client,
         debug_sink=None,
         run_id: Optional[str] = None,
+        worktree_pool: Optional[WorktreePool] = None,
     ):
         self.config = config
         self.gh_client = gh_client
@@ -117,6 +119,7 @@ class ReviewExecutor:
         self.budgeted_client = budgeted_client
         self.debug_sink = debug_sink
         self.run_id = run_id
+        self.worktree_pool = worktree_pool
 
         self.cache_key_builder = CacheKeyBuilder(config)
         self.metrics_collector = MetricsCollector(config)
@@ -392,6 +395,7 @@ class ReviewExecutor:
                 local.base_sha,
                 local.head_sha,
                 keep=local.keep_worktrees,
+                pool=self.worktree_pool,
             )
             # 先挂到 state 上：即使后面的 diff 生成失败，run_local 的 finally
             # 也能清理 worktree。

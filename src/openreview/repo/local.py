@@ -16,6 +16,8 @@ import logging
 import shutil
 import subprocess
 import tempfile
+import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -32,6 +34,177 @@ _STATUS_MAP = {
     "T": "modified",  # type change
     "U": "modified",
 }
+
+
+@dataclass
+class _WorktreeSlot:
+    """One detached worktree owned by :class:`WorktreePool`."""
+
+    repo_root: Path
+    path: Path
+    sha: str
+    in_use: bool = False
+
+
+class WorktreePool:
+    """Reuse detached worktrees across local reviews of the same repository.
+
+    A large repository can contain tens of thousands of files (generated
+    fixtures, testdata, ...), so ``git worktree add`` can take tens of seconds.
+    Switching a reused worktree to another commit only updates files that
+    differ, which is much cheaper. Slots are returned to the pool on cleanup
+    and physically removed by :meth:`close`.
+    """
+
+    def __init__(self, root: Optional[Path] = None) -> None:
+        self._root = (
+            Path(root).expanduser().resolve()
+            if root is not None
+            else Path(tempfile.mkdtemp(prefix="openreview_worktrees_"))
+        )
+        self._root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._idle: Dict[str, List[_WorktreeSlot]] = {}
+        self._all: List[_WorktreeSlot] = []
+        self._closed = False
+
+    @property
+    def root(self) -> Path:
+        return self._root
+
+    def acquire(self, repo_root: Path, sha: str) -> _WorktreeSlot:
+        """Return an idle slot checked out at ``sha`` (creating one if needed)."""
+        repo_root = Path(repo_root).resolve()
+        key = str(repo_root)
+
+        with self._lock:
+            if self._closed:
+                raise RepoCommandError(
+                    command=["git", "worktree", "add"],
+                    returncode=-1,
+                    stderr="WorktreePool is closed",
+                )
+            idle = self._idle.setdefault(key, [])
+            slot = self._pop_slot(idle, sha)
+            if slot is None and idle:
+                slot = idle.pop()
+
+        if slot is None:
+            return self._create_slot(repo_root, sha)
+
+        if slot.sha != sha:
+            try:
+                self._checkout(slot.path, sha)
+            except RepoCommandError as exc:
+                logger.warning(
+                    "Failed to reuse worktree %s for %s: %s",
+                    slot.path,
+                    sha[:8],
+                    exc.stderr or exc,
+                )
+                self._dispose_slot(slot)
+                return self._create_slot(repo_root, sha)
+            slot.sha = sha
+        slot.in_use = True
+        return slot
+
+    def release(self, slot: _WorktreeSlot) -> None:
+        with self._lock:
+            if not slot.in_use:
+                return
+            slot.in_use = False
+            if self._closed:
+                return
+            self._idle.setdefault(str(slot.repo_root), []).append(slot)
+
+    def close(self) -> None:
+        """Remove every pooled worktree and the pool's temporary root."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            slots = list(self._all)
+            self._all.clear()
+            self._idle.clear()
+
+        repos = {slot.repo_root for slot in slots}
+        for slot in slots:
+            self._remove_worktree(slot.repo_root, slot.path)
+        for repo_root in repos:
+            try:
+                _git(repo_root, "worktree", "prune", check=False)
+            except Exception:  # noqa: BLE001 - pool close is best-effort
+                logger.debug("Could not prune worktrees for %s", repo_root)
+        shutil.rmtree(self._root, ignore_errors=True)
+
+    def __enter__(self) -> "WorktreePool":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    @staticmethod
+    def _pop_slot(
+        idle: List[_WorktreeSlot], sha: str
+    ) -> Optional[_WorktreeSlot]:
+        for index, slot in enumerate(idle):
+            if slot.sha == sha:
+                return idle.pop(index)
+        return None
+
+    def _create_slot(self, repo_root: Path, sha: str) -> _WorktreeSlot:
+        path = self._root / f"wt-{uuid.uuid4().hex}"
+        try:
+            _git(
+                repo_root,
+                "worktree",
+                "add",
+                "--detach",
+                "--force",
+                str(path),
+                sha,
+            )
+        except Exception:
+            shutil.rmtree(path, ignore_errors=True)
+            _git(repo_root, "worktree", "prune", check=False)
+            raise
+        slot = _WorktreeSlot(repo_root=repo_root, path=path, sha=sha, in_use=True)
+        with self._lock:
+            self._all.append(slot)
+        return slot
+
+    @staticmethod
+    def _checkout(path: Path, sha: str) -> None:
+        _git(path, "checkout", "--force", "--detach", sha)
+
+    def _dispose_slot(self, slot: _WorktreeSlot) -> None:
+        with self._lock:
+            try:
+                self._all.remove(slot)
+            except ValueError:
+                pass
+            idle = self._idle.get(str(slot.repo_root))
+            if idle is not None:
+                try:
+                    idle.remove(slot)
+                except ValueError:
+                    pass
+        self._remove_worktree(slot.repo_root, slot.path)
+
+    @staticmethod
+    def _remove_worktree(repo_root: Path, path: Path) -> None:
+        try:
+            _git(
+                repo_root,
+                "worktree",
+                "remove",
+                "--force",
+                str(path),
+                check=False,
+            )
+        except Exception:  # noqa: BLE001 - pool cleanup is best-effort
+            logger.debug("Could not remove worktree %s", path)
+        shutil.rmtree(path, ignore_errors=True)
 
 
 @dataclass
@@ -59,10 +232,25 @@ class LocalWorkspace:
     base_path: Optional[Path]
     temp_root: Optional[Path]
     keep: bool = False
+    pool: Optional[WorktreePool] = None
+    head_slot: Optional[_WorktreeSlot] = None
+    base_slot: Optional[_WorktreeSlot] = None
 
     def cleanup(self) -> None:
         if self.keep:
             logger.info("Keeping local worktrees at %s", self.temp_root)
+            return
+
+        if self.pool is not None:
+            # Return slots to the pool instead of deleting them. Idempotent:
+            # clear the references first so a second cleanup is a no-op.
+            head_slot, base_slot = self.head_slot, self.base_slot
+            self.head_slot = None
+            self.base_slot = None
+            if head_slot is not None:
+                self.pool.release(head_slot)
+            if base_slot is not None:
+                self.pool.release(base_slot)
             return
 
         for worktree in (self.head_path, self.base_path):
@@ -166,8 +354,14 @@ def prepare_local_workspace(
     head_sha: str,
     *,
     keep: bool = False,
+    pool: Optional[WorktreePool] = None,
 ) -> LocalWorkspace:
-    """为 head/base 各创建一个 detached worktree。"""
+    """为 head/base 各创建一个 detached worktree。
+
+    ``pool`` 存在且 ``keep`` 为 False 时，从复用池获取 worktree；调用
+    ``LocalWorkspace.cleanup()`` 只会把 worktree 归还池子，真正删除交给
+    ``WorktreePool.close()``。
+    """
     repo_root = resolve_repo_root(repo_path)
     base = base_sha.strip()
     head = head_sha.strip()
@@ -175,6 +369,25 @@ def prepare_local_workspace(
     _validate_commit(repo_root, head, "head_sha")
     if base == head:
         raise ValueError("base_sha and head_sha are identical; nothing to review")
+
+    if pool is not None and not keep:
+        head_slot = pool.acquire(repo_root, head)
+        base_slot: Optional[_WorktreeSlot] = None
+        try:
+            base_slot = pool.acquire(repo_root, base)
+        except RepoCommandError as exc:
+            # base 侧只用于增强上下文，失败不应阻断 review。
+            logger.warning("Failed to acquire base worktree: %s", exc.stderr)
+        return LocalWorkspace(
+            repo_path=repo_root,
+            head_path=head_slot.path,
+            base_path=base_slot.path if base_slot is not None else None,
+            temp_root=pool.root,
+            keep=False,
+            pool=pool,
+            head_slot=head_slot,
+            base_slot=base_slot,
+        )
 
     temp_root = Path(tempfile.mkdtemp(prefix="openreview_local_"))
     head_path = temp_root / "head"

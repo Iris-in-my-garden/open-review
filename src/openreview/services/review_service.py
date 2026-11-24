@@ -21,7 +21,7 @@ from typing import Callable, Optional, Sequence
 from openreview.domain.models import ReviewResult
 from openreview.github.client import GitHubClient
 from openreview.repo.diff_parser import DiffParser
-from openreview.repo.local import LocalReviewInput
+from openreview.repo.local import LocalReviewInput, WorktreePool
 from openreview.repo.manager import RepoManager
 from openreview.retriever.base import EmptyRetriever, Retriever, ScopedRetriever
 from openreview.retriever.hybrid import HybridRetriever
@@ -98,6 +98,7 @@ class ReviewPipeline:
         llm_cache_dir: Optional[str] = None,
         llm_cache_mode: str = "auto",
         debug_dir: Optional[str] = None,
+        local_worktree_reuse: bool = False,
     ):
         # Diff 使用独立预算，P2-P6 共享 max_context_tokens；hard_patch 只做
         # 单个无法拆分文件的硬熔断，不参与正常分批。
@@ -180,6 +181,8 @@ class ReviewPipeline:
         self.review_cache = ReviewCache(
             review_cache_dir, enabled=review_cache_enabled
         )
+        self._local_worktree_reuse = local_worktree_reuse
+        self._worktree_pool: Optional[WorktreePool] = None
 
         # run()/run_local() 结束后保留最后一次结果，供 CLI 导出 JSON 或评测读取。
         # thread-local：并发 run 不会互相覆盖 last_*。
@@ -241,6 +244,13 @@ class ReviewPipeline:
             debug_sink=self.debug_sink,
         )
 
+    def _get_worktree_pool(self) -> Optional[WorktreePool]:
+        if not self._local_worktree_reuse:
+            return None
+        if self._worktree_pool is None:
+            self._worktree_pool = WorktreePool()
+        return self._worktree_pool
+
     def _new_session(self) -> ReviewSession:
         """Build all mutable per-run components.
 
@@ -283,6 +293,7 @@ class ReviewPipeline:
             budgeted_client=budgeted_client,
             debug_sink=self.debug_sink,
             run_id=run_id,
+            worktree_pool=self._get_worktree_pool(),
         )
         return ReviewSession(
             run_id=run_id,
@@ -378,6 +389,9 @@ class ReviewPipeline:
         close_retriever = getattr(self.retriever, "close", None)
         if callable(close_retriever):
             close_retriever()
+        if self._worktree_pool is not None:
+            self._worktree_pool.close()
+            self._worktree_pool = None
 
     def __enter__(self) -> "ReviewPipeline":
         return self

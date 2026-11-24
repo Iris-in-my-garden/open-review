@@ -1,8 +1,10 @@
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
 from openreview.repo.local import (
+    WorktreePool,
     collect_local_changes,
     prepare_local_workspace,
 )
@@ -138,3 +140,83 @@ def test_run_local_generates_report_and_json(tmp_path: Path):
         assert not workspace.temp_root.exists()
     finally:
         pipeline.close()
+
+
+def test_worktree_pool_reuses_and_switches_commits(tmp_path: Path):
+    repo, base, head = _make_repo(tmp_path)
+    (repo / "src" / "app.py").write_text(
+        "def add(a, b):\n    return a * b\n", encoding="utf-8"
+    )
+    next_head = _commit(repo, "next")
+
+    pool = WorktreePool(root=tmp_path / "pool")
+    first_paths: set[Path] = set()
+    try:
+        first = prepare_local_workspace(repo, base, head, pool=pool)
+        first_paths = {first.head_path, first.base_path}
+        assert "a + b" in (first.head_path / "src" / "app.py").read_text()
+        assert first.base_path is not None
+        first.cleanup()
+
+        # cleanup 只归还池子，不删除目录。
+        assert all(path.exists() for path in first_paths)
+        assert len(pool._all) == 2
+
+        second = prepare_local_workspace(repo, base, next_head, pool=pool)
+        second_paths = {second.head_path, second.base_path}
+        # 复用已有 slot，而不是重新 checkout 6 万文件。
+        assert second_paths & first_paths
+        assert len(pool._all) == 2
+        assert "a * b" in (second.head_path / "src" / "app.py").read_text()
+        assert second.base_path is not None
+        assert "a - b" in (second.base_path / "src" / "app.py").read_text()
+        second.cleanup()
+    finally:
+        pool.close()
+
+    assert not any(path.exists() for path in first_paths)
+
+
+def test_prepare_local_workspace_keep_bypasses_pool(tmp_path: Path):
+    repo, base, head = _make_repo(tmp_path)
+    pool = WorktreePool(root=tmp_path / "pool")
+    temp_root = None
+    try:
+        workspace = prepare_local_workspace(
+            repo, base, head, keep=True, pool=pool
+        )
+        temp_root = workspace.temp_root
+        assert workspace.pool is None
+        assert temp_root is not None and temp_root.exists()
+        assert len(pool._all) == 0
+    finally:
+        pool.close()
+        if temp_root is not None:
+            shutil.rmtree(temp_root, ignore_errors=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "worktree", "prune"], check=False
+            )
+
+
+def test_pipeline_reuses_local_worktrees(tmp_path: Path):
+    repo, base, head = _make_repo(tmp_path)
+    (repo / "src" / "app.py").write_text(
+        "def add(a, b):\n    return a * b\n", encoding="utf-8"
+    )
+    next_head = _commit(repo, "next")
+
+    pipeline = ReviewPipeline(mock_llm=True, local_worktree_reuse=True)
+    try:
+        pipeline.run_local(repo, base, head, tmp_path / "out1")
+        pool = pipeline._worktree_pool
+        assert pool is not None
+        assert len(pool._all) == 2
+        first_paths = {slot.path for slot in pool._all}
+
+        pipeline.run_local(repo, base, next_head, tmp_path / "out2")
+        assert {slot.path for slot in pool._all} == first_paths
+        assert all(path.exists() for path in first_paths)
+    finally:
+        pipeline.close()
+
+    assert not any(path.exists() for path in first_paths)
