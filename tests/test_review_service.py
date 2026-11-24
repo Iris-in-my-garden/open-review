@@ -1173,3 +1173,41 @@ def test_pipeline_wires_output_token_budget_into_state_and_metrics(tmp_path: Pat
     assert pipeline.last_result.metrics["budget"]["max_output_tokens"] == 1234
 
     pipeline.close()
+
+
+def test_review_cache_key_includes_language_scope(tmp_path: Path):
+    from openreview.repo.local import LocalReviewInput
+
+    pipeline = ReviewPipeline(mock_llm=True, ablation="ast")
+    try:
+        executor = pipeline._executor()
+        state = executor.new_state(
+            "https://github.com/org/repo/pull/1", tmp_path
+        )
+        state.pr_info = PullRequestInfo(
+            owner="org",
+            repo="repo",
+            pr_number=1,
+            title="PR",
+            body="",
+            base_branch="main",
+            head_branch="feature",
+            base_sha="base-sha",
+            head_sha="head-sha",
+            html_url="https://github.com/org/repo/pull/1",
+        )
+
+        def key(suffixes):
+            state.local_input = LocalReviewInput(
+                repo_path=tmp_path,
+                base_sha="base-sha",
+                head_sha="head-sha",
+                allowed_suffixes=suffixes,
+            )
+            return executor._cache_key(state)
+
+        assert key((".py",)) != key((".go",))
+        assert key((".py",)) == key((".py",))
+        assert key(None) != key((".py",))
+    finally:
+        pipeline.close()

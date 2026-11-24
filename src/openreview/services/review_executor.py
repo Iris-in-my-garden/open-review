@@ -1047,8 +1047,20 @@ class ReviewExecutor:
         return ordered[: max(0, remaining_calls)]
 
     def _cache_key(self, state: ReviewState) -> str:
+        extra_parts: tuple[str, ...] = ()
+        local_input = getattr(state, "local_input", None)
+        allowed = (
+            getattr(local_input, "allowed_suffixes", None)
+            if local_input
+            else None
+        )
+        if allowed:
+            extra_parts = ("language:" + ",".join(sorted(allowed)),)
         return self.cache_key_builder.build(
-            state.pr_url, state.pr_info, self.llm_client
+            state.pr_url,
+            state.pr_info,
+            self.llm_client,
+            extra_parts=extra_parts,
         )
 
     def _usage_snapshot(self) -> Dict[str, int]:

@@ -7,7 +7,7 @@ config``. Callers no longer need to remember which fields to enumerate.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from openreview.domain.models import PullRequestInfo
 from openreview.domain.versions import ARTIFACT_VERSIONS, ArtifactVersions
@@ -29,6 +29,8 @@ class CacheKeyBuilder:
         pr_url: str,
         pr_info: Optional[PullRequestInfo],
         llm_client: Any,
+        *,
+        extra_parts: Sequence[str] = (),
     ) -> str:
         if pr_info is None:
             return ""
@@ -41,4 +43,5 @@ class CacheKeyBuilder:
             str(getattr(llm_client, "seed", "")),
             *self.versions.cache_parts(),
             *self.config.cache_key_parts(),
+            *extra_parts,
         )
