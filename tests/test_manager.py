@@ -210,6 +210,23 @@ def test_prepare_pr_worktree_is_run_scoped(mock_run, tmp_path: Path):
     assert any(command[:3] == ["worktree", "add", "--detach"] for command in commands)
 
 
+@patch.object(RepoManager, "_run_git_cmd")
+def test_prepare_pr_worktree_skips_fetch_when_head_is_cached(mock_run, tmp_path: Path):
+    """A head SHA already present in the shared clone must not be re-fetched."""
+    manager = RepoManager(cache_dir=tmp_path, max_cache_size_gb=0)
+    (tmp_path / "org__repo").mkdir()
+    mock_run.return_value = MagicMock(returncode=0, stdout="cachedsha\n", stderr="")
+
+    manager.prepare_pr_worktree(
+        "org", "repo", 9, head_sha="cachedsha", run_id="abc"
+    )
+
+    commands = [call.args[0] for call in mock_run.call_args_list]
+    assert ["fetch", "origin", "pull/9/head"] not in commands
+    assert ["cat-file", "-e", "cachedsha^{commit}"] in commands
+    assert any(command[:3] == ["worktree", "add", "--detach"] for command in commands)
+
+
 def test_active_worktree_and_backing_repo_survive_cache_pruning(tmp_path: Path):
     """Pruning must not evict a worktree or the clone its .git points into."""
     manager = RepoManager(cache_dir=tmp_path, max_cache_size_gb=0)

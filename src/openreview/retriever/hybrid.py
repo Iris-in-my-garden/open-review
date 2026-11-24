@@ -27,7 +27,7 @@ from openreview.retriever.code_context import (
 )
 from openreview.retriever.context_planner import plan_contexts
 from openreview.retriever.graph import GraphRetriever
-from openreview.retriever.index import RepoIndex, module_name
+from openreview.retriever.index import RepoIndex, index_cache_key, module_name
 from openreview.retriever.query import QueryBuilder, RetrievalQuery
 from openreview.retriever.tree_sitter_retriever import TreeSitterLocalRetriever
 
@@ -58,12 +58,14 @@ class HybridRetriever:
         self.max_context_tokens = max(1, max_context_tokens)
         self.query_builder = QueryBuilder()
         self._index_cache: Dict[str, RepoIndex] = {}
+        self._index_key_cache: Dict[str, str] = {}
         self.last_stats: Dict[str, float] = {}
 
     def close(self) -> None:
         for index in self._index_cache.values():
             index.close()
         self._index_cache.clear()
+        self._index_key_cache.clear()
 
     def retrieve(
         self,
@@ -276,10 +278,19 @@ class HybridRetriever:
             else:
                 stats[key] = value
 
+    def _index_key(self, repo_path: Path) -> str:
+        """Stable index key: shared git dir + HEAD, not the worktree path."""
+        path_key = str(repo_path)
+        key = self._index_key_cache.get(path_key)
+        if key is None:
+            key = index_cache_key(repo_path)
+            self._index_key_cache[path_key] = key
+        return key
+
     def _get_index(
         self, repo_path: Path, stats: Dict[str, float]
     ) -> Optional[RepoIndex]:
-        key = str(repo_path)
+        key = self._index_key(repo_path)
         cached = self._index_cache.get(key)
         if cached is not None:
             try:
@@ -297,7 +308,9 @@ class HybridRetriever:
                 self._index_cache.pop(key, None)
 
         try:
-            index = RepoIndex.for_worktree(repo_path, cache_dir=self.index_cache_dir)
+            index = RepoIndex.for_worktree(
+                repo_path, cache_dir=self.index_cache_dir, cache_key=key
+            )
         except Exception as exc:  # noqa: BLE001
             stats["index_error"] = 1
             logger.warning("Failed to build repo index for %s: %s", repo_path, exc)

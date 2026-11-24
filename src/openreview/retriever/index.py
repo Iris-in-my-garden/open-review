@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 
 from openreview.domain.versions import RETRIEVER_VERSION as RETRIEVER_VERSION
 from openreview.repo.manager import default_cache_dir
@@ -40,6 +40,11 @@ MAX_INDEXED_FILE_SIZE = 500 * 1024
 MAX_INDEXED_FILES = 20000
 SUPPORTED_SUFFIXES = {".py", ".go"}
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Index files are keyed by (shared repo identity, HEAD), so per-run worktrees
+# converge on the same SQLite file. Keep that cache bounded instead of letting
+# every review leave another multi-megabyte database behind.
+INDEX_CACHE_MAX_BYTES = 2 * 1024**3
+INDEX_CACHE_MAX_AGE_SECONDS = 30 * 24 * 3600
 
 
 def default_index_cache_dir() -> Path:
@@ -47,6 +52,164 @@ def default_index_cache_dir() -> Path:
     if env_dir:
         return Path(env_dir).expanduser().resolve()
     return (default_cache_dir().parent / "index").resolve()
+
+
+def _git_identity(repo_path: Path) -> tuple[str, str]:
+    """Return ``(shared git dir, HEAD)`` for a checkout or worktree.
+
+    Linked worktrees have different ``--git-dir`` paths but share
+    ``--git-common-dir``. Keying by the common dir plus HEAD lets a PR
+    worktree and a local worktree at the same commit reuse one index, while
+    still keeping different commits (and concurrent reviews) isolated.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_path),
+                "rev-parse",
+                "--git-common-dir",
+                "HEAD",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return str(repo_path), ""
+    if result.returncode != 0:
+        return str(repo_path), ""
+
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return str(repo_path), ""
+
+    common = Path(lines[0]).expanduser()
+    if not common.is_absolute():
+        common = (repo_path / common).resolve()
+    return str(common.resolve()), lines[1]
+
+
+def index_cache_key(repo_path: str | Path) -> str:
+    """Stable cache key for a repository revision.
+
+    Falls back to the absolute worktree path for non-git directories, which
+    matches the historical behavior for fixtures and ad-hoc trees.
+    """
+    resolved = Path(repo_path).expanduser().resolve()
+    common, head = _git_identity(resolved)
+    raw = f"{common}\0{head}" if head else str(resolved)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _index_db_sidecars(db_path: Path) -> list[Path]:
+    return [
+        db_path,
+        db_path.with_name(db_path.name + "-wal"),
+        db_path.with_name(db_path.name + "-shm"),
+    ]
+
+
+def _remove_index_db(db_path: Path) -> bool:
+    """Delete one cached index and its WAL sidecars.
+
+    The ``.lock`` file is acquired non-blocking first so an index that is
+    currently being built by another process is never deleted underneath it.
+    Returns ``True`` only if at least one file was removed.
+    """
+    lock = FileLock(str(db_path.with_suffix(db_path.suffix + ".lock")))
+    try:
+        lock.acquire(timeout=0)
+    except Timeout:
+        logger.debug("Skipping active index cache %s", db_path)
+        return False
+
+    removed = False
+    try:
+        for path in _index_db_sidecars(db_path):
+            try:
+                path.unlink()
+                removed = True
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                logger.debug("Could not remove index cache file %s: %s", path, exc)
+    finally:
+        lock.release()
+    return removed
+
+
+def prune_index_cache(
+    cache_dir: str | Path,
+    *,
+    exclude: Iterable[str | Path] = (),
+    max_bytes: int = INDEX_CACHE_MAX_BYTES,
+    max_age_seconds: float = INDEX_CACHE_MAX_AGE_SECONDS,
+    now: float | None = None,
+) -> int:
+    """Evict cached index databases that are too old or exceed the size cap.
+
+    Only ``*.sqlite3`` files (plus their WAL sidecars) are considered, so
+    unrelated files in the cache directory are left untouched. ``exclude``
+    should contain the index currently in use by the caller.
+
+    Returns the number of databases removed.
+    """
+    cache_root = Path(cache_dir).expanduser().resolve()
+    if not cache_root.is_dir():
+        return 0
+
+    excluded = {Path(path).expanduser().resolve() for path in exclude}
+    current_time = time.time() if now is None else now
+
+    try:
+        db_paths = list(cache_root.glob("*.sqlite3"))
+    except OSError:
+        return 0
+
+    candidates: list[tuple[float, int, Path]] = []
+    total = 0
+    for db_path in db_paths:
+        size = 0
+        try:
+            for path in _index_db_sidecars(db_path):
+                if path.exists():
+                    size += path.stat().st_size
+            mtime = db_path.stat().st_mtime
+        except OSError:
+            # Another concurrent prune may have removed it already.
+            continue
+        total += size
+        if db_path.resolve() in excluded:
+            continue
+        candidates.append((mtime, size, db_path))
+
+    removed = 0
+
+    if max_age_seconds > 0:
+        for mtime, size, db_path in sorted(candidates, key=lambda item: item[0]):
+            if current_time - mtime <= max_age_seconds:
+                continue
+            if _remove_index_db(db_path):
+                removed += 1
+                total -= size
+                candidates = [item for item in candidates if item[2] != db_path]
+
+    if max_bytes <= 0 or total <= max_bytes:
+        return removed
+
+    for _, size, db_path in sorted(candidates, key=lambda item: item[0]):
+        if total <= max_bytes:
+            break
+        if _remove_index_db(db_path):
+            removed += 1
+            total -= size
+
+    return removed
 
 
 def git_blob_sha(data: bytes) -> str:
@@ -115,6 +278,8 @@ class RepoIndex:
         repo_path: str | Path,
         cache_dir: str | Path | None = None,
         force: bool = False,
+        *,
+        cache_key: str | None = None,
     ) -> "RepoIndex":
         repo_path = Path(repo_path).expanduser().resolve()
         cache_root = (
@@ -122,11 +287,31 @@ class RepoIndex:
             if cache_dir is not None
             else default_index_cache_dir()
         )
-        key = hashlib.sha1(str(repo_path).encode("utf-8")).hexdigest()[:12]
-        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", repo_path.name or "repo")
-        index = cls(cache_root / f"{safe_name}-{key}.sqlite3")
-        index.ensure(repo_path, force=force)
+        # Stable key: per-run worktrees of the same repository revision share
+        # one SQLite file instead of rebuilding a fresh index every review.
+        key = cache_key or index_cache_key(repo_path)
+        db_path = cache_root / f"{key}.sqlite3"
+        index = cls(db_path)
+        try:
+            index.ensure(repo_path, force=force)
+        except BaseException:
+            index.close()
+            raise
+        # Age-based GC should mean "unused", not "not rebuilt": a reused
+        # index is only read, so bump its mtime explicitly.
+        try:
+            os.utime(db_path, None)
+        except OSError:
+            pass
+        index._prune_cache(cache_root, db_path)
         return index
+
+    @staticmethod
+    def _prune_cache(cache_root: Path, active_db: Path) -> None:
+        try:
+            prune_index_cache(cache_root, exclude=(active_db,))
+        except Exception:  # noqa: BLE001 - cache GC must never fail a review
+            logger.debug("Index cache pruning failed", exc_info=True)
 
     def close(self) -> None:
         try:

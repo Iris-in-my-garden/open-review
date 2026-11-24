@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -461,4 +462,65 @@ def test_hybrid_reports_candidates_deduped_and_truncated(tmp_path: Path):
     assert retriever.last_stats["contexts_truncated"] == 2
     assert retriever.last_stats["context_tokens_remaining"] >= 0
     assert retriever.last_stats["ast_contexts_truncated"] == 1
+
+
+def test_index_cache_is_reused_across_linked_worktrees(tmp_path: Path):
+    """Per-run worktrees at the same commit must share one SQLite index."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_repo(root)
+    _init_repo(root)
+
+    worktree = tmp_path / "wt"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "--detach", str(worktree), "HEAD"],
+        cwd=root,
+        check=True,
+    )
+
+    cache_dir = tmp_path / "idx"
+    first = RepoIndex.for_worktree(root, cache_dir=cache_dir)
+    first_db = first.db_path
+    first.close()
+
+    second = RepoIndex.for_worktree(worktree, cache_dir=cache_dir)
+    try:
+        assert second.db_path == first_db
+        assert second.last_stats["index_reused"] == 1
+    finally:
+        second.close()
+
+
+def test_prune_index_cache_respects_exclude_size_and_age(tmp_path: Path):
+    cache_dir = tmp_path / "idx"
+    cache_dir.mkdir()
+    old = cache_dir / "old.sqlite3"
+    keep = cache_dir / "keep.sqlite3"
+    old.write_bytes(b"x" * 4096)
+    keep.write_bytes(b"x" * 4096)
+    os.utime(old, (1, 1))
+
+    removed = index_module.prune_index_cache(
+        cache_dir,
+        exclude={keep},
+        max_bytes=1,
+        max_age_seconds=0,
+    )
+    assert removed == 1
+    assert not old.exists()
+    assert keep.exists()
+
+    aged = cache_dir / "aged.sqlite3"
+    aged.write_bytes(b"x")
+    os.utime(aged, (1, 1))
+    removed = index_module.prune_index_cache(
+        cache_dir,
+        exclude={keep},
+        max_bytes=10**9,
+        max_age_seconds=60,
+        now=10**6,
+    )
+    assert removed == 1
+    assert not aged.exists()
+    assert keep.exists()
 

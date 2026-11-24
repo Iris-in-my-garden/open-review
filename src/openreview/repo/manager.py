@@ -15,9 +15,10 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Sequence
 
 from filelock import FileLock, Timeout
 
@@ -54,6 +55,12 @@ class RepoCommandError(Exception):
 
 class RepoManager:
 
+    PRUNE_COOLDOWN_SECONDS = 30.0
+    # Below this size, block-aligned ``du`` output is re-measured with
+    # apparent file sizes; scanning such a small tree is cheap and keeps the
+    # configured byte cap meaningful for tests and tiny fixtures.
+    _DU_APPARENT_THRESHOLD = 4 * 1024 * 1024
+
     def __init__(
         self,
         cache_dir: str | Path | None = None,
@@ -82,6 +89,10 @@ class RepoManager:
         self._active_paths: dict[Path, int] = {}
         self._worktree_repo_leases: dict[Path, Path] = {}
         self._active_lock = threading.Lock()
+        # One review prepares head and base worktrees back-to-back. Scanning
+        # the whole cache twice is wasteful, so only prune once per window.
+        self._prune_lock = threading.Lock()
+        self._last_prune_at = 0.0
 
     def _hold_path_unlocked(self, path: Path) -> None:
         self._active_paths[path] = self._active_paths.get(path, 0) + 1
@@ -250,17 +261,22 @@ class RepoManager:
                 if not repo_dir.exists():
                     self._clone_repo(repo_url, repo_dir)
 
-                self._run_git_cmd(
-                    ["fetch", "origin", f"pull/{pr_number}/head"], cwd=repo_dir
-                )
-                fetched = self._run_git_cmd(
-                    ["rev-parse", "FETCH_HEAD"], cwd=repo_dir
-                ).stdout.strip()
-                target = (
-                    head_sha
-                    if head_sha and self._git_ref_exists(head_sha, repo_dir)
-                    else fetched
-                )
+                if head_sha and self._git_ref_exists(head_sha, repo_dir):
+                    # The shared clone already has this commit (e.g. a previous
+                    # run fetched it), so skip the network round-trip.
+                    target = head_sha
+                else:
+                    self._run_git_cmd(
+                        ["fetch", "origin", f"pull/{pr_number}/head"], cwd=repo_dir
+                    )
+                    fetched = self._run_git_cmd(
+                        ["rev-parse", "FETCH_HEAD"], cwd=repo_dir
+                    ).stdout.strip()
+                    target = (
+                        head_sha
+                        if head_sha and self._git_ref_exists(head_sha, repo_dir)
+                        else fetched
+                    )
 
                 self._remove_worktree(repo_dir, worktree_dir)
                 self._run_git_cmd(
@@ -359,20 +375,35 @@ class RepoManager:
         """按 mtime 淘汰旧仓库，保证缓存不超过配置上限。
 
         ``max_cache_size_gb=0`` 表示禁用淘汰，便于测试或用户自行管理。
+        Calling this twice in one review (head + base) should not rescan the
+        whole cache, so repeated calls within ``PRUNE_COOLDOWN_SECONDS`` are
+        ignored.
         """
         if self.max_cache_size_bytes <= 0:
             return
 
+        now = time.monotonic()
+        with self._prune_lock:
+            if now - self._last_prune_at < self.PRUNE_COOLDOWN_SECONDS:
+                return
+            self._last_prune_at = now
+
         exclude = {path.resolve() for path in (exclude or set())}
         with self._active_lock:
             exclude.update(self._active_paths)
-        entries: list[tuple[float, int, Path]] = []
+
+        entries = [
+            entry
+            for entry in self.base_cache_dir.iterdir()
+            if entry.name != ".locks" and entry.is_dir()
+        ]
+        sizes = self._dir_sizes(entries)
+
+        candidates: list[tuple[float, int, Path]] = []
         total_size = 0
 
-        for entry in self.base_cache_dir.iterdir():
-            if entry.name == ".locks" or not entry.is_dir():
-                continue
-            size = self._dir_size(entry)
+        for entry in entries:
+            size = sizes.get(entry, 0)
             total_size += size
             if entry.resolve() in exclude:
                 continue
@@ -382,13 +413,13 @@ class RepoManager:
                 # Another concurrent prune removed it between iterdir/stat.
                 total_size -= size
                 continue
-            entries.append((mtime, size, entry))
+            candidates.append((mtime, size, entry))
 
         if total_size <= self.max_cache_size_bytes:
             return
 
-        entries.sort(key=lambda item: item[0])
-        for _, size, entry in entries:
+        candidates.sort(key=lambda item: item[0])
+        for _, size, entry in candidates:
             if total_size <= self.max_cache_size_bytes:
                 break
             logger.info(
@@ -398,6 +429,59 @@ class RepoManager:
             )
             shutil.rmtree(entry, ignore_errors=True)
             total_size -= size
+
+    @classmethod
+    def _dir_sizes(cls, paths: Sequence[Path]) -> dict[Path, int]:
+        """Return sizes keyed by the given paths.
+
+        ``du`` is much faster than walking every file in Python for large
+        checkouts, and can measure all sibling cache entries in one call.
+        Missing/failed entries fall back to apparent size.
+        """
+        if not paths:
+            return {}
+
+        sizes: dict[Path, int] = {}
+        remaining = list(paths)
+        try:
+            result = subprocess.run(
+                ["du", "-sk", *[str(path) for path in remaining]],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+
+        if result is not None and result.returncode == 0:
+            by_resolved = {path.resolve(): path for path in remaining}
+            for line in result.stdout.splitlines():
+                raw_size, separator, raw_path = line.partition("\t")
+                if not separator:
+                    continue
+                try:
+                    size = int(raw_size) * 1024
+                except ValueError:
+                    continue
+                path = by_resolved.get(Path(raw_path).resolve())
+                if path is None or path not in remaining:
+                    continue
+                sizes[path] = size
+                remaining.remove(path)
+
+        for path in remaining:
+            sizes[path] = cls._dir_size(path)
+
+        # ``du`` reports block-aligned disk usage (a 900-byte tree can report
+        # 4 KiB). For small trees, prefer apparent size so the configured cap
+        # behaves like logical bytes; large trees keep the fast ``du`` value.
+        for path, size in list(sizes.items()):
+            if size <= cls._DU_APPARENT_THRESHOLD:
+                sizes[path] = cls._dir_size(path)
+        return sizes
 
     @staticmethod
     def _dir_size(path: Path) -> int:
