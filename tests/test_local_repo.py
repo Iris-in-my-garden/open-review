@@ -220,3 +220,70 @@ def test_pipeline_reuses_local_worktrees(tmp_path: Path):
         pipeline.close()
 
     assert not any(path.exists() for path in first_paths)
+
+
+def test_filter_changes_by_suffixes_keeps_primary_language_only():
+    from openreview.domain.models import ChangedFile
+    from openreview.repo.local import filter_changes_by_suffixes
+
+    files = [
+        ChangedFile(
+            filename="src/app.go",
+            status="modified",
+            additions=1,
+            deletions=0,
+            changes=1,
+        ),
+        ChangedFile(
+            filename="src/native.cpp",
+            status="modified",
+            additions=1,
+            deletions=0,
+            changes=1,
+        ),
+        ChangedFile(
+            filename="src/app_test.py",
+            status="modified",
+            additions=1,
+            deletions=0,
+            changes=1,
+        ),
+    ]
+
+    kept, skipped = filter_changes_by_suffixes(files, (".go",))
+
+    assert [file.filename for file in kept] == ["src/app.go"]
+    assert [file.filename for file in skipped] == [
+        "src/native.cpp",
+        "src/app_test.py",
+    ]
+    assert filter_changes_by_suffixes(files, None) == (files, [])
+
+
+def test_run_local_can_filter_to_primary_language(tmp_path: Path):
+    repo, base, head = _make_repo(tmp_path)
+    (repo / "src" / "native.cpp").write_text(
+        "int add(int a, int b) { return a + b; }\n", encoding="utf-8"
+    )
+    (repo / "src" / "app.py").write_text(
+        "def add(a, b):\n    return a + b + 1\n", encoding="utf-8"
+    )
+    next_head = _commit(repo, "mixed language")
+
+    pipeline = ReviewPipeline(mock_llm=True)
+    try:
+        pipeline.run_local(
+            repo,
+            base,
+            next_head,
+            tmp_path / "out",
+            allowed_suffixes=(".py",),
+        )
+        state = pipeline.last_state
+        assert state is not None
+        assert state.raw_files
+        assert {Path(file.filename).suffix for file in state.raw_files} == {".py"}
+        assert "src/native.cpp" in state.language_skipped_files
+        assert state.language_filter_summary
+    finally:
+        pipeline.close()

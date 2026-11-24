@@ -20,12 +20,38 @@ import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from openreview.domain.models import ChangedFile
 from openreview.repo.manager import RepoCommandError
 
 logger = logging.getLogger(__name__)
+
+
+def filter_changes_by_suffixes(
+    files: Sequence[ChangedFile],
+    suffixes: Optional[Sequence[str]],
+) -> Tuple[List[ChangedFile], List[ChangedFile]]:
+    """Split changes into (kept, skipped) by file suffix.
+
+    Used by local/eval runs that intentionally review only one language
+    (e.g. AACR Go/Python cases). An empty/None suffix list means no filtering.
+    """
+    allowed = {
+        suffix.lower()
+        for suffix in (suffixes or ())
+        if suffix and suffix.strip()
+    }
+    if not allowed:
+        return list(files), []
+    kept: List[ChangedFile] = []
+    skipped: List[ChangedFile] = []
+    for file in files:
+        if Path(file.filename).suffix.lower() in allowed:
+            kept.append(file)
+        else:
+            skipped.append(file)
+    return kept, skipped
 
 _STATUS_MAP = {
     "A": "added",
@@ -221,6 +247,8 @@ class LocalReviewInput:
     body: Optional[str] = None
     pr_url: Optional[str] = None
     keep_worktrees: bool = False
+    # Eval-only language scope: keep only these suffixes (None = no filter).
+    allowed_suffixes: Optional[Tuple[str, ...]] = None
 
 
 @dataclass

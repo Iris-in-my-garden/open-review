@@ -29,6 +29,7 @@ from openreview.repo.local import (
     LocalReviewInput,
     WorktreePool,
     collect_local_changes,
+    filter_changes_by_suffixes,
     prepare_local_workspace,
 )
 from openreview.repo.manager import RepoCommandError
@@ -408,6 +409,21 @@ class ReviewExecutor:
             state.raw_files = collect_local_changes(
                 workspace.repo_path, local.base_sha, local.head_sha
             )
+            if local.allowed_suffixes:
+                kept, skipped = filter_changes_by_suffixes(
+                    state.raw_files, local.allowed_suffixes
+                )
+                state.raw_files = kept
+                state.language_skipped_files = [
+                    file.filename for file in skipped
+                ]
+                if skipped:
+                    suffixes = ", ".join(sorted(set(local.allowed_suffixes)))
+                    state.language_filter_summary = (
+                        f"仅保留 {suffixes} 源文件，过滤 "
+                        f"{len(skipped)} 个其他语言/文件"
+                    )
+                    state.add_note(f"[language] {state.language_filter_summary}")
 
     def _node_cache_lookup(self, state: ReviewState) -> None:
         if state.pr_info is None:

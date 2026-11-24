@@ -451,6 +451,7 @@ class ReviewPipeline:
         pr_url: Optional[str] = None,
         progress_cb: Optional[Callable[[int, str], None]] = None,
         keep_worktrees: bool = False,
+        allowed_suffixes: Optional[Sequence[str]] = None,
     ) -> Path:
         """不依赖 GitHub API，在本地仓库上跑完整 review。
 
@@ -480,6 +481,9 @@ class ReviewPipeline:
             body=body,
             pr_url=pr_url,
             keep_worktrees=keep_worktrees,
+            allowed_suffixes=(
+                tuple(allowed_suffixes) if allowed_suffixes else None
+            ),
         )
         session = self._new_session()
         state = session.new_state(

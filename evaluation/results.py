@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from evaluation.languages import allowed_suffixes
 from openreview.review.report_writer import PotentialIssue, ReviewResult
 from openreview.review.workflow import ReviewStatus
 
@@ -220,6 +221,7 @@ def run_reviews(
                 title=f"AACR {instance_id}",
                 pr_url=instance.get("github_pr_url"),
                 keep_worktrees=keep_worktrees,
+                allowed_suffixes=allowed_suffixes(instance.get("language")),
             )
             if pipeline.last_result is None:
                 raise RuntimeError("run_local 结束但没有 last_result")

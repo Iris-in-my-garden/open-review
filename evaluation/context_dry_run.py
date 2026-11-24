@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict
 
+from evaluation.languages import allowed_suffixes
 from openreview.repo.local import LocalReviewInput
 from openreview.retriever.base import supports_plan
 from openreview.retriever.code_context import cap_repeated_contexts
@@ -23,6 +24,7 @@ def build_context_dry_run(
 ) -> Dict[str, Any]:
     """Run the review preparation/retrieval path and report prompt inputs only."""
     owner, repo_name = instance["repo"].split("/", 1)
+    suffixes = allowed_suffixes(instance.get("language"))
     local_input = LocalReviewInput(
         repo_path=repo_path,
         base_sha=instance["base_commit"],
@@ -32,6 +34,7 @@ def build_context_dry_run(
         pr_number=int(instance.get("pr_number") or 0),
         title=f"AACR {instance['instance_id']}",
         pr_url=instance.get("github_pr_url"),
+        allowed_suffixes=suffixes,
     )
     session = pipeline._new_session()
     state = session.new_state(
@@ -170,10 +173,22 @@ def build_context_dry_run(
         return {
             "instance_id": instance["instance_id"],
             "repo": instance["repo"],
+            "language": instance.get("language"),
             "base_commit": instance["base_commit"],
             "head_commit": instance["head_commit"],
             "llm_called": False,
             "token_estimator": "openreview.review.token_budget.estimate_tokens (heuristic, not provider tokenizer)",
+            "language_filter": {
+                "suffixes": list(suffixes),
+                "summary": getattr(state, "language_filter_summary", ""),
+                "skipped_files": len(
+                    getattr(state, "language_skipped_files", [])
+                ),
+            },
+            "file_filter": {
+                "summary": getattr(state, "file_filter_summary", ""),
+                "skipped_files": len(getattr(state, "skipped_files", [])),
+            },
             "batches": batch_reports,
             "final_prompt_tokens_estimate": sum(
                 batch["final_prompt_tokens_estimate"] for batch in batch_reports

@@ -27,6 +27,11 @@ class DiffMetrics(TypedDict):
     languages: List[str]
 
 
+class LanguageFilterMetrics(TypedDict):
+    skipped_files: int
+    summary: str
+
+
 class FileFilteringMetrics(TypedDict):
     enabled: bool
     policy: str
@@ -37,6 +42,7 @@ class FileFilteringMetrics(TypedDict):
     skipped_deletions: int
     categories: Dict[str, int]
     files: List[Dict[str, object]]
+    language_filter: LanguageFilterMetrics
 
 
 class ContextGapMetrics(TypedDict, total=False):

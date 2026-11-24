@@ -333,6 +333,10 @@ class ReviewState:
     raw_parsed_diff: Optional[ParsedDiff] = None
     skipped_files: List[Dict[str, Any]] = field(default_factory=list)
     file_filter_summary: str = ""
+    # Eval-only language scope (AACR Go/Python cases). Kept separate from
+    # file_filter so production policy and benchmark scope remain distinct.
+    language_filter_summary: str = ""
+    language_skipped_files: List[str] = field(default_factory=list)
     local_repo_path: Optional[Path] = None
     base_path: Optional[Path] = None
     base_error: Optional[str] = None

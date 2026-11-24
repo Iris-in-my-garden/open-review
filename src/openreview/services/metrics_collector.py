@@ -141,6 +141,12 @@ class MetricsCollector:
                 ),
                 "categories": dict(sorted(skipped_categories.items())),
                 "files": skipped_files[:100],
+                "language_filter": {
+                    "skipped_files": len(
+                        getattr(state, "language_skipped_files", []) or []
+                    ),
+                    "summary": getattr(state, "language_filter_summary", ""),
+                },
             },
             "retrieval": {
                 "contexts": len(state.all_contexts),

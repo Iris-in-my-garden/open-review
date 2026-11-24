@@ -22,6 +22,10 @@
 - 每种语言都出现在每个 split。
 - dev/holdout 各选一个仓库，其余进 test；并列时用 `SHA256(seed + split + language + repo)` 稳定打破平局。
 - 每个 split 仓库数很少；某语言少于两个仓库簇时，报告省略该层 bootstrap 区间，而不是给零宽区间。
+- **语言范围过滤**：评测按 manifest `language` 过滤 diff，只保留主语言源码
+  （Go → `.go`；Python → `.py`/`.pyi`）。多语言仓库里的 C/C++/CUDA/TS
+  vendored 代码不进入 Go/Python 评测队列；文件过滤器再单独跳过
+  snapshot/testdata/generated/vendored 文件。
 
 ## 2. 两层指标
 
