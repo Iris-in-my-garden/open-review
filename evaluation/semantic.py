@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from evaluation.aacr import ManifestError
+from evaluation.languages import filter_comments_by_language
 
 
 def _reference_comments(comments: List[Dict[str, Any]]) -> List[Any]:
@@ -80,7 +81,12 @@ def run_semantic_eval(
             head_commit=instance["head_commit"],
             clone_url=instance.get("clone_url")
             or f"https://github.com/{instance['repo']}.git",
-            reference_comments=_reference_comments(instance.get("comments") or []),
+            reference_comments=_reference_comments(
+                filter_comments_by_language(
+                    instance.get("comments") or [],
+                    instance.get("language"),
+                )
+            ),
         )
         for instance in instances
     ]

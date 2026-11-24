@@ -12,3 +12,18 @@ def test_allowed_suffixes_unknown_or_missing_means_no_filter():
     assert allowed_suffixes(None) == ()
     assert allowed_suffixes("") == ()
     assert allowed_suffixes("Rust") == ()
+
+
+def test_filter_comments_by_language_drops_cross_language_references():
+    from evaluation.languages import filter_comments_by_language
+
+    comments = [
+        {"path": "src/main.go", "note": "go bug"},
+        {"path": "src/native.cpp", "note": "cpp bug"},
+        {"path": "src/util.py", "note": "py bug"},
+        {"note": "general comment"},
+    ]
+
+    kept = filter_comments_by_language(comments, "Go")
+
+    assert [item.get("path") for item in kept] == ["src/main.go", None]

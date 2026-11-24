@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from evaluation.languages import filter_comments_by_language
 from evaluation.results import result_path
 
 
@@ -60,6 +61,8 @@ def compute_retrieval_metrics(
     rows: List[Dict[str, Any]] = []
     reference_paths_total = 0
     reference_paths_matched = 0
+    reference_comments_total = 0
+    reference_comments_used = 0
     index_paths_matched = 0
     findings_total = 0
     findings_with_refs = 0
@@ -99,7 +102,11 @@ def compute_retrieval_metrics(
         if not isinstance(comments, list):
             comments = []
 
-        ref_paths = _reference_paths(instance.get("comments") or [])
+        raw_comments = instance.get("comments") or []
+        filtered_comments = filter_comments_by_language(
+            raw_comments, instance.get("language")
+        )
+        ref_paths = _reference_paths(filtered_comments)
         context_files = {
             str(item) for item in (metrics.get("context_file_list") or []) if item
         }
@@ -199,6 +206,8 @@ def compute_retrieval_metrics(
             }
         )
 
+        reference_comments_total += len(raw_comments)
+        reference_comments_used += len(filtered_comments)
         reference_paths_total += len(ref_paths)
         reference_paths_matched += len(matched_refs)
         index_paths_matched += len(matched_index_refs)
@@ -218,6 +227,8 @@ def compute_retrieval_metrics(
         "instances": len(rows),
         "retrieval": {
             "file_recall": _rate(reference_paths_matched, reference_paths_total),
+            "reference_comments_total": reference_comments_total,
+            "reference_comments_used": reference_comments_used,
             "index_file_recall": _rate(index_paths_matched, reference_paths_total),
             "symbol_coverage": _mean(symbol_coverages),
             "citation_rate": _rate(findings_with_refs, findings_total),

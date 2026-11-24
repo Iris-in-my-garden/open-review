@@ -125,3 +125,42 @@ def test_compute_retrieval_metrics(tmp_path: Path):
     path = write_retrieval_metrics(metrics, tmp_path / "metrics", run_id="test")
     assert path.exists()
     assert path.name == "retrieval_test.json"
+
+
+def test_retrieval_metrics_filter_reference_comments_by_language(tmp_path: Path):
+    results_dir = tmp_path / "results"
+    _write_result(
+        results_dir,
+        "org/repo/1",
+        {
+            "instance_id": "org/repo/1",
+            "status": "ok",
+            "review": {
+                "comments": [],
+                "metrics": {
+                    "retrieval": {
+                        "contexts": 1,
+                        "context_file_list": ["src/auth.go"],
+                        "index_context_file_list": ["src/auth.go"],
+                    }
+                },
+            },
+        },
+    )
+    instances = [
+        {
+            "instance_id": "org/repo/1",
+            "language": "Go",
+            "comments": [
+                {"path": "src/auth.go", "note": "go bug"},
+                {"path": "csrc/cache.cu", "note": "cuda bug"},
+            ],
+        }
+    ]
+
+    metrics = compute_retrieval_metrics(instances, results_dir)
+
+    retrieval = metrics["retrieval"]
+    assert retrieval["reference_comments_total"] == 2
+    assert retrieval["reference_comments_used"] == 1
+    assert retrieval["file_recall"] == 1.0

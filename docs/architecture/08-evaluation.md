@@ -26,6 +26,9 @@
   （Go → `.go`；Python → `.py`/`.pyi`）。多语言仓库里的 C/C++/CUDA/TS
   vendored 代码不进入 Go/Python 评测队列；文件过滤器再单独跳过
   snapshot/testdata/generated/vendored 文件。
+- **reference comments 同样过滤**：semantic judge 和 retrieval file recall 只使用
+  主语言 reference comments，避免 C/C++/CUDA/notebook/doc 标注变成不可达的
+  false negative。
 
 ## 2. 两层指标
 
