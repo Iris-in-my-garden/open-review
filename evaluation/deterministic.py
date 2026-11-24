@@ -16,10 +16,11 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from evaluation.languages import allowed_suffixes
 from evaluation.repos import read_file_at_commit, repo_cache_path
 from evaluation.results import result_path
 from openreview.domain.versions import VERIFICATION_METRICS_SCHEMA_VERSION
-from openreview.repo.diff_parser import DiffParser, ParsedChangedFile
+from openreview.repo.diff_parser import DiffParser, ParsedChangedFile, ParsedDiff
 from openreview.repo.local import collect_local_changes
 
 EVIDENCE_MIN_CHARS = 6
@@ -67,6 +68,7 @@ def _parsed_diff(
     repo_path: Optional[Path],
     base_commit: str,
     head_commit: str,
+    language: Optional[str] = None,
 ) -> Optional[Dict[str, ParsedChangedFile]]:
     if repo_path is None or not (repo_path / ".git").exists():
         return None
@@ -77,6 +79,19 @@ def _parsed_diff(
         )
     except Exception:  # noqa: BLE001 - 指标计算失败不应拖垮整批评测
         return None
+    suffixes = set(allowed_suffixes(language))
+    files = parsed.files
+    if suffixes:
+        files = [
+            file
+            for file in parsed.files
+            if Path(file.filename).suffix.lower() in suffixes
+        ]
+        parsed = ParsedDiff(
+            files=files,
+            total_additions=sum(file.additions for file in files),
+            total_deletions=sum(file.deletions for file in files),
+        )
     return {file.filename: file for file in parsed.files}
 
 
@@ -348,7 +363,10 @@ def compute_deterministic_metrics(
         row["grounding_available"] = repo_path is not None
 
         diff_files = _parsed_diff(
-            repo_path, instance["base_commit"], instance["head_commit"]
+            repo_path,
+            instance["base_commit"],
+            instance["head_commit"],
+            language=instance.get("language"),
         )
         source_cache: Dict[tuple[str, str], Optional[str]] = {}
         row_invalid = 0

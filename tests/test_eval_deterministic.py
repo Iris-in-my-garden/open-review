@@ -344,3 +344,21 @@ def test_deterministic_metrics_counts_missing_result(tmp_path: Path):
     assert metrics["results_ok"] == 0
     assert metrics["issues"] == 0
     assert metrics["per_instance"][0]["status"] == "missing"
+
+
+def test_parsed_diff_can_scope_to_primary_language(tmp_path: Path):
+    from evaluation.deterministic import _parsed_diff
+
+    repo, base, _head = _make_repo(tmp_path)
+    (repo / "src" / "native.cpp").write_text(
+        "int add(int a, int b) { return a + b; }\n", encoding="utf-8"
+    )
+    head = _commit(repo, "add cpp")
+
+    everything = _parsed_diff(repo, base, head)
+    scoped = _parsed_diff(repo, base, head, language="Python")
+
+    assert everything is not None
+    assert scoped is not None
+    assert "src/native.cpp" in everything
+    assert set(scoped) == {"src/app.py"}
