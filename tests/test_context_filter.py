@@ -3,6 +3,7 @@ from openreview.retriever.code_context import CodeContext, ContextPriority
 from openreview.review.context_filter import (
     filter_redundant_base_contexts,
     is_base_definition_covered_by_deleted_lines,
+    is_base_definition_visible_in_patch,
 )
 
 
@@ -41,6 +42,27 @@ def test_fully_deleted_definition_is_redundant():
     file_diff = diff.files[0]
 
     assert is_base_definition_covered_by_deleted_lines(context, file_diff) is True
+
+    kept, dropped = filter_redundant_base_contexts(
+        [context], diff, fully_visible_files={"src/utils.py"}
+    )
+
+    assert kept == []
+    assert dropped == [context]
+
+
+def test_definition_fully_visible_as_context_lines_is_redundant():
+    """Base definitions are also redundant when the patch shows them as context."""
+    diff = _diff(
+        "@@ -10,3 +10,3 @@\n"
+        " def old_func():\n"
+        "-    return 0\n"
+        "+    return 1\n"
+    )
+    context = _base_context(10, 11)
+    file_diff = diff.files[0]
+
+    assert is_base_definition_visible_in_patch(context, file_diff) is True
 
     kept, dropped = filter_redundant_base_contexts(
         [context], diff, fully_visible_files={"src/utils.py"}

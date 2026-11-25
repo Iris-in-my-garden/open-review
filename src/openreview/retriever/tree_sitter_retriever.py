@@ -48,6 +48,13 @@ MAX_TEST_FUNCTION_CONTEXTS = 2
 MAX_ENCLOSING_SNIPPET_TOKENS = 1200
 MAX_ENCLOSING_SNIPPET_TOKENS_TEST = 800
 MAX_ENCLOSING_SNIPPET_TOKENS_TYPE = 500
+# 如果定义的大部分行已经在 patch 里可见，剩余部分通常只是未改动的
+# scaffolding；再注入整段 enclosing 只是重复 diff。80% 是经验阈值：
+# 低于它时缺失行仍可能包含关键上下文。
+ENCLOSING_VISIBLE_RATIO_SKIP = 0.80
+# 同名定义（尤其是生成 mock 里的 HealthCheck/EXPECT）可能在同一文件出现
+# 几十次。base 侧只保留最相关的少量定义，避免把 P3 预算全部吃掉。
+MAX_BASE_DEFINITIONS_PER_SYMBOL = 2
 
 # 打分：变更行所在的函数/类 > 符号定义 > 关联测试 > 符号引用 > base 侧历史代码
 SCORE_ENCLOSING = 0.95
@@ -220,15 +227,26 @@ class TreeSitterLocalRetriever:
                     definition_names.add(name)
 
                 start_row, end_row = node.start_point[0], node.end_point[0]
-                # 如果整个定义都已出现在 hunk/visible lines 里，注入 P2
-                # 只是重复 diff 内容，直接跳过（不再限制为“微小型”）。
-                if self._is_fully_visible_enclosing(
+                # 如果定义的大部分内容都已出现在 hunk/visible lines 里，
+                # 注入 P2 主要是重复 diff；保留少量未可见行不值得整段成本。
+                visible_ratio = self._visible_line_ratio(
                     file_diff, start_row, end_row
-                ):
-                    self.last_stats["fully_visible_enclosing_skipped"] = (
-                        self.last_stats.get("fully_visible_enclosing_skipped", 0)
-                        + 1
-                    )
+                )
+                if visible_ratio >= ENCLOSING_VISIBLE_RATIO_SKIP:
+                    if visible_ratio >= 1.0:
+                        self.last_stats["fully_visible_enclosing_skipped"] = (
+                            self.last_stats.get(
+                                "fully_visible_enclosing_skipped", 0
+                            )
+                            + 1
+                        )
+                    else:
+                        self.last_stats["mostly_visible_enclosing_skipped"] = (
+                            self.last_stats.get(
+                                "mostly_visible_enclosing_skipped", 0
+                            )
+                            + 1
+                        )
                     continue
 
                 unique_key = (
@@ -291,19 +309,25 @@ class TreeSitterLocalRetriever:
         return contexts, definition_names
 
     @staticmethod
-    def _is_fully_visible_enclosing(
+    def _visible_line_ratio(
         file_diff: ParsedChangedFile,
         start_row: int,
         end_row: int,
-    ) -> bool:
-        """Whether the whole enclosing definition is already visible in the patch."""
+    ) -> float:
+        """Fraction of an enclosing definition already visible in the patch."""
         visible = set(file_diff.visible_lines or [])
         if not visible:
-            return False
+            return 0.0
         # start_row/end_row 是 0-based；visible_lines 是 1-based。
-        return all(
-            line in visible for line in range(start_row + 1, end_row + 2)
+        total = end_row - start_row + 1
+        if total <= 0:
+            return 0.0
+        covered = sum(
+            1
+            for line in range(start_row + 1, end_row + 2)
+            if line in visible
         )
+        return covered / total
 
     @staticmethod
     def _enclosing_token_cap(
@@ -528,6 +552,13 @@ class TreeSitterLocalRetriever:
                 continue
 
             _, lines, source, tree = loaded
+            deleted = set(file_diff.deleted_lines or [])
+            # 同一文件里可能有很多同名定义（生成 mock 的 HealthCheck/EXPECT
+            # 是典型例子）。先按 symbol 分组，再只保留与删除行最相关的少量
+            # 定义，避免同名定义把 base/P3 预算全部占满。
+            candidates: Dict[
+                str, List[Tuple[int, int, int, int, str]]
+            ] = {}
             for node in self._iter_definitions(tree.root_node):
                 qualname = ast_utils.definition_qualname(node, source)
                 name = self._definition_name(node, source)
@@ -537,37 +568,107 @@ class TreeSitterLocalRetriever:
                     continue
 
                 start_row, end_row = node.start_point[0], node.end_point[0]
-                key = (file_diff.filename, start_row, end_row, "base")
-                if key in seen_node_ranges:
-                    continue
-                seen_node_ranges.add(key)
-                contexts.append(
-                    CodeContext(
-                        file_path=file_diff.filename,
-                        reason=(
-                            f"[base revision] removed definition "
-                            f"`{qualname or name}` "
-                            f"(lines {start_row + 1}-{end_row + 1})"
-                        ),
-                        snippet="\n".join(lines[start_row : end_row + 1]),
-                        score=SCORE_BASE_DEFINITION,
-                        revision="base",
-                        kind="base_definition",
-                        priority=ContextPriority.DEFINITION,
-                        symbol=name,
-                        related_changed_symbols=[name],
-                        start_line=start_row + 1,
-                        end_line=end_row + 1,
-                        context_id=make_context_id(
-                            file_diff.filename,
-                            start_row + 1,
-                            end_row + 1,
-                            "base_definition",
-                            revision="base",
-                        ),
+                overlap = sum(
+                    1
+                    for line in range(start_row + 1, end_row + 2)
+                    if line in deleted
+                )
+                distance = self._distance_to_deleted_lines(
+                    start_row + 1, end_row + 1, deleted
+                )
+                candidates.setdefault(name, []).append(
+                    (
+                        overlap,
+                        distance,
+                        start_row,
+                        end_row,
+                        qualname or name,
                     )
                 )
+
+            for name, items in candidates.items():
+                for start_row, end_row, display_name in (
+                    (item[2], item[3], item[4])
+                    for item in self._select_base_candidates(items, deleted)
+                ):
+                    key = (file_diff.filename, start_row, end_row, "base")
+                    if key in seen_node_ranges:
+                        continue
+                    seen_node_ranges.add(key)
+                    contexts.append(
+                        CodeContext(
+                            file_path=file_diff.filename,
+                            reason=(
+                                f"[base revision] removed definition "
+                                f"`{display_name}` "
+                                f"(lines {start_row + 1}-{end_row + 1})"
+                            ),
+                            snippet="\n".join(
+                                lines[start_row : end_row + 1]
+                            ),
+                            score=SCORE_BASE_DEFINITION,
+                            revision="base",
+                            kind="base_definition",
+                            priority=ContextPriority.DEFINITION,
+                            symbol=name,
+                            related_changed_symbols=[name],
+                            start_line=start_row + 1,
+                            end_line=end_row + 1,
+                            context_id=make_context_id(
+                                file_diff.filename,
+                                start_row + 1,
+                                end_row + 1,
+                                "base_definition",
+                                revision="base",
+                            ),
+                        )
+                    )
         return contexts
+
+    @staticmethod
+    def _distance_to_deleted_lines(
+        start_line: int,
+        end_line: int,
+        deleted: Set[int],
+    ) -> int:
+        """Line distance from a definition to the nearest deleted line."""
+        if not deleted:
+            return 0
+        return min(
+            0
+            if start_line <= line <= end_line
+            else min(abs(line - start_line), abs(line - end_line))
+            for line in deleted
+        )
+
+    @staticmethod
+    def _select_base_candidates(
+        candidates: Sequence[Tuple[int, int, int, int, str]],
+        deleted: Set[int],
+    ) -> List[Tuple[int, int, int, int, str]]:
+        """Keep the definitions most likely to be the removed ones.
+
+        When deleted line numbers are available, prefer definitions that
+        actually overlap them; if none overlap, fall back to the nearest
+        definitions.  In both cases cap per symbol so repeated names in
+        generated files cannot flood the context budget.
+        """
+        if not candidates:
+            return []
+        if deleted:
+            overlapping = [item for item in candidates if item[0] > 0]
+            if overlapping:
+                pool = overlapping
+            else:
+                nearest = min(item[1] for item in candidates)
+                pool = [item for item in candidates if item[1] == nearest]
+        else:
+            pool = list(candidates)
+        ordered = sorted(
+            pool,
+            key=lambda item: (-item[0], item[1], item[2], item[3]),
+        )
+        return ordered[:MAX_BASE_DEFINITIONS_PER_SYMBOL]
 
     # ------------------------------------------------------------------
     # Linked test functions

@@ -313,6 +313,128 @@ def test_base_revision_context_is_used_for_removed_symbols(tmp_path: Path):
     )
 
 
+def test_base_revision_context_prefers_deleted_definition_and_caps_same_name(
+    tmp_path: Path,
+):
+    """同名定义只保留最相关的少量，避免生成 mock 的 HealthCheck 爆炸。"""
+    from openreview.retriever.tree_sitter_retriever import (
+        MAX_BASE_DEFINITIONS_PER_SYMBOL,
+    )
+
+    head_repo = tmp_path / "head"
+    base_repo = tmp_path / "base"
+    head_repo.mkdir()
+    base_repo.mkdir()
+    (head_repo / "mod.py").write_text("def keep():\n    pass\n")
+    (base_repo / "mod.py").write_text(
+        "def dup():\n"
+        "    return 0\n"
+        "\n"
+        "def dup():\n"
+        "    return 1\n"
+        "\n"
+        "def dup():\n"
+        "    return 2\n"
+    )
+    _init_repo(head_repo)
+    _init_repo(base_repo)
+
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="mod.py",
+                status="modified",
+                removed_symbols=["dup"],
+                deleted_lines=[2],
+            )
+        ]
+    )
+
+    contexts = TreeSitterLocalRetriever().retrieve(
+        head_repo, diff, base_path=base_repo
+    )
+    base_contexts = [context for context in contexts if context.revision == "base"]
+
+    assert 0 < len(base_contexts) <= MAX_BASE_DEFINITIONS_PER_SYMBOL
+    assert any("return 0" in context.snippet for context in base_contexts)
+    assert not any("return 2" in context.snippet for context in base_contexts)
+
+
+def test_base_revision_context_caps_same_name_without_deleted_lines(
+    tmp_path: Path,
+):
+    from openreview.retriever.tree_sitter_retriever import (
+        MAX_BASE_DEFINITIONS_PER_SYMBOL,
+    )
+
+    head_repo = tmp_path / "head"
+    base_repo = tmp_path / "base"
+    head_repo.mkdir()
+    base_repo.mkdir()
+    (head_repo / "mod.py").write_text("def keep():\n    pass\n")
+    (base_repo / "mod.py").write_text(
+        "def dup():\n"
+        "    return 0\n"
+        "\n"
+        "def dup():\n"
+        "    return 1\n"
+        "\n"
+        "def dup():\n"
+        "    return 2\n"
+    )
+    _init_repo(head_repo)
+    _init_repo(base_repo)
+
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="mod.py",
+                status="modified",
+                removed_symbols=["dup"],
+            )
+        ]
+    )
+
+    contexts = TreeSitterLocalRetriever().retrieve(
+        head_repo, diff, base_path=base_repo
+    )
+    base_contexts = [context for context in contexts if context.revision == "base"]
+
+    assert len(base_contexts) == MAX_BASE_DEFINITIONS_PER_SYMBOL
+
+
+def test_mostly_visible_enclosing_is_skipped(tmp_path: Path):
+    """80% 已在 patch 中可见时，剩余 20% 不值得整段注入。"""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    body = "\n".join(f"    value_{index} = {index}" for index in range(8))
+    (pkg / "big.py").write_text(
+        "def big(x):\n"
+        f"{body}\n"
+        "    return x\n",
+        encoding="utf-8",
+    )
+    _init_repo(tmp_path)
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="pkg/big.py",
+                status="modified",
+                changed_lines=[5],
+                # 函数共 10 行，其中 8 行（80%）已在 patch 可见。
+                visible_lines=list(range(1, 9)),
+            )
+        ]
+    )
+    retriever = TreeSitterLocalRetriever()
+
+    contexts = retriever.retrieve(tmp_path, diff)
+
+    assert not any(context.kind == "enclosing" for context in contexts)
+    assert retriever.last_stats["mostly_visible_enclosing_skipped"] == 1
+    assert "fully_visible_enclosing_skipped" not in retriever.last_stats
+
+
 def test_reference_search_timeout_is_bounded(monkeypatch, tmp_path: Path):
     """检索超时只能降级，不能让 review 挂住，且要留下可见计数。"""
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from openreview.repo.diff_parser import ParsedChangedFile, ParsedDiff
 
@@ -433,7 +433,42 @@ def _is_binary_or_asset(filename: str) -> bool:
     )
 
 
-def _is_generated(filename: str, patch: str | None) -> bool:
+GENERATED_HEADER_BYTES = 8 * 1024
+GENERATED_HEADER_LINES = 40
+
+
+def _has_generated_marker(text: str) -> bool:
+    header = "\n".join(text.splitlines()[:GENERATED_HEADER_LINES]).lower()
+    return any(marker in header for marker in GENERATED_MARKERS)
+
+
+def _resolve_head_file(head_root: Optional[Path], filename: str) -> Optional[Path]:
+    """Resolve a repo-relative path inside the head worktree safely."""
+    if head_root is None:
+        return None
+    try:
+        root = Path(head_root).resolve()
+        candidate = (root / filename).resolve()
+        candidate.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _read_head_header(path: Path) -> str:
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(GENERATED_HEADER_BYTES)
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="ignore")
+
+
+def _is_generated(
+    filename: str,
+    patch: str | None,
+    head_root: Optional[Path] = None,
+) -> bool:
     name = _basename(filename)
     if _matches_any(name, GENERATED_NAME_PATTERNS):
         return True
@@ -451,7 +486,18 @@ def _is_generated(filename: str, patch: str | None) -> bool:
         if line.startswith("+") and not line.startswith("+++")
     ]
     header = "\n".join(added[:30]).lower()
-    return any(marker in header for marker in GENERATED_MARKERS)
+    if any(marker in header for marker in GENERATED_MARKERS):
+        return True
+
+    # Existing generated files often change deep inside the file, so the
+    # patch does not contain the "Code generated ... DO NOT EDIT" header.
+    # Read the head file header as a fallback; without this, files such as
+    # mockgen output (`mock_datasources.go`) are reviewed as hand-written
+    # source and can flood the context budget with same-name definitions.
+    head_file = _resolve_head_file(head_root, filename)
+    if head_file is None:
+        return False
+    return _has_generated_marker(_read_head_header(head_file))
 
 
 def _is_reviewable_config(filename: str) -> bool:
@@ -516,8 +562,17 @@ def _is_bundled_generated(filename: str) -> bool:
     )
 
 
-def classify_file(file_diff: ParsedChangedFile) -> FileFilterDecision:
-    """Return a deterministic review/skip decision for one changed file."""
+def classify_file(
+    file_diff: ParsedChangedFile,
+    *,
+    head_root: Optional[Path] = None,
+) -> FileFilterDecision:
+    """Return a deterministic review/skip decision for one changed file.
+
+    ``head_root`` is optional and only used to detect generated files whose
+    header is outside the patch hunk.  Callers without a head checkout keep
+    the previous patch-only behaviour.
+    """
     filename = file_diff.filename
     additions = int(file_diff.additions or 0)
     deletions = int(file_diff.deletions or 0)
@@ -538,7 +593,7 @@ def classify_file(file_diff: ParsedChangedFile) -> FileFilterDecision:
     if _is_binary_or_asset(filename):
         return decision(SKIP, "asset", "图片/字体/媒体/压缩包/二进制产物")
 
-    if _is_generated(filename, file_diff.patch):
+    if _is_generated(filename, file_diff.patch, head_root=head_root):
         return decision(
             SKIP,
             "generated",
@@ -608,12 +663,16 @@ def classify_file(file_diff: ParsedChangedFile) -> FileFilterDecision:
     return decision(REVIEW, "code", "源代码，保留审查")
 
 
-def filter_parsed_diff(parsed_diff: ParsedDiff) -> FileFilterResult:
+def filter_parsed_diff(
+    parsed_diff: ParsedDiff,
+    *,
+    head_root: Optional[Path] = None,
+) -> FileFilterResult:
     """Split a parsed diff into reviewable files and skipped files."""
     kept: List[ParsedChangedFile] = []
     decisions: List[FileFilterDecision] = []
     for file_diff in parsed_diff.files:
-        decision = classify_file(file_diff)
+        decision = classify_file(file_diff, head_root=head_root)
         decisions.append(decision)
         if decision.action == REVIEW:
             kept.append(file_diff)

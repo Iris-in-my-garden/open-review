@@ -504,7 +504,10 @@ class ReviewExecutor:
 
         state.raw_parsed_diff = state.parsed_diff
         if self.config.file_filter_enabled:
-            filtered = filter_parsed_diff(state.raw_parsed_diff)
+            filtered = filter_parsed_diff(
+                state.raw_parsed_diff,
+                head_root=state.local_repo_path,
+            )
             state.parsed_diff = filtered.diff
             state.skipped_files = [
                 decision.as_dict() for decision in filtered.skipped
