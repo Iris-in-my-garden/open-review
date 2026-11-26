@@ -854,3 +854,42 @@ def test_go_call_extraction_does_not_rescan_tree_per_call(monkeypatch):
     imports, calls = _go_imports_and_calls(tree, source)
     assert imports == []
     assert calls == [("Run", "helper", "", 4)]
+
+
+def test_index_schema_bump_resets_stale_file_rows(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "go.mod").write_text("module example.com/demo\n\ngo 1.22\n")
+    (root / "lib").mkdir()
+    (root / "app").mkdir()
+    (root / "lib" / "lib.go").write_text(
+        "package lib\n\nfunc Helper() int { return 1 }\n"
+    )
+    (root / "app" / "app.go").write_text(
+        "package app\n\n"
+        'import "example.com/demo/lib"\n\n'
+        "func Run() int { return lib.Helper() }\n"
+    )
+    _init_repo(root)
+
+    cache_dir = tmp_path / "idx"
+    index = RepoIndex.for_worktree(root, cache_dir=cache_dir)
+    try:
+        index._conn.execute(
+            "UPDATE imports SET dst_module = 'stale-module'"
+        )
+        index._conn.execute(
+            "UPDATE meta SET value = '0' WHERE key = 'schema_version'"
+        )
+        index._conn.commit()
+    finally:
+        index.close()
+
+    rebuilt = RepoIndex.for_worktree(root, cache_dir=cache_dir)
+    try:
+        modules = {
+            edge.dst_module for edge in rebuilt.imports_of(["app/app.go"])
+        }
+        assert modules == {"lib"}
+    finally:
+        rebuilt.close()

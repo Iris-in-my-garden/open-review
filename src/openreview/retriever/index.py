@@ -34,7 +34,7 @@ from openreview.retriever.pathing import is_source_file
 
 logger = logging.getLogger(__name__)
 
-INDEX_SCHEMA_VERSION = "4"
+INDEX_SCHEMA_VERSION = "6"
 MAX_INDEXED_FILE_SIZE = 500 * 1024
 MAX_INDEXED_FILES = 20000
 SUPPORTED_SUFFIXES = {".py", ".go"}
@@ -786,6 +786,10 @@ class RepoIndex:
             old_head = self._meta("head_sha")
             schema_version = self._meta("schema_version")
             if schema_version and schema_version != INDEX_SCHEMA_VERSION:
+                # A schema bump changes how rows are written.  `_index_if_changed`
+                # skips unchanged blobs, so without a full reset old files would
+                # keep stale columns/values after the version bump.
+                self._reset_index()
                 force = True
             if not force and old_head == head_sha:
                 self.last_stats = {
@@ -966,6 +970,15 @@ class RepoIndex:
         self._conn.execute("DELETE FROM imports WHERE src_file = ?", (rel_path,))
         self._conn.execute("DELETE FROM calls WHERE caller_file = ?", (rel_path,))
         self._conn.execute("DELETE FROM files WHERE path = ?", (rel_path,))
+
+    def _reset_index(self) -> None:
+        """Drop all indexed rows after an incompatible schema change."""
+        for table in ("symbols", "imports", "calls", "files"):
+            self._conn.execute(f"DELETE FROM {table}")
+        self._conn.execute(
+            "DELETE FROM meta WHERE key IN ('head_sha', 'indexed_at')"
+        )
+        self._conn.commit()
 
     def _meta(self, key: str) -> Optional[str]:
         row = self._conn.execute(
