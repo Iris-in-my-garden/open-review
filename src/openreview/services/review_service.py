@@ -83,7 +83,7 @@ class ReviewPipeline:
         soft_prompt_tokens: int = DEFAULT_SOFT_PROMPT_TOKENS,
         hard_prompt_tokens: int = DEFAULT_HARD_PROMPT_TOKENS,
         ablation: Optional[str] = None,
-        llm_timeout: float = 60.0,
+        llm_timeout: float = 180.0,
         llm_max_retries: int = 0,
         max_completion_tokens: int = 16384,
         temperature: float = 0.0,

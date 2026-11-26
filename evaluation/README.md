@@ -202,6 +202,9 @@ uv run python -m evaluation.cli review \
   它是 lower bound：不模拟 batching、重试和真实 `max_context_tokens` 截断。
 - `--run-budget-tokens` 是 **单个 PR run 的运行时硬上限**：每个 PR 独立计账，
   估算输入超过该值就停止该 run 的后续调用，并把它标记为 `partial`。
+- Thinking 模型的单次调用可能超过 60s；默认请求超时已提高到 180s，必要时用
+  `--llm-timeout 300`。超时的请求会按“已被 provider 接受”保守扣预算，因此
+  smoke 时不要把 `--run-budget-tokens` 设得太紧。
 
 没有设置 `--preflight-tokens` 时不要直接跑 `--split all`。
 

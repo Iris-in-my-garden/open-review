@@ -18,7 +18,7 @@ verifier 用 `deepseek-flash` + 非 thinking。非 DeepSeek 模型不会收到 `
 | `llm_thinking` | `True` | `--thinking/--no-thinking` | Review thinking（仅 DeepSeek） |
 | `verifier_llm_thinking` | `False` | `--verifier-thinking` | Verifier thinking |
 | `llm_reasoning_effort` | `high` | `--reasoning-effort` | `none/low/high/max` |
-| `llm_timeout` | 60.0 | — | 单次请求超时 |
+| `llm_timeout` | 180.0 | `--llm-timeout` | 单次请求超时（thinking 建议 180–300s） |
 | `llm_max_retries` | 0 | `--llm-max-retries` | 每次 attempt 独立计账 |
 | `temperature` | 0.0 | — | 固定采样，保证可复现 |
 | `seed` | `None` | — | 可选随机种子（DeepSeek 不发送） |

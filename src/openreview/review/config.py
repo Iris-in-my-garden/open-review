@@ -54,7 +54,7 @@ class ReviewConfig:
     # verifier 可独立选便宜模型；None 表示 DeepSeek 用 flash，其他沿用主模型。
     verifier_llm_model: Optional[str] = None
     llm_base_url: Optional[str] = None
-    llm_timeout: float = 60.0
+    llm_timeout: float = 180.0
     llm_max_retries: int = 0
     temperature: float = 0.0
     seed: Optional[int] = None

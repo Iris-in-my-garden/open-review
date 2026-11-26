@@ -281,6 +281,7 @@ def cmd_check_run(args: argparse.Namespace) -> int:
         thinking=args.thinking,
         verifier_thinking=args.verifier_thinking,
         reasoning_effort=args.reasoning_effort,
+        llm_timeout=args.llm_timeout,
     )
     if has_reusable_results(
         instances,
@@ -399,6 +400,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         thinking=args.thinking,
         verifier_thinking=args.verifier_thinking,
         reasoning_effort=args.reasoning_effort,
+        llm_timeout=args.llm_timeout,
         mock_llm=args.mock_llm,
     )
     pipeline = ReviewPipeline(
@@ -409,6 +411,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         llm_thinking=args.thinking,
         verifier_llm_thinking=args.verifier_thinking,
         llm_reasoning_effort=args.reasoning_effort,
+        llm_timeout=args.llm_timeout,
         ablation=args.ablation,
         budget_calls=args.budget_calls,
         budget_tokens=args.run_budget_tokens,
@@ -696,6 +699,12 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
         choices=["none", "low", "high", "max"],
         default="high",
         help="Thinking 强度",
+    )
+    parser.add_argument(
+        "--llm-timeout",
+        type=float,
+        default=180.0,
+        help="单次 LLM 请求超时秒数（thinking 模型建议 >=180）",
     )
 
 

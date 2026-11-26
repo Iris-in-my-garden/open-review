@@ -157,6 +157,14 @@ def review(
         "--llm-max-retries",
         help="Retries for transient LLM API failures (default: 0)",
     ),
+    llm_timeout: float = typer.Option(
+        180.0,
+        "--llm-timeout",
+        help=(
+            "Single LLM request timeout in seconds. Thinking/Pro models over "
+            "long prompts often need >60s (default: 180)."
+        ),
+    ),
     max_completion_tokens: int = typer.Option(
         16384,
         "--max-completion-tokens",
@@ -230,6 +238,7 @@ def review(
             llm_cache_dir=llm_cache_dir,
             llm_cache_mode=llm_cache_mode,
             llm_max_retries=llm_max_retries,
+            llm_timeout=llm_timeout,
             max_completion_tokens=max_completion_tokens,
             debug_dir=str(dump_intermediates) if dump_intermediates else None,
         )

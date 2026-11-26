@@ -27,6 +27,7 @@ VERIFIER_MODEL=""
 THINKING=1
 VERIFIER_THINKING=0
 REASONING_EFFORT=""
+LLM_TIMEOUT=""
 LEVELS="diff ast graph verifier"
 LIMIT=""
 PREFLIGHT_TOKENS=""
@@ -49,6 +50,7 @@ usage() {
   --no-thinking              关闭 Review thinking（默认开启，仅 DeepSeek 生效）
   --verifier-thinking        开启 Verifier thinking（默认关闭）
   --reasoning-effort LEVEL   none | low | high | max（默认 high）
+  --llm-timeout SECONDS      单次请求超时（默认 180；thinking 建议 180-300）
   --levels "diff ast ..."    要跑的档位（默认全部四档）
   --limit N                  每个 split 只跑前 N 条（smoke）
   --preflight-tokens N       split 级 token 预检；超限则在调用 LLM 前退出
@@ -86,6 +88,7 @@ while [[ $# -gt 0 ]]; do
     --verifier-thinking) VERIFIER_THINKING=1; shift ;;
     --no-verifier-thinking) VERIFIER_THINKING=0; shift ;;
     --reasoning-effort) require_value "$@"; REASONING_EFFORT="$2"; shift 2 ;;
+    --llm-timeout) require_value "$@"; LLM_TIMEOUT="$2"; shift 2 ;;
     --levels) require_value "$@"; LEVELS="$2"; shift 2 ;;
     --limit) require_value "$@"; LIMIT="$2"; shift 2 ;;
     --preflight-tokens) require_value "$@"; PREFLIGHT_TOKENS="$2"; shift 2 ;;
@@ -143,6 +146,7 @@ run_review() {
   if [[ "$THINKING" -eq 1 ]]; then cmd+=(--thinking); else cmd+=(--no-thinking); fi
   if [[ "$VERIFIER_THINKING" -eq 1 ]]; then cmd+=(--verifier-thinking); fi
   if [[ -n "$REASONING_EFFORT" ]]; then cmd+=(--reasoning-effort "$REASONING_EFFORT"); fi
+  if [[ -n "$LLM_TIMEOUT" ]]; then cmd+=(--llm-timeout "$LLM_TIMEOUT"); fi
   if [[ -n "$LIMIT" ]]; then cmd+=(--limit "$LIMIT"); fi
   if [[ -n "$PREFLIGHT_TOKENS" ]]; then cmd+=(--preflight-tokens "$PREFLIGHT_TOKENS"); fi
   if [[ -n "$RUN_BUDGET_TOKENS" ]]; then cmd+=(--run-budget-tokens "$RUN_BUDGET_TOKENS"); fi
@@ -171,6 +175,7 @@ is_reusable_level() {
   if [[ "$THINKING" -eq 1 ]]; then cmd+=(--thinking); else cmd+=(--no-thinking); fi
   if [[ "$VERIFIER_THINKING" -eq 1 ]]; then cmd+=(--verifier-thinking); fi
   if [[ -n "$REASONING_EFFORT" ]]; then cmd+=(--reasoning-effort "$REASONING_EFFORT"); fi
+  if [[ -n "$LLM_TIMEOUT" ]]; then cmd+=(--llm-timeout "$LLM_TIMEOUT"); fi
   "${cmd[@]}"
 }
 
