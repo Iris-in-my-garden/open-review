@@ -20,6 +20,7 @@ from openreview.domain.errors import (
     BudgetExceeded,
     ProviderError,
     StructuredOutputError,
+    TruncatedOutputError,
 )
 from openreview.review.output_parser import PotentialIssueSchema
 from openreview.review.token_budget import estimate_tokens
@@ -38,6 +39,10 @@ REASONING_EFFORTS = frozenset(
     {"none", "low", "high", "max", "minimal", "medium", "xhigh"}
 )
 STRUCTURED_OUTPUT_MODES = frozenset({"auto", "json_schema", "json_object"})
+# A truncated JSON response usually means the model hit its output cap while
+# reasoning or enumerating findings. Retrying with a larger cap is cheap
+# compared with repeating the same 16k-token failure several times.
+MAX_TRUNCATION_RETRY_TOKENS = 32768
 JSON_OUTPUT_INSTRUCTION = (
     "\n\n【结构化输出】只输出一个 JSON 对象，不要 Markdown 代码块，"
     "不要额外解释。输出必须符合以下 JSON Schema：\n{schema}"
@@ -251,18 +256,18 @@ class BudgetedLLMClient:
         estimated = _estimate_request_tokens(
             system_prompt, user_prompt, response_schema
         )
+        base_output_limit = getattr(self.inner, "max_completion_tokens", None)
+        retry_output_limit: Optional[int] = None
         for attempt in range(self.max_retries + 1):
             budget = self._budget
             output_reservation = 0
-            configured_output_limit = getattr(
-                self.inner, "max_completion_tokens", None
-            )
+            desired_output_limit = retry_output_limit or base_output_limit
             if budget is not None:
                 remaining_output = budget.remaining_output_tokens()
                 if remaining_output is not None:
                     output_reservation = min(
                         remaining_output,
-                        max(0, int(configured_output_limit or remaining_output)),
+                        max(0, int(desired_output_limit or remaining_output)),
                     )
                 # Check and reserve the full possible response atomically.
                 budget.reserve(
@@ -283,7 +288,7 @@ class BudgetedLLMClient:
             output_token = _REQUEST_OUTPUT_LIMIT.set(
                 output_reservation
                 if budget is not None and budget.max_output_tokens > 0
-                else None
+                else desired_output_limit
             )
             attempt_token = _REQUEST_ATTEMPT.set(attempt + 1)
             try:
@@ -325,6 +330,14 @@ class BudgetedLLMClient:
                         )
                 if attempt >= self.max_retries or not _is_retryable_provider_error(exc):
                     raise
+                if isinstance(exc, TruncatedOutputError):
+                    current_limit = retry_output_limit or base_output_limit or 0
+                    next_limit = min(
+                        MAX_TRUNCATION_RETRY_TOKENS,
+                        max(current_limit * 2, current_limit + 8192, 16384),
+                    )
+                    if next_limit > current_limit:
+                        retry_output_limit = next_limit
                 delay = min(0.5 * (2**attempt), 8.0)
                 if budget is not None:
                     remaining = budget.remaining_seconds()
@@ -668,6 +681,14 @@ class LLMClient:
                 response = self._client.beta.chat.completions.parse(**request)
                 actual = self._record_usage(getattr(response, "usage", None))
                 message = response.choices[0].message
+                finish_reason = getattr(
+                    response.choices[0], "finish_reason", None
+                )
+                if finish_reason == "length":
+                    raise TruncatedOutputError(
+                        "model reached the output token cap "
+                        f"({output_limit or 'provider default'})"
+                    )
                 if message.refusal:
                     raise ValueError(
                         f"Model refused to respond: {message.refusal}"
@@ -681,6 +702,15 @@ class LLMClient:
                 response = self._client.chat.completions.create(**request)
                 actual = self._record_usage(getattr(response, "usage", None))
                 message = response.choices[0].message
+                finish_reason = getattr(
+                    response.choices[0], "finish_reason", None
+                )
+                if finish_reason == "length":
+                    raise TruncatedOutputError(
+                        "model reached the output token cap "
+                        f"({output_limit or 'provider default'}); "
+                        "retry with a larger cap or a smaller batch"
+                    )
                 if message.refusal:
                     raise ValueError(
                         f"Model refused to respond: {message.refusal}"
@@ -711,6 +741,7 @@ class LLMClient:
                         "thinking": self.thinking,
                         "reasoning_effort": self.reasoning_effort,
                         "structured_output": self.structured_output,
+                        "output_limit": output_limit,
                         "latency_ms": elapsed_ms,
                         "estimated_prompt_tokens": _estimate_request_tokens(
                             system_prompt, user_prompt, response_schema

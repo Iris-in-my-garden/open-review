@@ -209,6 +209,8 @@ uv run python -m evaluation.cli review \
   PR 级预算，超过预算的 batch 会以 `BudgetExceeded` 降级。
 - 输入预算耗尽后 verifier 也会被跳过（finding 保留但未二次校验）；大 PR 的
   `--run-budget-tokens` 要同时覆盖 review 和 verifier。
+- 输出被 `max_tokens` 截断时（`finish_reason=length`），重试会把单次输出上限
+  翻倍，最高到 32,768；需要 `--llm-max-retries` 至少为 1 才会触发。
 
 没有设置 `--preflight-tokens` 时不要直接跑 `--split all`。
 

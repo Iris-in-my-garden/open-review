@@ -22,7 +22,7 @@ verifier 用 `deepseek-flash` + 非 thinking。非 DeepSeek 模型不会收到 `
 | `llm_max_retries` | 0 | `--llm-max-retries` | 每次 attempt 独立计账 |
 | `temperature` | 0.0 | — | 固定采样，保证可复现 |
 | `seed` | `None` | — | 可选随机种子（DeepSeek 不发送） |
-| `max_completion_tokens` | 16,384 | `--max-completion-tokens` | 单次输出上限（thinking 含 reasoning token） |
+| `max_completion_tokens` | 16,384 | `--max-completion-tokens` | 单次输出上限（thinking 含 reasoning token；截断重试最多升到 32,768） |
 
 DeepSeek 只支持 `response_format={"type": "json_object"}`，因此
 `structured_output=auto` 会对 DeepSeek 自动切换到 JSON 模式，并在 system prompt

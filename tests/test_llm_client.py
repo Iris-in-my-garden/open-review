@@ -448,3 +448,62 @@ def test_non_deepseek_model_keeps_json_schema_and_default_openai_endpoint(monkey
     assert "extra_body" not in request
     assert request["seed"] == 7
     assert request["response_format"] is Output
+
+
+def test_truncated_json_retries_with_a_larger_output_cap(monkeypatch):
+    from types import SimpleNamespace
+
+    from pydantic import BaseModel
+
+    class Output(BaseModel):
+        value: int
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr("openreview.review.llm_client.time.sleep", lambda _: None)
+    truncated = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(refusal=None, content=""),
+                finish_reason="length",
+            )
+        ],
+        usage=SimpleNamespace(
+            prompt_tokens=10,
+            completion_tokens=16384,
+            total_tokens=16394,
+        ),
+    )
+    valid = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    refusal=None, content='{"value": 3}'
+                ),
+                finish_reason="stop",
+            )
+        ],
+        usage=SimpleNamespace(
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+        ),
+    )
+    with patch("openreview.review.llm_client.OpenAI") as mock_openai:
+        create = mock_openai.return_value.chat.completions.create
+        create.side_effect = [truncated, valid]
+        client = LLMClient(
+            model="deepseek-flash",
+            thinking=False,
+            max_completion_tokens=16384,
+            max_retries=1,
+        )
+        budgeted = BudgetedLLMClient(
+            client, ReviewBudget(max_input_tokens=100_000), run_id="run-a"
+        )
+
+        result = budgeted.generate_structured("sys", "user", Output)
+
+    assert result.value == 3
+    requests = [call.kwargs for call in create.call_args_list]
+    assert requests[0]["max_tokens"] == 16384
+    assert requests[1]["max_tokens"] == 32768

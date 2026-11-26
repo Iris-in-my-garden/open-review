@@ -38,6 +38,14 @@ class StructuredOutputError(ProviderError):
     """
 
 
+class TruncatedOutputError(StructuredOutputError):
+    """The provider stopped because it reached the output token cap.
+
+    Callers can retry the same request with a larger output cap instead of
+    repeating the same truncated request.
+    """
+
+
 class RepositoryError(ExternalServiceError):
     """Git/repository preparation failed."""
 
