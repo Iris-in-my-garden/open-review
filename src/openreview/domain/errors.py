@@ -29,6 +29,15 @@ class ProviderError(ExternalServiceError):
     """LLM provider failed (timeout, refusal, malformed structured output)."""
 
 
+class StructuredOutputError(ProviderError):
+    """Provider returned content that cannot be parsed into the response schema.
+
+    JSON-mode providers (for example DeepSeek) can return empty content or a
+    truncated JSON object when the output cap is too small.  This is treated as
+    retryable, unlike a schema-level programming error.
+    """
+
+
 class RepositoryError(ExternalServiceError):
     """Git/repository preparation failed."""
 

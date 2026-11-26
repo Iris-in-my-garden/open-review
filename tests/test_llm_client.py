@@ -83,7 +83,7 @@ def test_llm_client_records_per_call_log_and_output_cap(monkeypatch):
 
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     with patch("openreview.review.llm_client.OpenAI") as mock_openai:
-        client = LLMClient(max_completion_tokens=256)
+        client = LLMClient(model="gpt-4o", max_completion_tokens=256)
         parse = mock_openai.return_value.beta.chat.completions.parse
         parse.return_value = SimpleNamespace(
             choices=[
@@ -128,7 +128,7 @@ def test_budgeted_request_caps_output_and_tags_run(monkeypatch):
 
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     with patch("openreview.review.llm_client.OpenAI") as mock_openai:
-        client = LLMClient(max_completion_tokens=200, max_retries=2)
+        client = LLMClient(model="gpt-4o", max_completion_tokens=200, max_retries=2)
         parse = mock_openai.return_value.beta.chat.completions.parse
         parse.return_value = SimpleNamespace(
             choices=[
@@ -172,7 +172,7 @@ def test_shared_provider_logs_and_budgets_are_isolated_across_runs(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     barrier = threading.Barrier(2)
     with patch("openreview.review.llm_client.OpenAI") as mock_openai:
-        client = LLMClient()
+        client = LLMClient(model="gpt-4o")
 
         def parse(**request):
             user_prompt = request["messages"][1]["content"]
@@ -220,3 +220,231 @@ def test_shared_provider_logs_and_budgets_are_isolated_across_runs(monkeypatch):
     } == {"run-a": 10, "run-b": 30}
     assert budgets[0].used_input_tokens == 10
     assert budgets[1].used_input_tokens == 30
+
+
+def test_deepseek_defaults_use_pro_for_review_and_flash_for_verify(monkeypatch):
+    from openreview.review.llm_client import (
+        resolve_model,
+        resolve_verifier_model,
+    )
+
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    monkeypatch.delenv("OPENREVIEW_VERIFIER_MODEL", raising=False)
+
+    review_model = resolve_model(None)
+    assert review_model == "deepseek-v4-pro"
+    assert resolve_verifier_model(review_model, None) == "deepseek-flash"
+    # 非 DeepSeek 模型默认沿用主模型，避免把 DeepSeek 端点强加给 OpenAI 用户。
+    assert resolve_verifier_model("gpt-4o", None) == "gpt-4o"
+
+
+def test_deepseek_json_mode_sends_thinking_and_parses_content(monkeypatch):
+    from types import SimpleNamespace
+
+    from pydantic import BaseModel
+
+    class Output(BaseModel):
+        value: int
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-test")
+    with patch("openreview.review.llm_client.OpenAI") as mock_openai:
+        create = mock_openai.return_value.chat.completions.create
+        create.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        refusal=None,
+                        content='```json\n{"value": 7}\n```',
+                    )
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=10, completion_tokens=5, total_tokens=15
+            ),
+        )
+        client = LLMClient(
+            model="deepseek-v4-pro",
+            thinking=True,
+            reasoning_effort="high",
+            max_completion_tokens=4096,
+        )
+        result = client.generate_structured("sys", "user", Output)
+
+    request = create.call_args.kwargs
+    assert request["model"] == "deepseek-v4-pro"
+    assert request["response_format"] == {"type": "json_object"}
+    assert request["extra_body"]["thinking"] == {"type": "enabled"}
+    assert request["extra_body"]["reasoning_effort"] == "high"
+    assert request["max_tokens"] == 4096
+    assert "json" in request["messages"][0]["content"].lower()
+    assert result.value == 7
+    assert client.call_log[0]["structured_output"] == "json_object"
+    assert client.call_log[0]["thinking"] is True
+
+
+def test_json_mode_empty_content_is_retryable(monkeypatch):
+    from types import SimpleNamespace
+
+    from pydantic import BaseModel
+
+    class Output(BaseModel):
+        value: int
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr("openreview.review.llm_client.time.sleep", lambda _: None)
+    blank = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(refusal=None, content=""))],
+        usage=SimpleNamespace(
+            prompt_tokens=1, completion_tokens=1, total_tokens=2
+        ),
+    )
+    valid = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(refusal=None, content='{"value": 3}')
+            )
+        ],
+        usage=SimpleNamespace(
+            prompt_tokens=1, completion_tokens=1, total_tokens=2
+        ),
+    )
+    with patch("openreview.review.llm_client.OpenAI") as mock_openai:
+        create = mock_openai.return_value.chat.completions.create
+        create.side_effect = [blank, valid]
+        client = LLMClient(model="deepseek-flash", max_retries=1, thinking=False)
+        budgeted = BudgetedLLMClient(
+            client, ReviewBudget(max_input_tokens=10_000), run_id="run-a"
+        )
+
+        result = budgeted.generate_structured("sys", "user", Output)
+
+    assert result.value == 3
+    assert create.call_count == 2
+
+
+def test_composite_client_merges_stage_usage_and_call_log():
+    from openreview.review.llm_client import CompositeLLMClient
+
+    primary = MockLLMClient()
+    verifier = MockLLMClient()
+    composite = CompositeLLMClient(primary, verifier)
+
+    composite.generate_structured("sys", "review", AspectReviewOutputSchema)
+    verifier.generate_structured("sys", "verify", AspectReviewOutputSchema)
+
+    assert composite.usage["calls"] == 2
+    assert len(composite.call_log) == 2
+    assert composite.model == "mock"
+
+
+def test_review_config_cache_key_tracks_verifier_model_and_thinking():
+    from openreview.review.config import ReviewConfig
+
+    base = ReviewConfig(
+        llm_model="deepseek-v4-pro",
+        verifier_llm_model="deepseek-flash",
+        llm_thinking=True,
+        verifier_llm_thinking=False,
+    )
+    other_model = ReviewConfig(
+        llm_model="deepseek-v4-pro",
+        verifier_llm_model="deepseek-v4-pro",
+        llm_thinking=True,
+        verifier_llm_thinking=False,
+    )
+    other_thinking = ReviewConfig(
+        llm_model="deepseek-v4-pro",
+        verifier_llm_model="deepseek-flash",
+        llm_thinking=True,
+        verifier_llm_thinking=True,
+    )
+
+    assert base.cache_key_parts() != other_model.cache_key_parts()
+    assert base.cache_key_parts() != other_thinking.cache_key_parts()
+
+
+def test_pipeline_wires_pro_thinking_review_and_flash_verifier(monkeypatch):
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    monkeypatch.delenv("OPENREVIEW_VERIFIER_MODEL", raising=False)
+    with (
+        patch("openreview.services.review_service.LLMClient") as mock_llm,
+    ):
+        pipeline = ReviewPipeline()
+        try:
+            calls = mock_llm.call_args_list
+        finally:
+            pipeline.close()
+
+    assert [call.kwargs["model"] for call in calls] == [
+        "deepseek-v4-pro",
+        "deepseek-flash",
+    ]
+    assert [call.kwargs["thinking"] for call in calls] == [True, False]
+    assert pipeline.config.verifier_llm_model == "deepseek-flash"
+
+
+def test_composite_binds_one_budget_to_every_stage_client():
+    from openreview.review.llm_client import CompositeLLMClient
+
+    review = BudgetedLLMClient(MockLLMClient())
+    verifier = BudgetedLLMClient(MockLLMClient())
+    composite = CompositeLLMClient(review, verifier)
+    budget = ReviewBudget(max_llm_calls=4)
+
+    composite.bind_budget(budget)
+
+    assert review.budget is budget
+    assert verifier.budget is budget
+
+
+def test_pipeline_session_binds_budget_across_models(monkeypatch, tmp_path):
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    monkeypatch.delenv("OPENREVIEW_VERIFIER_MODEL", raising=False)
+    with patch("openreview.services.review_service.LLMClient") as mock_llm:
+        mock_llm.side_effect = [MockLLMClient(), MockLLMClient()]
+        pipeline = ReviewPipeline()
+    try:
+        session = pipeline._new_session()
+        state = session.new_state(
+            "https://github.com/org/repo/pull/1", tmp_path
+        )
+
+        assert session.llm_client.primary is not session.llm_client.verifier
+        assert session.llm_client.primary.budget is state.budget
+        assert session.llm_client.verifier.budget is state.budget
+    finally:
+        pipeline.close()
+
+
+def test_non_deepseek_model_keeps_json_schema_and_default_openai_endpoint(monkeypatch):
+    from types import SimpleNamespace
+
+    from pydantic import BaseModel
+
+    class Output(BaseModel):
+        value: int
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    with patch("openreview.review.llm_client.OpenAI") as mock_openai:
+        parse = mock_openai.return_value.beta.chat.completions.parse
+        parse.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(refusal=None, parsed=Output(value=1))
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=1, completion_tokens=1, total_tokens=2
+            ),
+        )
+        client = LLMClient(model="gpt-4o", thinking=True, seed=7)
+        client.generate_structured("sys", "user", Output)
+
+    request = parse.call_args.kwargs
+    assert client.structured_output == "json_schema"
+    assert client.base_url is None
+    assert "extra_body" not in request
+    assert request["seed"] == 7
+    assert request["response_format"] is Output

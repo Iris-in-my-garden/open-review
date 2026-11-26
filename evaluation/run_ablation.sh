@@ -23,6 +23,10 @@ read -r -a PYTHON <<< "$PYTHON_BIN"
 MANIFEST="evaluation/manifests/aacr_pygo_v3.json"
 SPLIT="dev"
 MODEL=""
+VERIFIER_MODEL=""
+THINKING=1
+VERIFIER_THINKING=0
+REASONING_EFFORT=""
 LEVELS="diff ast graph verifier"
 LIMIT=""
 PREFLIGHT_TOKENS=""
@@ -40,7 +44,11 @@ usage() {
 用法: evaluation/run_ablation.sh [options]
 
   --split SPLIT              dev | holdout | all（默认 dev；test 仅用于旧 manifest）
-  --model MODEL              四档共用的模型名；不传则走 OPENAI_MODEL
+  --model MODEL              Review 主模型；不传则默认 deepseek-v4-pro
+  --verifier-model MODEL     Verifier 模型；不传则 DeepSeek 下默认 deepseek-flash
+  --no-thinking              关闭 Review thinking（默认开启，仅 DeepSeek 生效）
+  --verifier-thinking        开启 Verifier thinking（默认关闭）
+  --reasoning-effort LEVEL   none | low | high | max（默认 high）
   --levels "diff ast ..."    要跑的档位（默认全部四档）
   --limit N                  每个 split 只跑前 N 条（smoke）
   --preflight-tokens N       split 级 token 预检；超限则在调用 LLM 前退出
@@ -72,6 +80,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --split) require_value "$@"; SPLIT="$2"; shift 2 ;;
     --model) require_value "$@"; MODEL="$2"; shift 2 ;;
+    --verifier-model) require_value "$@"; VERIFIER_MODEL="$2"; shift 2 ;;
+    --thinking) THINKING=1; shift ;;
+    --no-thinking) THINKING=0; shift ;;
+    --verifier-thinking) VERIFIER_THINKING=1; shift ;;
+    --no-verifier-thinking) VERIFIER_THINKING=0; shift ;;
+    --reasoning-effort) require_value "$@"; REASONING_EFFORT="$2"; shift 2 ;;
     --levels) require_value "$@"; LEVELS="$2"; shift 2 ;;
     --limit) require_value "$@"; LIMIT="$2"; shift 2 ;;
     --preflight-tokens) require_value "$@"; PREFLIGHT_TOKENS="$2"; shift 2 ;;
@@ -125,6 +139,10 @@ run_review() {
     --ablation "$level"
   )
   if [[ -n "$MODEL" ]]; then cmd+=(--model "$MODEL"); fi
+  if [[ -n "$VERIFIER_MODEL" ]]; then cmd+=(--verifier-model "$VERIFIER_MODEL"); fi
+  if [[ "$THINKING" -eq 1 ]]; then cmd+=(--thinking); else cmd+=(--no-thinking); fi
+  if [[ "$VERIFIER_THINKING" -eq 1 ]]; then cmd+=(--verifier-thinking); fi
+  if [[ -n "$REASONING_EFFORT" ]]; then cmd+=(--reasoning-effort "$REASONING_EFFORT"); fi
   if [[ -n "$LIMIT" ]]; then cmd+=(--limit "$LIMIT"); fi
   if [[ -n "$PREFLIGHT_TOKENS" ]]; then cmd+=(--preflight-tokens "$PREFLIGHT_TOKENS"); fi
   if [[ -n "$RUN_BUDGET_TOKENS" ]]; then cmd+=(--run-budget-tokens "$RUN_BUDGET_TOKENS"); fi
@@ -149,6 +167,10 @@ is_reusable_level() {
   )
   if [[ -n "$LIMIT" ]]; then cmd+=(--limit "$LIMIT"); fi
   if [[ -n "$MODEL" ]]; then cmd+=(--model "$MODEL"); fi
+  if [[ -n "$VERIFIER_MODEL" ]]; then cmd+=(--verifier-model "$VERIFIER_MODEL"); fi
+  if [[ "$THINKING" -eq 1 ]]; then cmd+=(--thinking); else cmd+=(--no-thinking); fi
+  if [[ "$VERIFIER_THINKING" -eq 1 ]]; then cmd+=(--verifier-thinking); fi
+  if [[ -n "$REASONING_EFFORT" ]]; then cmd+=(--reasoning-effort "$REASONING_EFFORT"); fi
   "${cmd[@]}"
 }
 

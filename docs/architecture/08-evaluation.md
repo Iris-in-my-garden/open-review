@@ -83,7 +83,8 @@
 
 ```bash
 # 一键跑四档：review -> metrics -> gate -> 可选 semantic -> report
-./evaluation/run_ablation.sh --split dev --model gpt-4o-mini \
+# 默认 review=deepseek-v4-pro thinking，verifier=deepseek-flash
+./evaluation/run_ablation.sh --split dev \
   --preflight-tokens 200000 --run-budget-tokens 20000
 
 # 只估算，不 clone、不调用 LLM
@@ -158,13 +159,14 @@ uv run python -m evaluation.cli gate \
   --metrics evaluation/metrics/aacr-pygo-v3/dev-mock/deterministic_dev-mock.json
 
 # 4. 真实模型（按需）
-export OPENAI_API_KEY=...
+export DEEPSEEK_API_KEY=...
 uv run python -m evaluation.cli review --split dev --limit 1 \
-  --run-id dev-smoke --model gpt-4o-mini \
-  --preflight-tokens 20000 --run-budget-tokens 20000
+  --run-id dev-smoke --preflight-tokens 20000 --run-budget-tokens 20000
 ```
 
-完整四档对照直接跑 `./evaluation/run_ablation.sh --split dev --model gpt-4o-mini`。
+默认 review 用 `deepseek-v4-pro` + thinking，verifier 用 `deepseek-flash`；
+换模型用 `--model` / `--verifier-model` 覆盖。
+完整四档对照直接跑 `./evaluation/run_ablation.sh --split dev`。
 
 ## 7. 统计注意事项
 

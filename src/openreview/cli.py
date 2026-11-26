@@ -47,13 +47,34 @@ def review(
         None,
         "--model",
         envvar="OPENAI_MODEL",
-        help="LLM model name (default: gpt-4o)",
+        help="Review 主模型（默认 deepseek-v4-pro）",
+    ),
+    verifier_llm_model: str = typer.Option(
+        None,
+        "--verifier-model",
+        envvar="OPENREVIEW_VERIFIER_MODEL",
+        help="Verifier 模型（默认 DeepSeek 下用 deepseek-flash）",
     ),
     llm_base_url: str = typer.Option(
         None,
         "--base-url",
         envvar="OPENAI_BASE_URL",
-        help="OpenAI-compatible API base URL",
+        help="OpenAI 兼容 API base URL（DeepSeek 模型默认官方地址）",
+    ),
+    thinking: bool = typer.Option(
+        True,
+        "--thinking/--no-thinking",
+        help="Review 是否启用 thinking 模式（仅 DeepSeek 发送该参数）",
+    ),
+    verifier_thinking: bool = typer.Option(
+        False,
+        "--verifier-thinking/--no-verifier-thinking",
+        help="Verifier 是否启用 thinking 模式（默认关闭以节省成本）",
+    ),
+    reasoning_effort: str = typer.Option(
+        "high",
+        "--reasoning-effort",
+        help="Thinking 强度：none | low | high | max",
     ),
     mock_llm: bool = typer.Option(
         False,
@@ -137,11 +158,11 @@ def review(
         help="Retries for transient LLM API failures (default: 0)",
     ),
     max_completion_tokens: int = typer.Option(
-        2048,
+        16384,
         "--max-completion-tokens",
         help=(
-            "Per-call output token cap. Prevents a chatty/malformed response "
-            "from blowing up cost (0 disables the cap)."
+            "Per-call output token cap (thinking 模式需要为 reasoning 预留空间; "
+            "0 disables the cap)."
         ),
     ),
     dump_intermediates: Optional[Path] = typer.Option(
@@ -192,7 +213,11 @@ def review(
         pipeline = ReviewPipeline(
             github_token=github_token,
             llm_model=llm_model,
+            verifier_llm_model=verifier_llm_model,
             llm_base_url=llm_base_url,
+            llm_thinking=thinking,
+            verifier_llm_thinking=verifier_thinking,
+            llm_reasoning_effort=reasoning_effort,
             mock_llm=mock_llm,
             max_batch_tokens=max_batch_tokens,
             ablation=ablation,

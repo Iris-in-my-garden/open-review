@@ -277,6 +277,10 @@ def cmd_check_run(args: argparse.Namespace) -> int:
         ablation=args.ablation,
         model=args.model,
         base_url=args.base_url,
+        verifier_model=args.verifier_model,
+        thinking=args.thinking,
+        verifier_thinking=args.verifier_thinking,
+        reasoning_effort=args.reasoning_effort,
     )
     if has_reusable_results(
         instances,
@@ -391,12 +395,20 @@ def cmd_review(args: argparse.Namespace) -> int:
         ablation=args.ablation,
         model=args.model,
         base_url=args.base_url,
+        verifier_model=args.verifier_model,
+        thinking=args.thinking,
+        verifier_thinking=args.verifier_thinking,
+        reasoning_effort=args.reasoning_effort,
         mock_llm=args.mock_llm,
     )
     pipeline = ReviewPipeline(
         mock_llm=args.mock_llm,
         llm_model=args.model,
+        verifier_llm_model=args.verifier_model,
         llm_base_url=args.base_url,
+        llm_thinking=args.thinking,
+        verifier_llm_thinking=args.verifier_thinking,
+        llm_reasoning_effort=args.reasoning_effort,
         ablation=args.ablation,
         budget_calls=args.budget_calls,
         budget_tokens=args.run_budget_tokens,
@@ -656,6 +668,37 @@ def cmd_synthetic(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _add_model_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model", default=None, help="Review 主模型")
+    parser.add_argument("--verifier-model", default=None, help="Verifier 模型")
+    parser.add_argument("--base-url", default=None, help="OpenAI 兼容 API 地址")
+    parser.add_argument(
+        "--thinking",
+        dest="thinking",
+        action="store_true",
+        default=True,
+        help="Review 启用 thinking（默认开启）",
+    )
+    parser.add_argument(
+        "--no-thinking",
+        dest="thinking",
+        action="store_false",
+        help="Review 关闭 thinking",
+    )
+    parser.add_argument(
+        "--verifier-thinking",
+        action="store_true",
+        default=False,
+        help="Verifier 启用 thinking（默认关闭）",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["none", "low", "high", "max"],
+        default="high",
+        help="Thinking 强度",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m evaluation.cli",
@@ -702,8 +745,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     check_run.add_argument("--results-dir", type=Path, default=None)
     check_run.add_argument("--ablation", choices=["diff", "ast", "graph", "verifier"])
-    check_run.add_argument("--model", default=None)
-    check_run.add_argument("--base-url", default=None)
+    _add_model_args(check_run)
     check_run.set_defaults(func=cmd_check_run)
 
     review = sub.add_parser("review", parents=[common], help="调用 run_local 跑评测")
@@ -711,8 +753,7 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument(
         "--mock-llm", action="store_true", help="mock LLM，仅验证链路"
     )
-    review.add_argument("--model", default=None)
-    review.add_argument("--base-url", default=None)
+    _add_model_args(review)
     review.add_argument(
         "--ablation",
         choices=["diff", "ast", "graph", "verifier"],

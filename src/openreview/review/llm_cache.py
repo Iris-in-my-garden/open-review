@@ -126,6 +126,11 @@ class FileLLMCacheClient:
             # 采样参数必须进 key，否则改 temperature/seed 后会误命中旧响应。
             str(getattr(self.inner, "temperature", "")),
             str(getattr(self.inner, "seed", "")),
+            # 同一模型切换 thinking / reasoning effort / 输出格式会改变答案。
+            str(getattr(self.inner, "thinking", "")),
+            str(getattr(self.inner, "reasoning_effort", "")),
+            str(getattr(self.inner, "structured_output", "")),
+            str(getattr(self.inner, "max_completion_tokens", "")),
             response_schema.__module__,
             response_schema.__name__,
             system_prompt,

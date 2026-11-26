@@ -32,10 +32,14 @@ from openreview.review.debug_sink import DebugSink
 from openreview.review.finding_validator import FindingValidator
 from openreview.review.llm_cache import FileLLMCacheClient
 from openreview.review.llm_client import (
+    DEFAULT_REASONING_EFFORT,
     AbstractLLMClient,
     BudgetedLLMClient,
+    CompositeLLMClient,
     LLMClient,
     MockLLMClient,
+    resolve_model,
+    resolve_verifier_model,
 )
 from openreview.review.output_parser import OutputParser
 from openreview.review.prompt_builder import PromptBuilder
@@ -67,7 +71,11 @@ class ReviewPipeline:
         github_token: Optional[str] = None,
         llm_api_key: Optional[str] = None,
         llm_model: Optional[str] = None,
+        verifier_llm_model: Optional[str] = None,
         llm_base_url: Optional[str] = None,
+        llm_thinking: bool = True,
+        verifier_llm_thinking: bool = False,
+        llm_reasoning_effort: Optional[str] = DEFAULT_REASONING_EFFORT,
         max_batch_tokens: int = 12000,
         max_patch_tokens: int = 8192,
         hard_patch_tokens: int = 48000,
@@ -77,7 +85,7 @@ class ReviewPipeline:
         ablation: Optional[str] = None,
         llm_timeout: float = 60.0,
         llm_max_retries: int = 0,
-        max_completion_tokens: int = 2048,
+        max_completion_tokens: int = 16384,
         temperature: float = 0.0,
         seed: Optional[int] = None,
         index_cache_dir: Optional[str] = None,
@@ -104,11 +112,15 @@ class ReviewPipeline:
         # 单个无法拆分文件的硬熔断，不参与正常分批。
         effective_context_tokens = max_context_tokens
         effective_patch_tokens = min(max_patch_tokens, hard_patch_tokens)
+        # 解析成实际模型名，保证 cache key 与真正发出的请求一致。
+        review_model = resolve_model(llm_model)
+        verifier_model = resolve_verifier_model(review_model, verifier_llm_model)
         self.config = ReviewConfig(
             mock_llm=mock_llm,
             github_token=github_token,
             llm_api_key=llm_api_key,
-            llm_model=llm_model,
+            llm_model=review_model,
+            verifier_llm_model=verifier_model,
             llm_base_url=llm_base_url,
             max_batch_tokens=max_batch_tokens,
             max_patch_tokens=effective_patch_tokens,
@@ -122,6 +134,9 @@ class ReviewPipeline:
             max_completion_tokens=max_completion_tokens,
             temperature=temperature,
             seed=seed,
+            llm_thinking=llm_thinking,
+            verifier_llm_thinking=verifier_llm_thinking,
+            llm_reasoning_effort=llm_reasoning_effort,
             index_cache_dir=index_cache_dir,
             triage_enabled=triage_enabled,
             file_filter_enabled=file_filter_enabled,
@@ -153,30 +168,45 @@ class ReviewPipeline:
 
         # 根据标志直接切换实例，不需要用 MagicMock 动态拼装。
         # 注意：GitHub Token 与 LLM API Key 是两套完全独立的凭证。
-        self._base_client: AbstractLLMClient = (
-            MockLLMClient()
-            if mock_llm
-            else LLMClient(
-                api_key=llm_api_key,
-                model=llm_model,
-                base_url=llm_base_url,
-                timeout=llm_timeout,
-                max_retries=llm_max_retries,
-                temperature=temperature,
-                seed=seed,
-                max_completion_tokens=max_completion_tokens,
+        self._review_model = review_model
+        self._verifier_model = verifier_model
+        # 同模型/同 thinking 时复用同一个底层客户端，避免重复计费统计。
+        self._shared_verifier_client = (
+            mock_llm
+            or not self.config.verifier_enabled
+            or (
+                verifier_model == review_model
+                and verifier_llm_thinking == llm_thinking
             )
+        )
+        self._base_client: AbstractLLMClient = self._make_base_client(
+            review_model, llm_thinking
+        )
+        self._verifier_base_client: AbstractLLMClient = (
+            self._base_client
+            if self._shared_verifier_client
+            else self._make_base_client(verifier_model, verifier_llm_thinking)
         )
         # 预算包在真实客户端外面：review / verifier / retry 的每次调用都扣账。
         # 这组客户端是“原型”，供兼容属性/测试观察；每次 run 会新建
         # run-scoped BudgetedLLMClient，避免并发 run 共用同一本预算账。
         self._budgeted_client = BudgetedLLMClient(self._base_client)
+        self._verifier_budgeted_client = (
+            self._budgeted_client
+            if self._shared_verifier_client
+            else BudgetedLLMClient(self._verifier_base_client)
+        )
         self.llm_client = self._wrap_llm_client(self._budgeted_client)
+        self._verifier_client = (
+            self.llm_client
+            if self._shared_verifier_client
+            else self._wrap_llm_client(self._verifier_budgeted_client)
+        )
 
         self.debug_sink = DebugSink(debug_dir) if debug_dir else None
         self.reviewer: SingleShotReviewer = self._build_reviewer(self.llm_client)
         self._default_reviewer = self.reviewer
-        self.verifier = self._build_verifier(self.llm_client)
+        self.verifier = self._build_verifier(self._verifier_client)
         self._default_verifier = self.verifier
         self.review_cache = ReviewCache(
             review_cache_dir, enabled=review_cache_enabled
@@ -194,6 +224,24 @@ class ReviewPipeline:
     # ------------------------------------------------------------------
     # run-scoped 组件构造
     # ------------------------------------------------------------------
+    def _make_base_client(
+        self, model: str, thinking: bool
+    ) -> AbstractLLMClient:
+        if self.config.mock_llm:
+            return MockLLMClient()
+        return LLMClient(
+            api_key=self.config.llm_api_key,
+            model=model,
+            base_url=self.config.llm_base_url,
+            timeout=self.config.llm_timeout,
+            max_retries=self.config.llm_max_retries,
+            temperature=self.config.temperature,
+            seed=self.config.seed,
+            max_completion_tokens=self.config.max_completion_tokens,
+            thinking=thinking,
+            reasoning_effort=self.config.llm_reasoning_effort,
+        )
+
     def _wrap_llm_client(self, client: AbstractLLMClient):
         # record/replay 放在预算外层：cache hit 不消耗真实调用预算。
         if self.config.llm_cache_dir:
@@ -260,7 +308,16 @@ class ReviewPipeline:
         """
         run_id = ReviewSession.new_run_id()
         budgeted_client = BudgetedLLMClient(self._base_client, run_id=run_id)
-        llm_client = self._wrap_llm_client(budgeted_client)
+        primary_client = self._wrap_llm_client(budgeted_client)
+        if self._shared_verifier_client:
+            verifier_client = primary_client
+        else:
+            verifier_budgeted = BudgetedLLMClient(
+                self._verifier_base_client, run_id=run_id
+            )
+            verifier_client = self._wrap_llm_client(verifier_budgeted)
+        # 一个 facade 同时承担：review 调用、usage/call_log 汇总、budget 绑定。
+        llm_client = CompositeLLMClient(primary_client, verifier_client)
 
         # 测试/调用方可能在构造后替换组件；只有仍指向默认原型时才重建，
         # 否则必须尊重替换（例如 FakeReviewer / FakeRetriever）。
@@ -272,7 +329,7 @@ class ReviewPipeline:
         verifier = (
             self.verifier
             if self.verifier is not self._default_verifier
-            else self._build_verifier(llm_client)
+            else self._build_verifier(verifier_client)
         )
         retriever = (
             self.retriever
@@ -290,7 +347,7 @@ class ReviewPipeline:
             verifier=verifier,
             review_cache=self.review_cache,
             llm_client=llm_client,
-            budgeted_client=budgeted_client,
+            budgeted_client=llm_client,
             debug_sink=self.debug_sink,
             run_id=run_id,
             worktree_pool=self._get_worktree_pool(),
@@ -298,7 +355,7 @@ class ReviewPipeline:
         return ReviewSession(
             run_id=run_id,
             executor=executor,
-            budgeted_client=budgeted_client,
+            budgeted_client=llm_client,
             llm_client=llm_client,
             reviewer=reviewer,
             verifier=verifier,

@@ -119,4 +119,5 @@ sequenceDiagram
 - 不是精确账单：输入 token 为估算，provider 计费口径可能不同。
 - 不计算金额：没有单价、缓存折扣、批处理折扣配置。
 - 时间预算不覆盖本地检索、仓库准备、报告与评论发布。
-- 输出上限依赖 Provider 遵守 `max_completion_tokens` 参数。
+- 输出上限依赖 Provider 遵守输出参数；DeepSeek JSON 模式发送 `max_tokens`，
+  其他 OpenAI 兼容端点发送 `max_completion_tokens`，两者共用同一预算值。

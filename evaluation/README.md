@@ -139,10 +139,9 @@ uv run python -m evaluation.cli prepare-repos --split dev
 # 实际检索上下文并估算 prompt；必要时 clone/fetch，但不调用 LLM
 ./evaluation/run_ablation.sh --dry-run --split dev --limit 1
 
-# 真实运行四档
+# 真实运行四档（默认 review=deepseek-v4-pro thinking，verifier=deepseek-flash）
 ./evaluation/run_ablation.sh \
   --split dev \
-  --model gpt-4o-mini \
   --preflight-tokens 200000 \
   --run-budget-tokens 20000 \
   --report-out reports/eval_dev.md
@@ -161,8 +160,12 @@ manifest、ablation、模型和代码工件版本；完整匹配的档位直接�
 
 ### 4. 真实模型（按需，消耗 token）
 
+默认配置：review 用 `deepseek-v4-pro` + thinking，verifier 用 `deepseek-flash`。
+设置 `DEEPSEEK_API_KEY`（或 `OPENAI_API_KEY`）即可；换模型时用
+`--model` / `--verifier-model` 覆盖。
+
 ```bash
-export OPENAI_API_KEY=...
+export DEEPSEEK_API_KEY=...
 
 # 实际检索上下文并估算 prompt；可能 clone/fetch 仓库，但不调用 LLM
 uv run python -m evaluation.cli review \
@@ -175,16 +178,14 @@ uv run python -m evaluation.cli review \
 uv run python -m evaluation.cli review \
   --split dev \
   --limit 1 \
-  --run-id dev-gpt4o-mini-smoke \
-  --model gpt-4o-mini \
+  --run-id dev-smoke \
   --preflight-tokens 20000 \
   --run-budget-tokens 20000
 
 # 完整 dev
 uv run python -m evaluation.cli review \
   --split dev \
-  --run-id dev-gpt4o-mini \
-  --model gpt-4o-mini \
+  --run-id dev-deepseek \
   --preflight-tokens 200000 \
   --run-budget-tokens 20000
 ```

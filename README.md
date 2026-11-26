@@ -218,20 +218,28 @@ uv run python -m evaluation.cli gate \
 ### 复现 dev mini-eval
 
 先做一条 smoke，确认 API、token 预算和结果落盘：
-真实模型调用需设置 `OPENAI_API_KEY`；私有仓库或需要更高 GitHub API 限额时可选设置 `GITHUB_TOKEN`：
+真实模型调用需设置 `OPENAI_API_KEY`（或直接设置 `DEEPSEEK_API_KEY`）。默认 review 使用
+`deepseek-v4-pro` + thinking，verifier 使用 `deepseek-flash`；私有仓库或需要更高
+GitHub API 限额时可选设置 `GITHUB_TOKEN`：
 
 ```bash
-export OPENAI_API_KEY=...
+export DEEPSEEK_API_KEY=...
 # export GITHUB_TOKEN=...
 
 uv run openreview review https://github.com/owner/repo/pull/123 \
-  --model gpt-4o \
   --budget-calls 8 \
   --budget-tokens 20000 \
   --budget-output-tokens 8000 \
   --budget-seconds 120 \
-  --max-completion-tokens 2048 \
   --json-out reports/result.json
+```
+
+需要换模型时显式覆盖，例如改用 OpenAI：
+
+```bash
+uv run openreview review https://github.com/owner/repo/pull/123 \
+  --model gpt-4o --verifier-model gpt-4o --no-thinking \
+  --base-url https://api.openai.com/v1
 ```
 
 输入 Token 使用字符估算，估算误差可能使已发出的单次请求超过上限；时间预算约束 LLM 请求，不等同于整个流程的墙钟超时。Mock 仅验证链路，不代表审查效果。

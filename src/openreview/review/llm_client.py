@@ -13,14 +13,136 @@ from openai import (
     InternalServerError,
     OpenAI,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from openreview.domain.errors import BudgetExceeded, ProviderError
+from openreview.domain.errors import (
+    BudgetExceeded,
+    ProviderError,
+    StructuredOutputError,
+)
 from openreview.review.output_parser import PotentialIssueSchema
 from openreview.review.token_budget import estimate_tokens
 from openreview.review.workflow import ReviewBudget
 
 T = TypeVar("T", bound=BaseModel)
+
+# 项目默认使用 DeepSeek：review 用 pro + thinking，verifier 用 flash。
+# 所有值都可以被显式参数或环境变量覆盖，非 DeepSeek 模型不会收到
+# ``thinking`` 这类厂商扩展字段。
+DEFAULT_MODEL = "deepseek-v4-pro"
+DEFAULT_VERIFIER_MODEL = "deepseek-flash"
+DEFAULT_BASE_URL = "https://api.deepseek.com"
+DEFAULT_REASONING_EFFORT = "high"
+REASONING_EFFORTS = frozenset(
+    {"none", "low", "high", "max", "minimal", "medium", "xhigh"}
+)
+STRUCTURED_OUTPUT_MODES = frozenset({"auto", "json_schema", "json_object"})
+JSON_OUTPUT_INSTRUCTION = (
+    "\n\n【结构化输出】只输出一个 JSON 对象，不要 Markdown 代码块，"
+    "不要额外解释。输出必须符合以下 JSON Schema：\n{schema}"
+)
+
+
+def is_deepseek_model(model: Optional[str]) -> bool:
+    return "deepseek" in (model or "").strip().lower()
+
+
+def resolve_model(model: Optional[str] = None) -> str:
+    return model or os.getenv("OPENAI_MODEL") or DEFAULT_MODEL
+
+
+def resolve_verifier_model(
+    review_model: str, verifier_model: Optional[str] = None
+) -> str:
+    """Verifier defaults to Flash for DeepSeek, otherwise matches review."""
+    if verifier_model:
+        return verifier_model
+    from_env = os.getenv("OPENREVIEW_VERIFIER_MODEL")
+    if from_env:
+        return from_env
+    return DEFAULT_VERIFIER_MODEL if is_deepseek_model(review_model) else review_model
+
+
+def resolve_base_url(
+    model: Optional[str], base_url: Optional[str] = None
+) -> Optional[str]:
+    if base_url:
+        return base_url
+    from_env = os.getenv("OPENAI_BASE_URL")
+    if from_env:
+        return from_env
+    if is_deepseek_model(model):
+        return DEFAULT_BASE_URL
+    return None
+
+
+def resolve_api_key(api_key: Optional[str] = None) -> Optional[str]:
+    return api_key or os.getenv("OPENAI_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
+
+
+def _is_deepseek_endpoint(model: Optional[str], base_url: Optional[str]) -> bool:
+    return is_deepseek_model(model) or "deepseek" in (base_url or "").lower()
+
+
+def resolve_structured_output(
+    model: Optional[str],
+    base_url: Optional[str],
+    structured_output: Optional[str] = None,
+) -> str:
+    """DeepSeek only supports ``json_object``; OpenAI supports JSON schema."""
+    mode = (
+        structured_output
+        or os.getenv("OPENREVIEW_STRUCTURED_OUTPUT")
+        or "auto"
+    ).strip().lower()
+    if mode not in STRUCTURED_OUTPUT_MODES:
+        raise ValueError(
+            "structured_output must be one of "
+            f"{', '.join(sorted(STRUCTURED_OUTPUT_MODES))}, got {mode!r}"
+        )
+    if mode == "auto":
+        return (
+            "json_object"
+            if _is_deepseek_endpoint(model, base_url)
+            else "json_schema"
+        )
+    return mode
+
+
+def _json_schema_hint(response_schema: Type[BaseModel]) -> str:
+    schema = json.dumps(
+        response_schema.model_json_schema(), ensure_ascii=False, sort_keys=True
+    )
+    return JSON_OUTPUT_INSTRUCTION.format(schema=schema)
+
+
+def _parse_json_object(text: str, response_schema: Type[T]) -> T:
+    """Parse a JSON-mode response, tolerating Markdown code fences."""
+    stripped = (text or "").strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped).strip()
+    if not stripped:
+        raise StructuredOutputError(
+            "model returned empty content in JSON mode "
+            "(output cap may be too small)"
+        )
+    try:
+        return response_schema.model_validate_json(stripped)
+    except ValidationError as first_error:
+        start, end = stripped.find("{"), stripped.rfind("}")
+        if 0 <= start < end:
+            try:
+                return response_schema.model_validate_json(
+                    stripped[start : end + 1]
+                )
+            except ValidationError:
+                pass
+        raise StructuredOutputError(
+            "model returned invalid JSON for "
+            f"{response_schema.__name__}: {first_error}"
+        ) from first_error
+
 _REQUEST_RUN_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "openreview_request_run_id", default=None
 )
@@ -36,6 +158,9 @@ _REQUEST_ATTEMPT: contextvars.ContextVar[int] = contextvars.ContextVar(
 
 
 def _is_retryable_provider_error(exc: Exception) -> bool:
+    if isinstance(exc, StructuredOutputError):
+        # Empty/truncated JSON is usually a per-call accident, not a schema bug.
+        return True
     if isinstance(exc, ProviderError):
         cause = exc.__cause__
         return isinstance(cause, Exception) and _is_retryable_provider_error(cause)
@@ -240,13 +365,133 @@ class BudgetedLLMClient:
         return getattr(self.inner, name)
 
 
+class CompositeLLMClient:
+    """把 review / verifier 两个分阶段客户端聚合成一个 facade。
+
+    Reviewer 与 Verifier 可以使用不同模型（本项目默认 review=pro、verify=flash）。
+    Executor、cache key 和 metrics 仍然只认识一个 client，因此：
+
+    - ``generate_structured`` 走 review 客户端；
+    - ``usage`` / ``call_log`` / cache ``hits`` / ``misses`` 汇总两个阶段；
+    - ``bind_budget`` 把同一个 run budget 绑定到两个客户端。
+    """
+
+    def __init__(
+        self,
+        primary: AbstractLLMClient,
+        verifier: Optional[AbstractLLMClient] = None,
+    ):
+        self.primary = primary
+        self.verifier = (
+            None if verifier is None or verifier is primary else verifier
+        )
+        self._clients = [primary]
+        if self.verifier is not None:
+            self._clients.append(self.verifier)
+
+    @property
+    def has_budget(self) -> bool:
+        return any(
+            bool(getattr(client, "has_budget", False))
+            for client in self._clients
+        )
+
+    @property
+    def model(self) -> str:
+        return str(
+            getattr(self.primary, "model", type(self.primary).__name__)
+        )
+
+    @property
+    def temperature(self) -> Optional[float]:
+        return getattr(self.primary, "temperature", None)
+
+    @property
+    def seed(self) -> Optional[int]:
+        return getattr(self.primary, "seed", None)
+
+    @property
+    def thinking(self) -> Optional[bool]:
+        return getattr(self.primary, "thinking", None)
+
+    @property
+    def reasoning_effort(self) -> Optional[str]:
+        return getattr(self.primary, "reasoning_effort", None)
+
+    @property
+    def structured_output(self) -> Optional[str]:
+        return getattr(self.primary, "structured_output", None)
+
+    @property
+    def timeout(self) -> float:
+        return float(getattr(self.primary, "timeout", 60.0))
+
+    @property
+    def max_completion_tokens(self) -> Optional[int]:
+        return getattr(self.primary, "max_completion_tokens", None)
+
+    @property
+    def max_retries(self) -> int:
+        return max(0, int(getattr(self.primary, "max_retries", 0) or 0))
+
+    @property
+    def last_usage(self) -> Optional[Dict[str, int]]:
+        return getattr(self.primary, "last_usage", None)
+
+    @property
+    def usage(self) -> Dict[str, int]:
+        totals: Dict[str, int] = {}
+        for client in self._clients:
+            for key, value in (getattr(client, "usage", {}) or {}).items():
+                totals[key] = totals.get(key, 0) + int(value or 0)
+        return totals
+
+    @property
+    def call_log(self) -> List[Dict[str, Any]]:
+        return [
+            dict(item)
+            for client in self._clients
+            for item in (getattr(client, "call_log", []) or [])
+        ]
+
+    @property
+    def hits(self) -> int:
+        return sum(int(getattr(client, "hits", 0) or 0) for client in self._clients)
+
+    @property
+    def misses(self) -> int:
+        return sum(
+            int(getattr(client, "misses", 0) or 0) for client in self._clients
+        )
+
+    def bind_budget(self, budget: Optional[ReviewBudget]) -> None:
+        for client in self._clients:
+            bind = getattr(client, "bind_budget", None)
+            if callable(bind):
+                bind(budget)
+
+    def generate_structured(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        response_schema: Type[T],
+    ) -> T:
+        return self.primary.generate_structured(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_schema=response_schema,
+        )
+
+
 class LLMClient:
-    """真实的 OpenAI 客户端。
+    """真实的 OpenAI 兼容客户端。
 
     配置与 GitHub Token 完全解耦：
-    - api_key:OPENAI_API_KEY
-    - model: OPENAI_MODEL，默认 gpt-4o
-    - base_url: OPENAI_BASE_URL（用于兼容 OpenAI 协议的第三方服务）
+    - api_key:``OPENAI_API_KEY``，回退到 ``DEEPSEEK_API_KEY``
+    - model:``OPENAI_MODEL``，默认 ``deepseek-v4-pro``
+    - base_url:``OPENAI_BASE_URL``；DeepSeek 模型未配置时默认官方地址
+    - thinking:仅对 DeepSeek 发送 ``thinking`` / ``reasoning_effort``
+    - structured_output:DeepSeek 走 ``json_object``，其他走 JSON Schema
     """
     def __init__(
         self,
@@ -258,26 +503,47 @@ class LLMClient:
         temperature: float = 0.0,
         seed: Optional[int] = None,
         max_completion_tokens: Optional[int] = None,
+        thinking: Optional[bool] = None,
+        reasoning_effort: Optional[str] = None,
+        structured_output: Optional[str] = None,
     ):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.api_key = resolve_api_key(api_key)
         if not self.api_key:
             raise ValueError(
-                "缺少 OpenAI API Key。请设置环境变量 OPENAI_API_KEY，"
+                "缺少 LLM API Key。请设置环境变量 OPENAI_API_KEY"
+                "（或 DEEPSEEK_API_KEY），"
                 "或使用 `openreview review <PR_URL> --mock_llm` 进行离线演示。"
             )
 
-        self.model: str = model or os.getenv("OPENAI_MODEL") or "gpt-4o"
-        self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
+        self.model: str = resolve_model(model)
+        self.base_url = resolve_base_url(self.model, base_url)
+        self.provider_is_deepseek = _is_deepseek_endpoint(
+            self.model, self.base_url
+        )
         self.timeout = timeout
         self.max_retries = max(0, int(max_retries))
         # 固定采样参数，保证同一 prompt 的结果可复现；评测/回放需要这一点。
         self.temperature = temperature
         self.seed = seed
-        # 固定输出上限，避免模型长篇大论把成本打穿；具体值由 config 控制。
+        # Thinking 模式需要为 reasoning 预留输出预算；具体值由 config 控制。
         self.max_completion_tokens = (
             int(max_completion_tokens)
             if max_completion_tokens and max_completion_tokens > 0
             else None
+        )
+        self.thinking = thinking
+        if reasoning_effort is not None:
+            normalized_effort = reasoning_effort.strip().lower()
+            if normalized_effort not in REASONING_EFFORTS:
+                raise ValueError(
+                    "reasoning_effort must be one of "
+                    f"{', '.join(sorted(REASONING_EFFORTS))}, "
+                    f"got {reasoning_effort!r}"
+                )
+            reasoning_effort = normalized_effort
+        self.reasoning_effort = reasoning_effort
+        self.structured_output = resolve_structured_output(
+            self.model, self.base_url, structured_output
         )
 
         client_kwargs: dict[str, Any] = {
@@ -342,41 +608,82 @@ class LLMClient:
         if timeout <= 0:
             raise BudgetExceeded("Review time budget exhausted before LLM request.")
 
+        system_content = system_prompt
+        if self.structured_output == "json_object":
+            # DeepSeek 的 JSON Output 要求 prompt 里出现 "json" 并给出格式示例。
+            system_content = system_prompt + _json_schema_hint(response_schema)
+
         request: Dict[str, Any] = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": user_prompt},
             ],
-            "response_format": response_schema,
             # 把 HTTP 超时压到 aspect_timeout 以下，避免线程超时后请求还挂很久。
             "timeout": timeout,
         }
         if self.temperature is not None:
             request["temperature"] = self.temperature
-        if self.seed is not None:
+        # DeepSeek 不支持 seed；其他 OpenAI 兼容端点保留可复现采样。
+        if self.seed is not None and not self.provider_is_deepseek:
             request["seed"] = self.seed
         output_limit = _REQUEST_OUTPUT_LIMIT.get()
+        if output_limit is None:
+            output_limit = self.max_completion_tokens
         if output_limit is not None:
-            request["max_completion_tokens"] = output_limit
-        elif self.max_completion_tokens is not None:
-            request["max_completion_tokens"] = self.max_completion_tokens
+            # DeepSeek 文档只暴露 max_tokens；JSON Schema 路径沿用 SDK 参数。
+            if self.structured_output == "json_object":
+                request["max_tokens"] = output_limit
+            else:
+                request["max_completion_tokens"] = output_limit
+
+        extra_body: Dict[str, Any] = {}
+        if self.provider_is_deepseek:
+            if self.thinking is not None:
+                extra_body["thinking"] = {
+                    "type": "enabled" if self.thinking else "disabled"
+                }
+            if self.thinking and self.reasoning_effort:
+                extra_body["reasoning_effort"] = self.reasoning_effort
+        if extra_body:
+            request["extra_body"] = extra_body
+
+        if self.structured_output == "json_schema":
+            request["response_format"] = response_schema
+        else:
+            request["response_format"] = {"type": "json_object"}
+
         started = time.perf_counter()
         actual: Dict[str, int] = {}
         status = "error"
         error_type = ""
         try:
-            response = self._client.beta.chat.completions.parse(**request)
-            actual = self._record_usage(getattr(response, "usage", None))
-            message = response.choices[0].message
-            if message.refusal:
-                raise ValueError(f"Model refused to respond: {message.refusal}")
-            if message.parsed is None:
-                raise RuntimeError(
-                    "Failed to parse structured output from model response."
+            if self.structured_output == "json_schema":
+                response = self._client.beta.chat.completions.parse(**request)
+                actual = self._record_usage(getattr(response, "usage", None))
+                message = response.choices[0].message
+                if message.refusal:
+                    raise ValueError(
+                        f"Model refused to respond: {message.refusal}"
+                    )
+                if message.parsed is None:
+                    raise StructuredOutputError(
+                        "model returned no parsed structured output"
+                    )
+                parsed = message.parsed
+            else:
+                response = self._client.chat.completions.create(**request)
+                actual = self._record_usage(getattr(response, "usage", None))
+                message = response.choices[0].message
+                if message.refusal:
+                    raise ValueError(
+                        f"Model refused to respond: {message.refusal}"
+                    )
+                parsed = _parse_json_object(
+                    getattr(message, "content", "") or "", response_schema
                 )
             status = "ok"
-            return message.parsed
+            return parsed
         except Exception as exc:
             error_type = type(exc).__name__
             if isinstance(exc, ProviderError):
@@ -392,6 +699,9 @@ class LLMClient:
                         "status": status,
                         "error_type": error_type,
                         "model": self.model,
+                        "thinking": self.thinking,
+                        "reasoning_effort": self.reasoning_effort,
+                        "structured_output": self.structured_output,
                         "latency_ms": elapsed_ms,
                         "estimated_prompt_tokens": _estimate_request_tokens(
                             system_prompt, user_prompt, response_schema
@@ -413,6 +723,12 @@ class MockLLMClient:
         self.model = "mock"
         self.temperature = 0.0
         self.seed: Optional[int] = None
+        self.thinking: Optional[bool] = None
+        self.reasoning_effort: Optional[str] = None
+        self.structured_output = "mock"
+        self.timeout = 0.0
+        self.max_retries = 0
+        self.max_completion_tokens: Optional[int] = None
         # 与真实客户端保持同一接口，方便报告统一读取。
         self.usage: Dict[str, int] = {
             "calls": 0,

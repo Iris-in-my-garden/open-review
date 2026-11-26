@@ -23,6 +23,7 @@ from openreview.review.ablation import (
     resolve_ablation,
 )
 from openreview.review.file_filter import FILE_FILTER_POLICY_VERSION
+from openreview.review.llm_client import REASONING_EFFORTS
 from openreview.review.token_budget import (
     DEFAULT_HARD_PROMPT_TOKENS,
     DEFAULT_SOFT_PROMPT_TOKENS,
@@ -48,15 +49,21 @@ class ReviewConfig:
     # 凭证与模型连接
     github_token: Optional[str] = None
     llm_api_key: Optional[str] = None
+    # review 主模型；None 表示沿用 OPENAI_MODEL / 项目默认。
     llm_model: Optional[str] = None
+    # verifier 可独立选便宜模型；None 表示 DeepSeek 用 flash，其他沿用主模型。
+    verifier_llm_model: Optional[str] = None
     llm_base_url: Optional[str] = None
     llm_timeout: float = 60.0
     llm_max_retries: int = 0
     temperature: float = 0.0
     seed: Optional[int] = None
-    # Per-call output cap. Prevents a malformed/chatty response from turning a
-    # bounded review into an unbounded bill.
-    max_completion_tokens: int = 2048
+    # review 默认开启 thinking（DeepSeek）；verifier 默认关闭以控制成本。
+    llm_thinking: bool = True
+    verifier_llm_thinking: bool = False
+    llm_reasoning_effort: Optional[str] = "high"
+    # Per-call output cap. Thinking 模式要把 reasoning token 算进去，默认给足余量。
+    max_completion_tokens: int = 16384
 
     # batching 与 prompt 预算
     # 单批原始 Diff 目标 8k；硬熔断 48k 只用于无法继续拆分的单个超大 hunk。
@@ -143,6 +150,19 @@ class ReviewConfig:
             )
         object.__setattr__(self, "llm_cache_mode", normalized_cache_mode)
 
+        if self.llm_reasoning_effort is not None:
+            normalized_effort = self.llm_reasoning_effort.strip().lower()
+            if normalized_effort not in REASONING_EFFORTS:
+                raise ValueError(
+                    "llm_reasoning_effort must be one of "
+                    f"{', '.join(sorted(REASONING_EFFORTS))}, "
+                    f"got {self.llm_reasoning_effort!r}"
+                )
+            object.__setattr__(self, "llm_reasoning_effort", normalized_effort)
+
+        if self.max_completion_tokens < 0:
+            raise ValueError("max_completion_tokens must be >= 0")
+
         object.__setattr__(
             self,
             "static_tools",
@@ -193,6 +213,10 @@ class ReviewConfig:
             f"hard_prompt_tokens={self.hard_prompt_tokens}",
             f"llm_timeout={self.llm_timeout}",
             f"llm_max_retries={self.llm_max_retries}",
+            f"verifier_model={self.verifier_llm_model or 'default'}",
+            f"thinking={int(self.llm_thinking)}",
+            f"verifier_thinking={int(self.verifier_llm_thinking)}",
+            f"reasoning_effort={self.llm_reasoning_effort or 'default'}",
             f"max_completion_tokens={self.max_completion_tokens}",
             f"mock={int(self.mock_llm)}",
         ]

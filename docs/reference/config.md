@@ -6,15 +6,28 @@
 
 ### 模型与连接
 
+Review 与 Verifier 可以使用不同模型：默认 review 用 `deepseek-v4-pro` + thinking，
+verifier 用 `deepseek-flash` + 非 thinking。非 DeepSeek 模型不会收到 `thinking`
+扩展字段；verifier 默认沿用主模型。
+
 | 字段 | 默认 | CLI | 说明 |
-|---|---:|---|---|
-| `llm_model` | `gpt-4o` / `OPENAI_MODEL` | `--model` | 模型名 |
-| `llm_base_url` | `None` / `OPENAI_BASE_URL` | `--llm-base-url` | OpenAI 兼容服务 |
+|---|---|---|---|
+| `llm_model` | `deepseek-v4-pro` / `OPENAI_MODEL` | `--model` | Review 主模型 |
+| `verifier_llm_model` | DeepSeek 下 `deepseek-flash` | `--verifier-model` | Verifier 模型 |
+| `llm_base_url` | DeepSeek 官方 / `OPENAI_BASE_URL` | `--base-url` | OpenAI 兼容服务 |
+| `llm_thinking` | `True` | `--thinking/--no-thinking` | Review thinking（仅 DeepSeek） |
+| `verifier_llm_thinking` | `False` | `--verifier-thinking` | Verifier thinking |
+| `llm_reasoning_effort` | `high` | `--reasoning-effort` | `none/low/high/max` |
 | `llm_timeout` | 60.0 | — | 单次请求超时 |
 | `llm_max_retries` | 0 | `--llm-max-retries` | 每次 attempt 独立计账 |
 | `temperature` | 0.0 | — | 固定采样，保证可复现 |
-| `seed` | `None` | — | 可选随机种子 |
-| `max_completion_tokens` | 2048 | `--max-completion-tokens` | 单次输出上限 |
+| `seed` | `None` | — | 可选随机种子（DeepSeek 不发送） |
+| `max_completion_tokens` | 16,384 | `--max-completion-tokens` | 单次输出上限（thinking 含 reasoning token） |
+
+DeepSeek 只支持 `response_format={"type": "json_object"}`，因此
+`structured_output=auto` 会对 DeepSeek 自动切换到 JSON 模式，并在 system prompt
+末尾追加 JSON Schema 指令；其他 OpenAI 兼容端点继续使用 JSON Schema。
+可用 `OPENREVIEW_STRUCTURED_OUTPUT=json_schema|json_object` 覆盖。
 
 ### 批处理与上下文
 
@@ -103,6 +116,10 @@ soft_prompt_tokens
 hard_prompt_tokens
 llm_timeout
 llm_max_retries
+verifier_model
+thinking
+verifier_thinking
+reasoning_effort
 max_completion_tokens
 mock
 ```
@@ -113,9 +130,12 @@ mock
 
 | 变量 | 用途 |
 |---|---|
-| `OPENAI_API_KEY` | LLM 凭证（必需，mock 除外） |
-| `OPENAI_MODEL` | 默认模型 |
-| `OPENAI_BASE_URL` | OpenAI 兼容服务地址 |
+| `OPENAI_API_KEY` | LLM 凭证（兼容 OpenAI 协议的端点） |
+| `DEEPSEEK_API_KEY` | `OPENAI_API_KEY` 未设置时的 DeepSeek 凭证 |
+| `OPENAI_MODEL` | Review 主模型（默认 `deepseek-v4-pro`） |
+| `OPENREVIEW_VERIFIER_MODEL` | Verifier 模型（默认 DeepSeek 下 `deepseek-flash`） |
+| `OPENAI_BASE_URL` | OpenAI 兼容服务地址（DeepSeek 模型默认官方地址） |
+| `OPENREVIEW_STRUCTURED_OUTPUT` | `auto` / `json_schema` / `json_object` |
 | `GITHUB_TOKEN` | 私有仓库/更高 API 限额（可选） |
 | `OPENREVIEW_INDEX_DIR` | 索引目录 |
 | `OPENREVIEW_INDEX_SEED` | 是否用 baseline 快照做跨 HEAD 增量索引（默认开） |

@@ -5,7 +5,7 @@
 | 外部系统 | 用途 | 凭证 | 失败影响 |
 |---|---|---|---|
 | GitHub REST API | 读 PR 元数据/文件、发布 Review | `GITHUB_TOKEN`（可选） | 拉取失败终止；发布失败在报告落盘后终止 |
-| LLM Provider（OpenAI 兼容） | 结构化审查与 Verifier | `OPENAI_API_KEY` | 单 batch 失败降级为 `partial`；全部失败终止 |
+| LLM Provider（OpenAI 兼容） | 结构化审查与 Verifier | `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` | 单 batch 失败降级为 `partial`；全部失败终止 |
 | Git | clone、worktree、diff、`git apply --check` | 本地 git | 仓库准备失败终止 |
 | 本地文件系统 | 仓库缓存、SQLite 索引、review/LLM cache、报告 | 无 | 报告/缓存写盘失败按 best-effort 处理 |
 | 静态分析工具（可选） | `ruff` 等，仅 changed lines | 无 | 工具缺失/失败写入 notes，不阻断 |
