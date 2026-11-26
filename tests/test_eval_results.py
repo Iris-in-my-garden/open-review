@@ -107,6 +107,8 @@ def test_run_reviews_writes_summary_and_result(tmp_path: Path, monkeypatch):
 
     assert rows[0]["status"] == "ok"
     assert rows[0]["issues"] == 1
+    assert rows[0]["degraded_reasons"] == []
+    assert rows[0]["failed_batches"] == 0
     assert (tmp_path / "results" / "owner__repo@abc1234.json").exists()
     assert (tmp_path / "results" / "summary_openreview.json").exists()
     assert pipeline.calls[0][1]["owner"] == "owner"
@@ -140,6 +142,9 @@ def test_run_reviews_does_not_report_partial_as_ok(tmp_path: Path, monkeypatch):
     )
 
     assert rows[0]["status"] == "partial"
+    assert rows[0]["failed_batches"] == 1
+    assert rows[0]["total_batches"] == 2
+    assert rows[0]["degraded_reasons"] == ["batch 2/2 审查失败"]
     payload = json.loads(
         (tmp_path / "results" / "owner__repo@abc1234.json").read_text()
     )

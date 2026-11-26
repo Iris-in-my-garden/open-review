@@ -140,6 +140,24 @@ def write_result(results_dir: Path, payload: Dict[str, Any]) -> Path:
     return path
 
 
+def _summary_extras(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact partial-run context for ``summary_openreview.json``.
+
+    The summary is an index: full findings and per-batch details stay in the
+    per-instance JSON.  These fields make a ``partial`` row explain *why* it is
+    partial without forcing callers to open every result file.
+    """
+    review = payload.get("review") or {}
+    summary = review.get("summary") or {}
+    outcome = payload.get("outcome") or {}
+    return {
+        "llm_calls": int(summary.get("llm_calls") or 0),
+        "failed_batches": int(outcome.get("failed_batches") or 0),
+        "total_batches": int(outcome.get("total_batches") or 0),
+        "degraded_reasons": list(payload.get("degraded_reasons") or []),
+    }
+
+
 def run_reviews(
     instances: List[Dict[str, Any]],
     *,
@@ -198,6 +216,7 @@ def run_reviews(
                         "result_path": str(existing_path),
                         "error": None,
                         "resumed": True,
+                        **_summary_extras(existing),
                     }
                 )
                 continue
@@ -287,6 +306,7 @@ def run_reviews(
                 "result_path": str(out_path),
                 "error": payload.get("error"),
                 "resumed": False,
+                **_summary_extras(payload),
             }
         )
 
