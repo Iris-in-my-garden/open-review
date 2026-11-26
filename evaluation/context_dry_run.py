@@ -75,11 +75,11 @@ def build_context_dry_run(
                     include_global_impact=index == 1,
                 )
             )
-            visible_patch_files = prompt_builder.fully_visible_patch_files(batch)
+            visible_patch_old_lines = prompt_builder.visible_patch_old_lines(batch)
             contexts, redundant_base_contexts = filter_redundant_base_contexts(
                 contexts,
                 batch,
-                fully_visible_files=visible_patch_files,
+                visible_old_lines_by_file=visible_patch_old_lines,
             )
             before_cap = len(contexts)
             contexts = cap_repeated_contexts(contexts, repeated_context_counts)
@@ -153,6 +153,10 @@ def build_context_dry_run(
                     "files": [file.filename for file in batch.files],
                     "changed_symbols": batch_changed_symbols,
                     "redundant_base_contexts": len(redundant_base_contexts),
+                    "redundant_base_context_tokens": sum(
+                        estimate_tokens(context.snippet)
+                        for context in redundant_base_contexts
+                    ),
                     "repeated_contexts_capped": repeated_contexts_capped,
                     "contexts": context_reports,
                     "patch_tokens_estimate": sum(

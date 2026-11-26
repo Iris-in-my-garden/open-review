@@ -376,6 +376,28 @@ def _deletion_diff(extra_added_lines: int = 0) -> ParsedDiff:
     )
 
 
+def _deletion_after_added_diff(extra_added_lines: int = 400) -> ParsedDiff:
+    """删除行位于大量新增行之后，截断时旧侧内容会先被裁掉。"""
+    added = "".join(f"+new_{index} = {index}\n" for index in range(extra_added_lines))
+    patch = (
+        f"@@ -10,2 +9,{extra_added_lines} @@\n"
+        f"{added}"
+        "-def old_func():\n"
+        "-    return 0\n"
+    )
+    return DiffParser.parse_diff(
+        [
+            {
+                "filename": "src/utils.py",
+                "status": "modified",
+                "additions": extra_added_lines,
+                "deletions": 2,
+                "patch": patch,
+            }
+        ]
+    )
+
+
 def _removed_base_context() -> CodeContext:
     return CodeContext(
         file_path="src/utils.py",
@@ -405,8 +427,24 @@ def test_base_definition_fully_covered_by_deleted_lines_is_skipped():
     assert builder.context_stats["redundant_base_context_tokens"] > 0
 
 
-def test_base_definition_is_kept_when_patch_is_truncated():
-    """Patch 被截断时删除行不再完整可见，base 定义必须保留作为唯一证据。"""
+def test_base_definition_is_kept_when_deleted_lines_are_truncated():
+    """截断点之前只有新增行时，base 定义仍是删除代码的唯一证据。"""
+    base = _removed_base_context()
+    base.ensure_context_id()
+    builder = PromptBuilder(max_patch_tokens=200)
+
+    prompt = builder.build_user_prompt(
+        _pr(), _deletion_after_added_diff(), [base]
+    )
+
+    assert base.context_id in prompt
+    assert "<base_branch_context>" in prompt
+    assert "Patch 被截断" in prompt
+    assert builder.context_stats["redundant_base_contexts"] == 0
+
+
+def test_base_definition_inside_truncated_prefix_is_skipped():
+    """Patch 虽被截断，但删除行完整落在可见前缀里，base 定义仍是重复。"""
     base = _removed_base_context()
     base.ensure_context_id()
     builder = PromptBuilder(max_patch_tokens=200)
@@ -415,10 +453,24 @@ def test_base_definition_is_kept_when_patch_is_truncated():
         _pr(), _deletion_diff(extra_added_lines=400), [base]
     )
 
-    assert base.context_id in prompt
-    assert "<base_branch_context>" in prompt
+    assert base.context_id not in prompt
+    assert "<base_branch_context>\n以下代码" not in prompt
     assert "Patch 被截断" in prompt
-    assert builder.context_stats["redundant_base_contexts"] == 0
+    assert builder.context_stats["redundant_base_contexts"] == 1
+
+
+def test_visible_patch_old_lines_reports_full_patch():
+    visible = PromptBuilder().visible_patch_old_lines(_deletion_diff())
+
+    assert visible["src/utils.py"] == {10, 11}
+
+
+def test_visible_patch_old_lines_excludes_truncated_old_side():
+    visible = PromptBuilder(max_patch_tokens=200).visible_patch_old_lines(
+        _deletion_after_added_diff()
+    )
+
+    assert visible["src/utils.py"] == frozenset()
 
 
 def test_patch_plan_is_rendered_once_per_batch(monkeypatch):

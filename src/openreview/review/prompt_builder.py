@@ -2,7 +2,7 @@
 import logging
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Set, Tuple
 
 from openreview.domain.models import PullRequestInfo
 from openreview.repo.diff_parser import (
@@ -17,7 +17,11 @@ from openreview.retriever.context_planner import (
 )
 from openreview.review.context_filter import filter_redundant_base_contexts
 from openreview.review.redaction import redact_text
-from openreview.review.token_budget import estimate_tokens, truncate_to_tokens
+from openreview.review.token_budget import (
+    TRUNCATION_MARKER,
+    estimate_tokens,
+    truncate_to_tokens,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +114,9 @@ class _PatchPlan:
     truncated: List[str]
     skipped: List[str]
     visible_files: frozenset[str]
+    # Old-side line numbers actually rendered in the prompt.  Truncated files
+    # only contribute the prefix that survived the patch token budget.
+    visible_old_lines: Mapping[str, frozenset[int]]
 
 
 class PromptBuilder:
@@ -230,18 +237,64 @@ class PromptBuilder:
             file_diff.filename,
         )
 
+    @staticmethod
+    def _visible_old_lines_from_patch(
+        patch: str,
+        max_lines: Optional[int] = None,
+    ) -> frozenset[int]:
+        """Old-side line numbers shown by the first ``max_lines`` patch lines.
+
+        The annotated rendering is line-for-line identical to the raw patch,
+        so a line count taken from the rendered (possibly truncated) text maps
+        directly onto the raw patch lines.
+        """
+        lines = patch.splitlines()
+        if max_lines is not None:
+            lines = lines[:max_lines]
+        visible: Set[int] = set()
+        old_line: Optional[int] = None
+        for raw_line in lines:
+            header = HUNK_RANGE_PATTERN.match(raw_line)
+            if header:
+                old_line = int(header.group(1))
+                continue
+            if old_line is None:
+                continue
+            if raw_line.startswith("+"):
+                continue
+            if raw_line.startswith("-") or raw_line.startswith(" "):
+                visible.add(old_line)
+                old_line += 1
+        return frozenset(visible)
+
+    @staticmethod
+    def _truncated_visible_line_count(annotated: str) -> int:
+        """Number of rendered patch lines that survived truncation."""
+        text = annotated
+        if text.endswith(TRUNCATION_MARKER):
+            text = text[: -len(TRUNCATION_MARKER)]
+        return len(text.splitlines())
+
     def _select_patch_files(
         self, parsed_diff: ParsedDiff
-    ) -> Tuple[List[Tuple[ParsedChangedFile, str]], List[str], List[str]]:
+    ) -> Tuple[
+        List[Tuple[ParsedChangedFile, str]],
+        List[str],
+        List[str],
+        Dict[str, frozenset[int]],
+    ]:
         """Select and render patch blocks under the per-batch patch budget.
 
-        Returns ``(selected_files, truncated, skipped)``.  ``selected_files``
-        contains the file object so callers can reason about visibility, not
-        just the rendered text.
+        Returns ``(selected_files, truncated, skipped, visible_old_lines)``.
+        ``selected_files`` contains the file object so callers can reason about
+        visibility, not just the rendered text.  ``visible_old_lines`` records
+        the old-side lines that actually made it into the prompt, including the
+        prefix of a file whose patch was truncated.
         """
         selected: List[Tuple[ParsedChangedFile, str]] = []
         truncated: List[str] = []
         skipped: List[str] = []
+        visible_old_lines: Dict[str, frozenset[int]] = {}
         remaining = self.max_patch_tokens
 
         for file_diff in sorted(parsed_diff.files, key=self._file_priority):
@@ -257,6 +310,20 @@ class PromptBuilder:
                     )
                     if was_truncated:
                         truncated.append(file_diff.filename)
+                        visible_old_lines[file_diff.filename] = (
+                            self._visible_old_lines_from_patch(
+                                file_diff.patch,
+                                max_lines=self._truncated_visible_line_count(
+                                    annotated
+                                ),
+                            )
+                        )
+                    else:
+                        visible_old_lines[file_diff.filename] = (
+                            self._visible_old_lines_from_patch(
+                                file_diff.patch
+                            )
+                        )
                     selected.append(
                         (
                             file_diff,
@@ -268,6 +335,9 @@ class PromptBuilder:
                 remaining = 0
                 continue
 
+            visible_old_lines[file_diff.filename] = (
+                self._visible_old_lines_from_patch(file_diff.patch)
+            )
             selected.append(
                 (
                     file_diff,
@@ -276,7 +346,7 @@ class PromptBuilder:
             )
             remaining -= cost
 
-        return selected, truncated, skipped
+        return selected, truncated, skipped, visible_old_lines
 
     def _plan_patch(self, parsed_diff: ParsedDiff) -> _PatchPlan:
         """Render/select patches once per batch and reuse across aspects."""
@@ -286,7 +356,9 @@ class PromptBuilder:
         ):
             return self._patch_plan
 
-        selected, truncated, skipped = self._select_patch_files(parsed_diff)
+        selected, truncated, skipped, visible_old_lines = (
+            self._select_patch_files(parsed_diff)
+        )
         truncated_set = set(truncated)
         plan = _PatchPlan(
             patch_blocks=[
@@ -299,6 +371,7 @@ class PromptBuilder:
                 for file_diff, _ in selected
                 if file_diff.filename not in truncated_set
             ),
+            visible_old_lines=visible_old_lines,
         )
         self._patch_plan = plan
         self._patch_plan_source = parsed_diff
@@ -314,6 +387,17 @@ class PromptBuilder:
     def fully_visible_patch_files(self, parsed_diff: ParsedDiff) -> set[str]:
         """Files whose entire patch is present in the prompt (not truncated)."""
         return set(self._plan_patch(parsed_diff).visible_files)
+
+    def visible_patch_old_lines(
+        self, parsed_diff: ParsedDiff
+    ) -> Mapping[str, frozenset[int]]:
+        """Old-side line numbers actually present in the prompt per file.
+
+        Includes the prefix of files whose patch was truncated, so callers can
+        drop base definitions that are duplicated by the visible diff even when
+        the whole file patch did not fit.
+        """
+        return self._plan_patch(parsed_diff).visible_old_lines
 
     @staticmethod
     def _render_context(ctx: CodeContext) -> str:
@@ -477,7 +561,7 @@ class PromptBuilder:
         contexts, redundant = filter_redundant_base_contexts(
             contexts,
             parsed_diff,
-            fully_visible_files=set(plan.visible_files),
+            visible_old_lines_by_file=plan.visible_old_lines,
         )
         if redundant:
             self.context_stats["redundant_base_contexts"] += len(redundant)

@@ -114,6 +114,7 @@ flowchart TD
 
 装配规则（`src/openreview/retriever/context_planner.py`）：
 
+0. 先丢弃与 patch 旧侧重复的 `base_definition`：可见性按 prompt 实际渲染的旧侧行号计算；patch 被截断时，只有仍完整落在可见前缀里的定义才会被丢弃。
 1. 先 `merge_contexts` 去重（相同范围 / 同一 AST 节点 / P2 包含 P5）。
 2. 按 priority 升序填充。
 3. P2/P3 按文件 **round-robin**：每个文件先出一个，再进入下一轮，避免大文件饿死其他变更。

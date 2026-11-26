@@ -627,15 +627,14 @@ class ReviewExecutor:
                     )
                 )
                 if prompt_builder is not None and hasattr(
-                    prompt_builder, "fully_visible_patch_files"
+                    prompt_builder, "visible_patch_old_lines"
                 ):
-                    visible_patch_files = prompt_builder.fully_visible_patch_files(
-                        batch
-                    )
                     contexts, redundant = filter_redundant_base_contexts(
                         contexts,
                         batch,
-                        fully_visible_files=visible_patch_files,
+                        visible_old_lines_by_file=(
+                            prompt_builder.visible_patch_old_lines(batch)
+                        ),
                     )
                     if redundant:
                         state.context_stats["redundant_base_contexts"] = (

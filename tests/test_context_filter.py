@@ -89,6 +89,51 @@ def test_partially_deleted_definition_is_kept():
     assert dropped == []
 
 
+def test_truncated_visibility_drops_definition_inside_visible_prefix():
+    """Patch 被截断，但 base 定义整段仍出现在可见前缀里时，也应视为重复。"""
+    diff = _diff("@@ -10,2 +9,0 @@\n-def old_func():\n-    return 0\n")
+    context = _base_context(10, 11)
+
+    kept, dropped = filter_redundant_base_contexts(
+        [context],
+        diff,
+        visible_old_lines_by_file={"src/utils.py": {10, 11}},
+    )
+
+    assert kept == []
+    assert dropped == [context]
+
+
+def test_truncated_visibility_keeps_definition_outside_visible_prefix():
+    """截断点之后的行没有出现在 prompt 里，base 定义仍是唯一证据。"""
+    diff = _diff("@@ -10,2 +9,0 @@\n-def old_func():\n-    return 0\n")
+    context = _base_context(10, 11)
+
+    kept, dropped = filter_redundant_base_contexts(
+        [context],
+        diff,
+        # 截断后只看到第 10 行，第 11 行被截掉。
+        visible_old_lines_by_file={"src/utils.py": {10}},
+    )
+
+    assert kept == [context]
+    assert dropped == []
+
+
+def test_truncated_visibility_ignores_files_missing_from_mapping():
+    diff = _diff("@@ -10,2 +9,0 @@\n-def old_func():\n-    return 0\n")
+    context = _base_context(10, 11)
+
+    kept, dropped = filter_redundant_base_contexts(
+        [context],
+        diff,
+        visible_old_lines_by_file={"other.py": {10, 11}},
+    )
+
+    assert kept == [context]
+    assert dropped == []
+
+
 def test_patch_visibility_guard_keeps_context_when_file_is_truncated():
     diff = _diff("@@ -10,2 +9,0 @@\n-def old_func():\n-    return 0\n")
     context = _base_context(10, 11)
