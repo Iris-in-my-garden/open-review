@@ -1211,3 +1211,62 @@ def test_review_cache_key_includes_language_scope(tmp_path: Path):
         assert key(None) != key((".py",))
     finally:
         pipeline.close()
+
+
+def test_prompt_builder_clone_isolates_batch_state():
+    from openreview.review.prompt_builder import PromptBuilder
+
+    builder = PromptBuilder(max_patch_tokens=123, max_context_tokens=456)
+    builder.context_stats["used_contexts"] = 3
+    clone = builder.clone()
+
+    assert clone is not builder
+    assert clone.max_patch_tokens == 123
+    assert clone.max_context_tokens == 456
+    assert clone.context_stats["used_contexts"] == 0
+
+
+def test_single_shot_clone_isolates_prompt_and_validator():
+    from openreview.review.llm_client import MockLLMClient
+
+    reviewer = SingleShotReviewer(llm_client=MockLLMClient())
+    clone = reviewer.clone_for_batch()
+
+    assert clone is not None
+    assert clone.llm_client is reviewer.llm_client
+    assert clone.prompt_builder is not reviewer.prompt_builder
+    assert clone.validator is not reviewer.validator
+
+
+def test_pipeline_runs_batches_concurrently_when_configured(tmp_path: Path):
+    files = [
+        ChangedFile(
+            filename=f"src/file_{index}.py",
+            status="modified",
+            additions=1,
+            deletions=0,
+            changes=1,
+            patch=f"@@ -0,0 +1,1 @@\n+x = {index}\n",
+        )
+        for index in range(2)
+    ]
+    pipeline = ReviewPipeline(
+        mock_llm=True,
+        max_batch_tokens=1,
+        max_concurrent_batches=2,
+        verifier_enabled=False,
+    )
+    pipeline.gh_client = FakeGitHubClient(files=files)
+    pipeline.repo_mgr = FakeRepoManager(tmp_path)
+    pipeline.retriever = FakeRetriever()
+    try:
+        pipeline.run("https://github.com/org/repo/pull/1", tmp_path / "reports")
+
+        assert pipeline.last_state is not None
+        assert len(pipeline.last_state.batches) == 2
+        assert pipeline.last_result is not None
+        assert pipeline.last_result.metrics["llm_usage"]["calls"] == 2
+        assert pipeline.last_outcome is not None
+        assert pipeline.last_outcome.status == ReviewStatus.COMPLETED
+    finally:
+        pipeline.close()

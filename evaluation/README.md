@@ -205,6 +205,10 @@ uv run python -m evaluation.cli review \
 - Thinking 模型的单次调用可能超过 60s；默认请求超时已提高到 180s，必要时用
   `--llm-timeout 300`。超时的请求会按“已被 provider 接受”保守扣预算，因此
   smoke 时不要把 `--run-budget-tokens` 设得太紧。
+- 大 PR 可用 `--max-concurrent-batches 2-3` 并发跑 batch；并发共享同一份
+  PR 级预算，超过预算的 batch 会以 `BudgetExceeded` 降级。
+- 输入预算耗尽后 verifier 也会被跳过（finding 保留但未二次校验）；大 PR 的
+  `--run-budget-tokens` 要同时覆盖 review 和 verifier。
 
 没有设置 `--preflight-tokens` 时不要直接跑 `--split all`。
 

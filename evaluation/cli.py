@@ -415,6 +415,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         llm_reasoning_effort=args.reasoning_effort,
         llm_timeout=args.llm_timeout,
         llm_max_retries=args.llm_max_retries,
+        max_concurrent_batches=args.max_concurrent_batches,
         ablation=args.ablation,
         budget_calls=args.budget_calls,
         budget_tokens=args.run_budget_tokens,
@@ -714,6 +715,12 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=0,
         help="瞬时网络/超时/429/5xx 的重试次数（默认 0；生产建议 1-2）",
+    )
+    parser.add_argument(
+        "--max-concurrent-batches",
+        type=int,
+        default=1,
+        help="单个 PR 的 batch 并发数（1=串行；大 PR 建议 2-3）",
     )
 
 

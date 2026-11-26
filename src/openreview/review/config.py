@@ -81,6 +81,8 @@ class ReviewConfig:
     ablation: Optional[str] = None
     # none | ast | graph
     retrieval_mode: str = "graph"
+    # 单个 PR 的 batch 并发数；1 保持严格串行，2-3 用于大 PR 提速。
+    max_concurrent_batches: int = 1
 
     # 检索与证据增强
     index_cache_dir: Optional[str] = None
@@ -162,6 +164,8 @@ class ReviewConfig:
 
         if self.max_completion_tokens < 0:
             raise ValueError("max_completion_tokens must be >= 0")
+        if self.max_concurrent_batches < 1:
+            raise ValueError("max_concurrent_batches must be >= 1")
 
         object.__setattr__(
             self,

@@ -37,6 +37,7 @@ DeepSeek 只支持 `response_format={"type": "json_object"}`，因此
 | `max_patch_tokens` | 8,192 | 单文件 patch 软预算 |
 | `hard_patch_tokens` | 48,000 | 单个超大 hunk 熔断 |
 | `max_context_tokens` | 8,192 | P2–P6 共享上下文预算 |
+| `max_concurrent_batches` | 1 | 单 PR batch 并发数；CLI `--max-concurrent-batches`（1=串行，大 PR 用 2–3） |
 | `soft_prompt_tokens` | 10,000 | 单批目标 |
 | `hard_prompt_tokens` | 14,000 | 触发拆分的硬上限 |
 

@@ -148,6 +148,16 @@ class PromptBuilder:
         for key in self.context_stats:
             self.context_stats[key] = 0
 
+    def clone(self) -> "PromptBuilder":
+        """Return an independent builder for a concurrently reviewed batch."""
+        cloned = PromptBuilder(
+            system_prompt=self.system_prompt,
+            max_patch_tokens=self.max_patch_tokens,
+            max_context_tokens=self.max_context_tokens,
+        )
+        cloned.context_stats = {key: 0 for key in self.context_stats}
+        return cloned
+
     def build_system_prompt(self) -> str:
         return self.system_prompt + SECURITY_SYSTEM_SUFFIX
 

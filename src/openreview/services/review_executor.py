@@ -18,13 +18,16 @@ import json
 import logging
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from openreview.domain.models import PullRequestInfo, ReviewResult
 from openreview.domain.policies import merge_review_results
 from openreview.github.pr_url import parse_pr_url
+from openreview.repo.diff_parser import ParsedDiff
 from openreview.repo.local import (
     LocalReviewInput,
     WorktreePool,
@@ -35,6 +38,7 @@ from openreview.repo.local import (
 from openreview.repo.manager import RepoCommandError
 from openreview.retriever.base import supports_plan
 from openreview.retriever.code_context import (
+    CodeContext,
     cap_repeated_contexts,
     context_identity,
 )
@@ -89,6 +93,17 @@ _PROGRESS_STEPS = {
     "post_comments": 12,
     "finalize": 13,
 }
+
+
+@dataclass
+class _BatchTask:
+    index: int
+    total: int
+    batch: ParsedDiff
+    contexts: List[CodeContext]
+    aspects: List[str]
+    calls_per_batch: int
+    estimated_tokens: int
 
 
 class ReviewExecutor:
@@ -589,228 +604,25 @@ class ReviewExecutor:
         if prompt_builder is not None and hasattr(prompt_builder, "reset_context_stats"):
             prompt_builder.reset_context_stats()
 
-        batch_results: List[ReviewResult] = []
-        # 跨 batch 去重只影响 state/metrics/verifier 的“本次唯一上下文”，
-        # 不改变每个 batch 自己的 prompt：后一个 batch 仍然需要它自己的上下文。
-        seen_context_keys: set[tuple] = set()
-        # callee/dependency/impact 在同一 run 内可能被多个 batch 反复检索到；
-        # 保留前 MAX 次，避免共享 helper / benchmark 代码占满后续 batch 预算。
-        repeated_context_counts: Dict[tuple, int] = {}
         with self._timed(state, "retrieve_and_review"):
-            for index, batch in enumerate(batches, start=1):
+            tasks = self._prepare_batch_tasks(
+                state,
+                batches,
+                impact_contexts,
+                static_contexts,
+                prompt_builder,
+            )
+            if self._can_run_batches_concurrently(tasks):
                 self._log(
                     state,
                     "analyze",
-                    f"Running AI Code Reviewer "
-                    f"(batch {index}/{len(batches)}, {len(batch.files)} files)...",
+                    f"Running {len(tasks)} batch(es) with "
+                    f"{min(self.config.max_concurrent_batches, len(tasks))} "
+                    "concurrent worker(s)...",
                 )
-                retrieve_kwargs: Dict[str, Any] = {"base_path": state.base_path}
-                if supports_plan(self.retriever):
-                    retrieve_kwargs["plan"] = False
-                contexts = self.retriever.retrieve(
-                    state.local_repo_path, batch, **retrieve_kwargs
-                )
-                # HybridRetriever 的索引命中/构建耗时按批次累加，供评测分析。
-                retrieval_stats = getattr(self.retriever, "last_stats", None)
-                if retrieval_stats:
-                    for key, value in retrieval_stats.items():
-                        if isinstance(value, (int, float)):
-                            state.retrieval_stats[key] = (
-                                state.retrieval_stats.get(key, 0) + value
-                            )
-                contexts.extend(
-                    self.evidence_pipeline.extra_contexts(
-                        batch,
-                        impact_contexts,
-                        static_contexts,
-                        include_global_impact=index == 1,
-                    )
-                )
-                if prompt_builder is not None and hasattr(
-                    prompt_builder, "visible_patch_old_lines"
-                ):
-                    contexts, redundant = filter_redundant_base_contexts(
-                        contexts,
-                        batch,
-                        visible_old_lines_by_file=(
-                            prompt_builder.visible_patch_old_lines(batch)
-                        ),
-                    )
-                    if redundant:
-                        state.context_stats["redundant_base_contexts"] = (
-                            state.context_stats.get(
-                                "redundant_base_contexts", 0
-                            )
-                            + len(redundant)
-                        )
-                        state.context_stats["redundant_base_context_tokens"] = (
-                            state.context_stats.get(
-                                "redundant_base_context_tokens", 0
-                            )
-                            + sum(
-                                estimate_tokens(context.snippet)
-                                for context in redundant
-                            )
-                        )
-                before_cap = len(contexts)
-                contexts = cap_repeated_contexts(contexts, repeated_context_counts)
-                capped = before_cap - len(contexts)
-                if capped:
-                    state.retrieval_stats["contexts_repeated_capped"] = (
-                        int(state.retrieval_stats.get("contexts_repeated_capped", 0))
-                        + capped
-                    )
-                contexts = plan_contexts(
-                    contexts,
-                    self.config.max_context_tokens,
-                    stats=state.retrieval_stats,
-                )
-                # 统一规划后回填兼容 metrics：retriever 在 plan=False 时只报
-                # 候选/去重，最终预算淘汰和选中数在这里按批累加。
-                state.retrieval_stats["contexts_truncated"] = int(
-                    state.retrieval_stats.get("contexts_omitted_by_priority", 0)
-                )
-                state.retrieval_stats["contexts_selected"] = (
-                    int(state.retrieval_stats.get("contexts_selected", 0))
-                    + len(contexts)
-                )
-                state.context_stats["batch_context_occurrences"] = (
-                    state.context_stats.get("batch_context_occurrences", 0)
-                    + len(contexts)
-                )
-                unique_contexts = [
-                    context
-                    for context in contexts
-                    if context_identity(context) not in seen_context_keys
-                ]
-                for context in unique_contexts:
-                    seen_context_keys.add(context_identity(context))
-                state.context_stats["cross_batch_duplicate_contexts"] = (
-                    state.context_stats.get(
-                        "cross_batch_duplicate_contexts", 0
-                    )
-                    + len(contexts)
-                    - len(unique_contexts)
-                )
-                state.all_contexts.extend(unique_contexts)
-
-                estimated_tokens = sum(
-                    estimate_tokens(context.snippet) for context in contexts
-                ) + sum(estimate_tokens(file.patch or "") for file in batch.files)
-                aspects = state.selected_aspects or list(ALL_ASPECTS)
-                calls_per_batch = self._reviewer_call_count(aspects)
-                # 先用“剩余调用数”收窄维度，再检查 token / 时间预算。
-                # 自定义 reviewer 可以只跑部分维度；单遍模式无法拆分，只能整批跳过。
-                remaining_calls = state.budget.remaining_calls()
-                if (
-                    remaining_calls is not None
-                    and remaining_calls < calls_per_batch
-                ):
-                    if remaining_calls <= 0:
-                        state.budget_exhausted = True
-                        state.degrade(
-                            "[budget] LLM 调用预算已用尽，"
-                            f"批次 {index}/{len(batches)} 起未执行审查。"
-                        )
-                        logger.warning(
-                            "LLM call budget exhausted before batch %d/%d",
-                            index,
-                            len(batches),
-                        )
-                        break
-                    if not self._can_narrow_aspects():
-                        state.budget_exhausted = True
-                        state.degrade(
-                            "[budget] 剩余调用数不足，单遍审查无法拆分维度，"
-                            f"批次 {index}/{len(batches)} 起未执行审查。"
-                        )
-                        logger.warning(
-                            "LLM call budget too small for single-pass batch %d/%d",
-                            index,
-                            len(batches),
-                        )
-                        break
-                    aspects = self._narrow_aspects(aspects, remaining_calls)
-                    state.selected_aspects = list(aspects)
-                    calls_per_batch = self._reviewer_call_count(aspects)
-                    state.add_note(
-                        f"[budget] 剩余调用数不足，仅运行 {len(aspects)} 个维度："
-                        + ", ".join(aspects)
-                    )
-
-                # 先按调用数 + 保守 token 下界做快速检查；真正的 token
-                # 扣减由 BudgetedLLMClient 在每次调用前精确执行。
-                preflight_tokens = estimated_tokens * max(1, calls_per_batch) + 2000
-                if not state.budget.allow(
-                    calls=calls_per_batch, tokens=preflight_tokens
-                ):
-                    state.budget_exhausted = True
-                    state.degrade(
-                        "[budget] LLM 调用或 token 预算不足，"
-                        f"批次 {index}/{len(batches)} 起未执行审查。"
-                    )
-                    logger.warning(
-                        "Budget exhausted before batch %d/%d", index, len(batches)
-                    )
-                    break
-
-                calls_before = state.budget.used_llm_calls
-                try:
-                    result = self.reviewer.review(
-                        pr_info=state.pr_info,
-                        parsed_diff=batch,
-                        contexts=contexts,
-                        repo_path=state.local_repo_path,
-                        aspects=aspects,
-                    )
-                except BudgetExceeded:
-                    state.budget_exhausted = True
-                    state.degrade(
-                        "[budget] LLM 预算在批次 "
-                        f"{index}/{len(batches)} 内耗尽，后续批次未执行。"
-                    )
-                    logger.warning(
-                        "Budget exhausted during batch %d/%d", index, len(batches)
-                    )
-                    break
-                except Exception as exc:  # noqa: BLE001 - 单批失败不应丢掉已完成的批次
-                    state.failed_batches += 1
-                    state.record_error(
-                        "analyze.batch", exc, batch=index, degrade=False
-                    )
-                    state.degrade(
-                        f"[error] 批次 {index}/{len(batches)} 审查失败"
-                        f"（{type(exc).__name__}），已跳过。"
-                    )
-                    logger.warning(
-                        "Batch %d/%d review failed: %s", index, len(batches), exc
-                    )
-                    continue
-                # 真实客户端由 BudgetedLLMClient 扣账；FakeReviewer / 自定义
-                # reviewer 绕过客户端时，这里补一次，保证预算语义一致。
-                # 注意：LLM cache hit 也不会增加 used_llm_calls，但它本来就
-                # 不应该消耗预算；因此只有 reviewer 不依赖预算客户端时才补账。
-                reviewer_client = getattr(self.reviewer, "llm_client", None)
-                reviewer_has_budget = bool(
-                    getattr(reviewer_client, "has_budget", False)
-                )
-                if (
-                    state.budget.used_llm_calls == calls_before
-                    and not reviewer_has_budget
-                ):
-                    state.budget.consume(
-                        calls=calls_per_batch, tokens=estimated_tokens
-                    )
-                batch_results.append(result)
-
-                # 多批次时累加 validator 计数；只保留最后一批会低估失败模式。
-                validator = getattr(self.reviewer, "validator", None)
-                stats = getattr(validator, "last_stats", None)
-                if stats:
-                    for key, value in stats.items():
-                        state.validation_stats[key] = (
-                            state.validation_stats.get(key, 0) + int(value)
-                        )
+                batch_results = self._run_batch_tasks_concurrent(state, tasks)
+            else:
+                batch_results = self._run_batch_tasks_sequential(state, tasks)
 
         prompt_context_stats = self._collect_prompt_context_stats(state)
         state.batch_results = batch_results
@@ -874,6 +686,386 @@ class ReviewExecutor:
             review_result.review_notes.append(note)
             state.add_note(f"[filter] {note}")
         state.review_result = review_result
+
+    # ------------------------------------------------------------------
+    # batch preparation / execution
+    # ------------------------------------------------------------------
+    def _prepare_batch_tasks(
+        self,
+        state: ReviewState,
+        batches: List[ParsedDiff],
+        impact_contexts: List[CodeContext],
+        static_contexts: List[CodeContext],
+        prompt_builder,
+    ) -> List[_BatchTask]:
+        """Retrieve and plan contexts sequentially, then return review tasks.
+
+        Retrieval mutates shared run state (context stats, dedupe counters), so
+        it stays single-threaded. Only the LLM calls are parallelized later.
+        """
+        tasks: List[_BatchTask] = []
+        seen_context_keys: set[tuple] = set()
+        repeated_context_counts: Dict[tuple, int] = {}
+
+        for index, batch in enumerate(batches, start=1):
+            self._log(
+                state,
+                "analyze",
+                f"Preparing AI Code Reviewer context "
+                f"(batch {index}/{len(batches)}, {len(batch.files)} files)...",
+            )
+            retrieve_kwargs: Dict[str, Any] = {"base_path": state.base_path}
+            if supports_plan(self.retriever):
+                retrieve_kwargs["plan"] = False
+            contexts = self.retriever.retrieve(
+                state.local_repo_path, batch, **retrieve_kwargs
+            )
+            retrieval_stats = getattr(self.retriever, "last_stats", None)
+            if retrieval_stats:
+                for key, value in retrieval_stats.items():
+                    if isinstance(value, (int, float)):
+                        state.retrieval_stats[key] = (
+                            state.retrieval_stats.get(key, 0) + value
+                        )
+            contexts.extend(
+                self.evidence_pipeline.extra_contexts(
+                    batch,
+                    impact_contexts,
+                    static_contexts,
+                    include_global_impact=index == 1,
+                )
+            )
+            if prompt_builder is not None and hasattr(
+                prompt_builder, "visible_patch_old_lines"
+            ):
+                contexts, redundant = filter_redundant_base_contexts(
+                    contexts,
+                    batch,
+                    visible_old_lines_by_file=(
+                        prompt_builder.visible_patch_old_lines(batch)
+                    ),
+                )
+                if redundant:
+                    state.context_stats["redundant_base_contexts"] = (
+                        state.context_stats.get("redundant_base_contexts", 0)
+                        + len(redundant)
+                    )
+                    state.context_stats["redundant_base_context_tokens"] = (
+                        state.context_stats.get(
+                            "redundant_base_context_tokens", 0
+                        )
+                        + sum(
+                            estimate_tokens(context.snippet)
+                            for context in redundant
+                        )
+                    )
+            before_cap = len(contexts)
+            contexts = cap_repeated_contexts(contexts, repeated_context_counts)
+            capped = before_cap - len(contexts)
+            if capped:
+                state.retrieval_stats["contexts_repeated_capped"] = (
+                    int(state.retrieval_stats.get("contexts_repeated_capped", 0))
+                    + capped
+                )
+            contexts = plan_contexts(
+                contexts,
+                self.config.max_context_tokens,
+                stats=state.retrieval_stats,
+            )
+            state.retrieval_stats["contexts_truncated"] = int(
+                state.retrieval_stats.get("contexts_omitted_by_priority", 0)
+            )
+            state.retrieval_stats["contexts_selected"] = (
+                int(state.retrieval_stats.get("contexts_selected", 0))
+                + len(contexts)
+            )
+            state.context_stats["batch_context_occurrences"] = (
+                state.context_stats.get("batch_context_occurrences", 0)
+                + len(contexts)
+            )
+            unique_contexts = [
+                context
+                for context in contexts
+                if context_identity(context) not in seen_context_keys
+            ]
+            for context in unique_contexts:
+                seen_context_keys.add(context_identity(context))
+            state.context_stats["cross_batch_duplicate_contexts"] = (
+                state.context_stats.get("cross_batch_duplicate_contexts", 0)
+                + len(contexts)
+                - len(unique_contexts)
+            )
+            state.all_contexts.extend(unique_contexts)
+
+            estimated_tokens = sum(
+                estimate_tokens(context.snippet) for context in contexts
+            ) + sum(estimate_tokens(file.patch or "") for file in batch.files)
+            aspects = state.selected_aspects or list(ALL_ASPECTS)
+            calls_per_batch = self._reviewer_call_count(aspects)
+            remaining_calls = state.budget.remaining_calls()
+            if (
+                remaining_calls is not None
+                and remaining_calls < calls_per_batch
+            ):
+                if remaining_calls <= 0:
+                    state.budget_exhausted = True
+                    state.degrade(
+                        "[budget] LLM 调用预算已用尽，"
+                        f"批次 {index}/{len(batches)} 起未执行审查。"
+                    )
+                    logger.warning(
+                        "LLM call budget exhausted before batch %d/%d",
+                        index,
+                        len(batches),
+                    )
+                    break
+                if not self._can_narrow_aspects():
+                    state.budget_exhausted = True
+                    state.degrade(
+                        "[budget] 剩余调用数不足，单遍审查无法拆分维度，"
+                        f"批次 {index}/{len(batches)} 起未执行审查。"
+                    )
+                    logger.warning(
+                        "LLM call budget too small for single-pass batch %d/%d",
+                        index,
+                        len(batches),
+                    )
+                    break
+                aspects = self._narrow_aspects(aspects, remaining_calls)
+                state.selected_aspects = list(aspects)
+                calls_per_batch = self._reviewer_call_count(aspects)
+                state.add_note(
+                    f"[budget] 剩余调用数不足，仅运行 {len(aspects)} 个维度："
+                    + ", ".join(aspects)
+                )
+
+            preflight_tokens = estimated_tokens * max(1, calls_per_batch) + 2000
+            if not state.budget.allow(
+                calls=calls_per_batch, tokens=preflight_tokens
+            ):
+                state.budget_exhausted = True
+                state.degrade(
+                    "[budget] LLM 调用或 token 预算不足，"
+                    f"批次 {index}/{len(batches)} 起未执行审查。"
+                )
+                logger.warning(
+                    "Budget exhausted before batch %d/%d", index, len(batches)
+                )
+                break
+
+            tasks.append(
+                _BatchTask(
+                    index=index,
+                    total=len(batches),
+                    batch=batch,
+                    contexts=contexts,
+                    aspects=list(aspects),
+                    calls_per_batch=calls_per_batch,
+                    estimated_tokens=estimated_tokens,
+                )
+            )
+        return tasks
+
+    def _can_run_batches_concurrently(self, tasks: Sequence[_BatchTask]) -> bool:
+        if (
+            self.config.max_concurrent_batches <= 1
+            or len(tasks) <= 1
+        ):
+            return False
+        clone = getattr(self.reviewer, "clone_for_batch", None)
+        if not callable(clone):
+            return False
+        # Concurrent batches share one budgeted client; custom reviewers that
+        # bypass budget accounting stay on the sequential path.
+        client = getattr(self.reviewer, "llm_client", None)
+        return bool(getattr(client, "has_budget", False))
+
+    def _run_batch_tasks_sequential(
+        self, state: ReviewState, tasks: Sequence[_BatchTask]
+    ) -> List[ReviewResult]:
+        results: List[ReviewResult] = []
+        for task in tasks:
+            remaining_calls = state.budget.remaining_calls()
+            if remaining_calls is not None and remaining_calls <= 0:
+                state.budget_exhausted = True
+                state.degrade(
+                    "[budget] LLM 调用预算已用尽，"
+                    f"批次 {task.index}/{task.total} 起未执行审查。"
+                )
+                break
+            if not state.budget.allow(
+                calls=task.calls_per_batch,
+                tokens=task.estimated_tokens * max(1, task.calls_per_batch) + 2000,
+            ):
+                state.budget_exhausted = True
+                state.degrade(
+                    "[budget] LLM 调用或 token 预算不足，"
+                    f"批次 {task.index}/{task.total} 起未执行审查。"
+                )
+                break
+            self._log(
+                state,
+                "analyze",
+                f"Running AI Code Reviewer "
+                f"(batch {task.index}/{task.total}, {len(task.batch.files)} files)...",
+            )
+            calls_before = state.budget.used_llm_calls
+            try:
+                result = self.reviewer.review(
+                    pr_info=state.pr_info,
+                    parsed_diff=task.batch,
+                    contexts=task.contexts,
+                    repo_path=state.local_repo_path,
+                    aspects=task.aspects,
+                )
+            except BudgetExceeded:
+                state.budget_exhausted = True
+                state.degrade(
+                    "[budget] LLM 预算在批次 "
+                    f"{task.index}/{task.total} 内耗尽，后续批次未执行。"
+                )
+                logger.warning(
+                    "Budget exhausted during batch %d/%d",
+                    task.index,
+                    task.total,
+                )
+                break
+            except Exception as exc:  # noqa: BLE001 - 单批失败不应丢掉已完成的批次
+                state.failed_batches += 1
+                state.record_error(
+                    "analyze.batch", exc, batch=task.index, degrade=False
+                )
+                state.degrade(
+                    f"[error] 批次 {task.index}/{task.total} 审查失败"
+                    f"（{type(exc).__name__}），已跳过。"
+                )
+                logger.warning(
+                    "Batch %d/%d review failed: %s",
+                    task.index,
+                    task.total,
+                    exc,
+                )
+                continue
+            reviewer_client = getattr(self.reviewer, "llm_client", None)
+            reviewer_has_budget = bool(
+                getattr(reviewer_client, "has_budget", False)
+            )
+            if (
+                state.budget.used_llm_calls == calls_before
+                and not reviewer_has_budget
+            ):
+                state.budget.consume(
+                    calls=task.calls_per_batch, tokens=task.estimated_tokens
+                )
+            results.append(result)
+            self._merge_validator_stats(
+                state, getattr(self.reviewer, "validator", None)
+            )
+        return results
+
+    def _run_batch_tasks_concurrent(
+        self, state: ReviewState, tasks: Sequence[_BatchTask]
+    ) -> List[ReviewResult]:
+        clones = [
+            self.reviewer.clone_for_batch()
+            for _ in tasks
+        ]
+        if any(clone is None for clone in clones):
+            return self._run_batch_tasks_sequential(state, tasks)
+
+        results: List[ReviewResult] = []
+        workers = min(self.config.max_concurrent_batches, len(tasks))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(
+                    self._review_one_batch,
+                    clone,
+                    state.pr_info,
+                    state.local_repo_path,
+                    task,
+                )
+                for clone, task in zip(clones, tasks, strict=True)
+            ]
+            for task, future in zip(tasks, futures, strict=True):
+                try:
+                    result, validator_stats, prompt_stats = future.result()
+                except BudgetExceeded:
+                    state.budget_exhausted = True
+                    state.degrade(
+                        "[budget] LLM 预算在批次 "
+                        f"{task.index}/{task.total} 内耗尽，后续批次未执行。"
+                    )
+                    logger.warning(
+                        "Budget exhausted during batch %d/%d",
+                        task.index,
+                        task.total,
+                    )
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    state.failed_batches += 1
+                    state.record_error(
+                        "analyze.batch", exc, batch=task.index, degrade=False
+                    )
+                    state.degrade(
+                        f"[error] 批次 {task.index}/{task.total} 审查失败"
+                        f"（{type(exc).__name__}），已跳过。"
+                    )
+                    logger.warning(
+                        "Batch %d/%d review failed: %s",
+                        task.index,
+                        task.total,
+                        exc,
+                    )
+                    continue
+                results.append(result)
+                for key, value in validator_stats.items():
+                    state.validation_stats[key] = (
+                        state.validation_stats.get(key, 0) + int(value)
+                    )
+                self._merge_prompt_stats(
+                    getattr(
+                        getattr(self.reviewer, "prompt_builder", None),
+                        "context_stats",
+                        None,
+                    ),
+                    prompt_stats,
+                )
+        return results
+
+    @staticmethod
+    def _review_one_batch(
+        reviewer, pr_info, repo_path, task: _BatchTask
+    ):
+        result = reviewer.review(
+            pr_info=pr_info,
+            parsed_diff=task.batch,
+            contexts=task.contexts,
+            repo_path=repo_path,
+            aspects=task.aspects,
+        )
+        validator = getattr(reviewer, "validator", None)
+        validator_stats = dict(getattr(validator, "last_stats", {}) or {})
+        builder = getattr(reviewer, "prompt_builder", None)
+        prompt_stats = dict(getattr(builder, "context_stats", {}) or {})
+        return result, validator_stats, prompt_stats
+
+    @staticmethod
+    def _merge_validator_stats(state: ReviewState, validator) -> None:
+        stats = getattr(validator, "last_stats", None)
+        if not stats:
+            return
+        for key, value in stats.items():
+            state.validation_stats[key] = (
+                state.validation_stats.get(key, 0) + int(value)
+            )
+
+    @staticmethod
+    def _merge_prompt_stats(target, source) -> None:
+        if not isinstance(target, dict) or not isinstance(source, dict):
+            return
+        for key, value in source.items():
+            if isinstance(value, (int, float)):
+                target[key] = int(target.get(key, 0)) + int(value)
 
     def _collect_prompt_context_stats(self, state: ReviewState) -> Dict[str, int]:
         """把 PromptBuilder 的上下文使用/省略统计并回本次 run。

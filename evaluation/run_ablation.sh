@@ -29,6 +29,7 @@ VERIFIER_THINKING=0
 REASONING_EFFORT=""
 LLM_TIMEOUT=""
 LLM_MAX_RETRIES=""
+MAX_CONCURRENT_BATCHES=""
 LEVELS="diff ast graph verifier"
 LIMIT=""
 PREFLIGHT_TOKENS=""
@@ -53,6 +54,7 @@ usage() {
   --reasoning-effort LEVEL   none | low | high | max（默认 high）
   --llm-timeout SECONDS      单次请求超时（默认 180；thinking 建议 180-300）
   --llm-max-retries N        瞬时错误重试次数（默认 0；建议 1-2）
+  --max-concurrent-batches N 单 PR batch 并发数（默认 1；大 PR 建议 2-3）
   --levels "diff ast ..."    要跑的档位（默认全部四档）
   --limit N                  每个 split 只跑前 N 条（smoke）
   --preflight-tokens N       split 级 token 预检；超限则在调用 LLM 前退出
@@ -92,6 +94,7 @@ while [[ $# -gt 0 ]]; do
     --reasoning-effort) require_value "$@"; REASONING_EFFORT="$2"; shift 2 ;;
     --llm-timeout) require_value "$@"; LLM_TIMEOUT="$2"; shift 2 ;;
     --llm-max-retries) require_value "$@"; LLM_MAX_RETRIES="$2"; shift 2 ;;
+    --max-concurrent-batches) require_value "$@"; MAX_CONCURRENT_BATCHES="$2"; shift 2 ;;
     --levels) require_value "$@"; LEVELS="$2"; shift 2 ;;
     --limit) require_value "$@"; LIMIT="$2"; shift 2 ;;
     --preflight-tokens) require_value "$@"; PREFLIGHT_TOKENS="$2"; shift 2 ;;
@@ -151,6 +154,7 @@ run_review() {
   if [[ -n "$REASONING_EFFORT" ]]; then cmd+=(--reasoning-effort "$REASONING_EFFORT"); fi
   if [[ -n "$LLM_TIMEOUT" ]]; then cmd+=(--llm-timeout "$LLM_TIMEOUT"); fi
   if [[ -n "$LLM_MAX_RETRIES" ]]; then cmd+=(--llm-max-retries "$LLM_MAX_RETRIES"); fi
+  if [[ -n "$MAX_CONCURRENT_BATCHES" ]]; then cmd+=(--max-concurrent-batches "$MAX_CONCURRENT_BATCHES"); fi
   if [[ -n "$LIMIT" ]]; then cmd+=(--limit "$LIMIT"); fi
   if [[ -n "$PREFLIGHT_TOKENS" ]]; then cmd+=(--preflight-tokens "$PREFLIGHT_TOKENS"); fi
   if [[ -n "$RUN_BUDGET_TOKENS" ]]; then cmd+=(--run-budget-tokens "$RUN_BUDGET_TOKENS"); fi
@@ -181,6 +185,7 @@ is_reusable_level() {
   if [[ -n "$REASONING_EFFORT" ]]; then cmd+=(--reasoning-effort "$REASONING_EFFORT"); fi
   if [[ -n "$LLM_TIMEOUT" ]]; then cmd+=(--llm-timeout "$LLM_TIMEOUT"); fi
   if [[ -n "$LLM_MAX_RETRIES" ]]; then cmd+=(--llm-max-retries "$LLM_MAX_RETRIES"); fi
+  if [[ -n "$MAX_CONCURRENT_BATCHES" ]]; then cmd+=(--max-concurrent-batches "$MAX_CONCURRENT_BATCHES"); fi
   "${cmd[@]}"
 }
 

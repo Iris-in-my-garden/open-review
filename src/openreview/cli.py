@@ -94,6 +94,14 @@ def review(
             "0 removes this cap, but the internal prompt budget still applies"
         ),
     ),
+    max_concurrent_batches: int = typer.Option(
+        1,
+        "--max-concurrent-batches",
+        help=(
+            "Concurrent review batches per PR (1 = serial). Large PRs speed up "
+            "with 2-3; provider rate limits still apply."
+        ),
+    ),
     ablation: Optional[str] = typer.Option(
         None,
         "--ablation",
@@ -228,6 +236,7 @@ def review(
             llm_reasoning_effort=reasoning_effort,
             mock_llm=mock_llm,
             max_batch_tokens=max_batch_tokens,
+            max_concurrent_batches=max_concurrent_batches,
             ablation=ablation,
             budget_calls=budget_calls,
             budget_tokens=budget_tokens,

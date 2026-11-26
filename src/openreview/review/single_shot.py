@@ -87,6 +87,24 @@ class SingleShotReviewer:
         self.validator = validator or FindingValidator()
         self.debug_sink = debug_sink
 
+    def clone_for_batch(self) -> Optional["SingleShotReviewer"]:
+        """Create a reviewer with independent prompt/validator state.
+
+        Batch review is CPU-light but LLM-heavy; concurrent batches must not
+        share ``PromptBuilder._patch_plan`` or ``FindingValidator.last_stats``.
+        The LLM client is shared intentionally (usage/call log are locked).
+        """
+        clone_builder = getattr(self.prompt_builder, "clone", None)
+        if not callable(clone_builder):
+            return None
+        return SingleShotReviewer(
+            prompt_builder=clone_builder(),
+            llm_client=self.llm_client,
+            output_parser=self.output_parser,
+            validator=FindingValidator(debug_sink=self.debug_sink),
+            debug_sink=self.debug_sink,
+        )
+
     def review(
         self,
         pr_info: PullRequestInfo,
