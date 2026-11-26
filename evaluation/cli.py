@@ -78,6 +78,33 @@ def _resolve_run_dir(root: Path, version: str, run_id: str) -> Path:
     return root / version / run_id
 
 
+def _ensure_split_has_instances(
+    manifest: dict, split: str, instances: list[dict]
+) -> None:
+    """Fail fast when a split is empty instead of silently running zero PRs.
+
+    ``--split test`` is still accepted for old manifests, but v3 no longer has a
+    test split.  Without this guard ``review --split test`` would "succeed" and
+    write empty metrics that look like a broken run.
+    """
+    if instances:
+        return
+    counts = manifest.get("counts", {})
+    available = [
+        name
+        for name in ("dev", "test", "holdout")
+        if name in counts
+        or any(item["split"] == name for item in manifest["instances"])
+    ]
+    detail = (
+        ", ".join(f"{name}={counts.get(name, 0)}" for name in available) or "无"
+    )
+    raise ManifestError(
+        f"split '{split}' 在 {manifest.get('version')} 中没有实例；"
+        f"可用 split: {detail}"
+    )
+
+
 def _load_dataset(args: argparse.Namespace):
     manifest = load_manifest(args.manifest)
     source = ensure_source(
@@ -85,6 +112,7 @@ def _load_dataset(args: argparse.Namespace):
     )
     records = load_records(source)
     instances = instances_for_split(manifest, records, args.split)
+    _ensure_split_has_instances(manifest, args.split, instances)
     if args.limit is not None:
         instances = instances[: args.limit]
     return manifest, instances
@@ -98,6 +126,7 @@ def _load_manifest_instances(args: argparse.Namespace):
         for item in manifest["instances"]
         if args.split == "all" or item["split"] == args.split
     ]
+    _ensure_split_has_instances(manifest, args.split, instances)
     if args.limit is not None:
         instances = instances[: args.limit]
     return manifest, instances
