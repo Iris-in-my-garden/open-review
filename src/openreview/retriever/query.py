@@ -171,7 +171,11 @@ class QueryBuilder:
             return []
         imports: List[str] = []
         for edge in index.imports_of(files):
-            for candidate in _module_variants_for(edge.dst_module):
+            if edge.src_file.endswith(".go"):
+                candidates = _go_module_variants(edge.dst_module)
+            else:
+                candidates = _module_variants_for(edge.dst_module)
+            for candidate in candidates:
                 if candidate and candidate not in imports:
                     imports.append(candidate)
         return imports[:MAX_QUERY_SYMBOLS]
@@ -208,6 +212,17 @@ class QueryBuilder:
                 ):
                     break
         return identifiers, strings
+
+
+def _go_module_variants(module: str) -> List[str]:
+    """Go import paths are slash-separated; keep the normalized path only.
+
+    Repo-internal imports are already normalized to a directory at index time
+    (``module/sub/pkg`` -> ``sub/pkg``), so no suffix expansion is needed.
+    External paths simply won't match any ``files.module``.
+    """
+    cleaned = module.strip().strip("/")
+    return [cleaned] if cleaned and cleaned != "." else ["."]
 
 
 def _module_variants_for(module: str) -> List[str]:

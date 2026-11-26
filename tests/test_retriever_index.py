@@ -797,7 +797,35 @@ def test_go_index_extracts_imports_and_qualified_callers(tmp_path: Path):
         assert {(edge.callee_name, edge.line) for edge in method_calls} == {
             ("helper", 15)
         }
-        assert {edge.caller_symbol for edge in method_calls} == {"Do"}
+        assert {edge.caller_symbol for edge in method_calls} == {"Server.Do"}
+    finally:
+        index.close()
+
+
+def test_go_imports_normalize_module_path_for_dependency(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "go.mod").write_text("module example.com/demo\n\ngo 1.22\n")
+    (root / "lib").mkdir()
+    (root / "app").mkdir()
+    (root / "lib" / "lib.go").write_text(
+        "package lib\n\nfunc Helper() int { return 1 }\n"
+    )
+    (root / "app" / "app.go").write_text(
+        "package app\n\n"
+        'import l "example.com/demo/lib"\n\n'
+        "func Run() int { return l.Helper() }\n"
+    )
+    _init_repo(root)
+
+    index = RepoIndex.for_worktree(root, cache_dir=tmp_path / "idx")
+    try:
+        imports = index.imports_of(["app/app.go"])
+        assert [(edge.dst_module, edge.symbol) for edge in imports] == [
+            ("lib", "l")
+        ]
+        definitions = index.definitions_in_modules(["lib"], limit=5)
+        assert {item.name for item in definitions} == {"Helper"}
     finally:
         index.close()
 

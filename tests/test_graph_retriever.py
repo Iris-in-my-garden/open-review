@@ -623,3 +623,50 @@ def test_graph_skips_low_value_reference_paths(tmp_path: Path):
         )
     finally:
         index.close()
+
+
+def test_graph_retriever_finds_go_callers_callees_and_dependencies(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "go.mod").write_text("module example.com/demo\n\ngo 1.22\n")
+    (root / "lib").mkdir()
+    (root / "app").mkdir()
+    (root / "lib" / "lib.go").write_text(
+        "package lib\n\nfunc Helper() int { return 1 }\n"
+    )
+    (root / "app" / "app.go").write_text(
+        "package app\n\n"
+        'import "example.com/demo/lib"\n\n'
+        "func Run() int { return lib.Helper() }\n"
+    )
+    (root / "app" / "caller.go").write_text(
+        "package app\n\nfunc Use() int { return Run() }\n"
+    )
+    _init_repo(root)
+
+    query = RetrievalQuery(
+        symbols=["Run"],
+        files=["app/app.go"],
+        modules=["app"],
+        imports=["lib"],
+        terms=["Run"],
+        signature_changed_symbols=["Run"],
+    )
+    index = RepoIndex.for_worktree(root, cache_dir=tmp_path / "idx")
+    try:
+        stats: dict[str, float] = {}
+        contexts = GraphRetriever().retrieve(root, index, query, stats=stats)
+
+        by_kind = {}
+        for context in contexts:
+            by_kind.setdefault(context.kind, set()).add(
+                (context.file_path, context.symbol)
+            )
+        assert ("app/caller.go", "Use") in by_kind.get("caller", set())
+        assert ("lib/lib.go", "Helper") in by_kind.get("callee", set())
+        assert ("lib/lib.go", "Helper") in by_kind.get("dependency", set())
+        assert stats["graph_caller_hits"] >= 1
+        assert stats["graph_callee_hits"] >= 1
+        assert stats["index_dependency_hits"] >= 1
+    finally:
+        index.close()

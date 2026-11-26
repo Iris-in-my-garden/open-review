@@ -7,8 +7,8 @@
 3. ``graph``：Diff + AST + 代码图谱（callee qualifier / import dependency）。
 4. ``verifier``：在 graph 基础上增加后置防幻觉校验。
 
-除检索上下文和 verifier 外，其余证据增强（triage / impact / static）在消融
-模式下一律关闭，保证相邻两档只差一个变量。
+impact / static 在消融模式下一律关闭，避免与 graph 检索的跨文件证据重叠。
+triage 是确定性的规则前置过滤，不是本实验的消融维度，因此默认保持开启。
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ class AblationSpec:
     name: str
     retrieval_mode: str
     verifier_enabled: bool
-    triage_enabled: bool = False
+    triage_enabled: bool = True
     impact_enabled: bool = False
     static_analysis_enabled: bool = False
     label: str = ""

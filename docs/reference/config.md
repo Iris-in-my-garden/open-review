@@ -74,16 +74,17 @@ DeepSeek 只支持 `response_format={"type": "json_object"}`，因此
 
 ## 2. 消融档位
 
-`--ablation` 会覆盖检索、verifier、triage、impact、static：
+`--ablation` 会覆盖检索、verifier、impact、static；triage 作为规则前置过滤保持开启：
 
 | 档位 | retrieval | verifier | triage | impact | static |
 |---|---|---|---|---|---|
-| `diff` | `none` | ❌ | ❌ | ❌ | ❌ |
-| `ast` | `ast` | ❌ | ❌ | ❌ | ❌ |
-| `graph` | `graph` | ❌ | ❌ | ❌ | ❌ |
-| `verifier` | `graph` | ✅ | ❌ | ❌ | ❌ |
+| `diff` | `none` | ❌ | ✅ | ❌ | ❌ |
+| `ast` | `ast` | ❌ | ✅ | ❌ | ❌ |
+| `graph` | `graph` | ❌ | ✅ | ❌ | ❌ |
+| `verifier` | `graph` | ✅ | ✅ | ❌ | ❌ |
 
 `None` 表示生产默认：graph + triage + impact + verifier，static 关闭。
+triage 是确定性规则，成本为零，不作为消融维度；impact 与 graph 检索存在跨文件证据重叠，因此消融中关闭。
 
 ## 3. Cache key 组成
 

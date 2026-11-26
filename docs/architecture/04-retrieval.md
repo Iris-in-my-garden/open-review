@@ -171,5 +171,8 @@ CJK:         effective = non_cjk + cjk * 2.2；ceil(effective / 3)
 
 - 只覆盖 Python/Go；其他语言以 diff 为主。
 - Call graph 是候选证据，不保证类型正确。
+- Go 的 import 会按最近的 `go.mod` 归一化成仓库目录，alias 也会保留；但
+  caller/callee 仍受限于 receiver/interface 解析：只有包名可解析、同 package
+  或方法名在仓库内唯一时才注入，interface 动态派发不会强行解析。
 - 索引无法表达的关系（动态调用、反射、配置注入）可能漏检。
 - 语义检索未启用；历史 review 知识库是后续方向。

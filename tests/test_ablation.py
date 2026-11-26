@@ -27,8 +27,8 @@ def test_ablation_levels_only_change_one_variable(
 
     assert spec.retrieval_mode == retrieval_mode
     assert spec.verifier_enabled is verifier
-    # 其余证据增强在消融模式下固定关闭，保证相邻档位只差一个变量。
-    assert spec.triage_enabled is False
+    # triage 是规则前置过滤，不是消融维度；impact/static 关闭以隔离 graph。
+    assert spec.triage_enabled is True
     assert spec.impact_enabled is False
     assert spec.static_analysis_enabled is False
 
@@ -49,7 +49,7 @@ def test_ablation_overrides_conflicting_config_flags():
 
     assert config.ablation == "diff"
     assert config.retrieval_mode == "none"
-    assert config.triage_enabled is False
+    assert config.triage_enabled is True
     assert config.impact_enabled is False
     assert config.static_analysis_enabled is False
     assert config.verifier_enabled is False

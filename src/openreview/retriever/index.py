@@ -34,7 +34,7 @@ from openreview.retriever.pathing import is_source_file
 
 logger = logging.getLogger(__name__)
 
-INDEX_SCHEMA_VERSION = "3"
+INDEX_SCHEMA_VERSION = "4"
 MAX_INDEXED_FILE_SIZE = 500 * 1024
 MAX_INDEXED_FILES = 20000
 SUPPORTED_SUFFIXES = {".py", ".go"}
@@ -274,14 +274,64 @@ def git_blob_sha(data: bytes) -> str:
 
 
 def module_name(rel_path: str) -> str:
-    """把仓库相对路径转成可检索的模块名（Python 为主）。"""
+    """把仓库相对路径转成可检索的模块名。"""
     path = Path(rel_path)
     if path.suffix == ".py":
         parts = list(path.with_suffix("").parts)
         if parts and parts[-1] == "__init__":
             parts = parts[:-1]
         return ".".join(parts)
+    if path.suffix == ".go":
+        # Go 的“模块”是目录（package）；仓库根目录用 "." 表示。
+        return "/".join(path.parent.parts) or "."
     return "/".join(path.parent.parts)
+
+
+def _parse_go_module(gomod: Path) -> Optional[str]:
+    try:
+        text = gomod.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    match = re.search(r"(?m)^\s*module\s+([^\s#]+)", text)
+    return match.group(1).strip().strip('"') if match else None
+
+
+def _go_module_for(
+    repo_path: Path, rel_path: str, cache: Dict[str, Optional[str]]
+) -> Optional[str]:
+    """Nearest ``go.mod`` module path for a Go file (monorepo friendly)."""
+    repo_path = Path(repo_path).resolve()
+    current = (repo_path / rel_path).parent
+    checked: List[str] = []
+    while True:
+        key = str(current)
+        if key in cache:
+            module = cache[key]
+            break
+        checked.append(key)
+        gomod = current / "go.mod"
+        if gomod.is_file():
+            module = _parse_go_module(gomod)
+            break
+        if current == repo_path or current.parent == current:
+            module = None
+            break
+        current = current.parent
+    for item in checked:
+        cache[item] = module
+    return module
+
+
+def _normalize_go_import(dst_module: str, go_module: Optional[str]) -> str:
+    """Map ``module/sub/pkg`` to the repo-relative package directory."""
+    if not go_module:
+        return dst_module
+    if dst_module == go_module:
+        return "."
+    prefix = go_module + "/"
+    if dst_module.startswith(prefix):
+        return dst_module[len(prefix) :]
+    return dst_module
 
 
 @dataclass(frozen=True)
@@ -397,6 +447,7 @@ class RepoIndex:
         )
         self._conn.row_factory = sqlite3.Row
         self.last_stats: Dict[str, Any] = {}
+        self._go_module_cache: Dict[str, Optional[str]] = {}
         self._init_schema()
 
     @classmethod
@@ -856,6 +907,13 @@ class RepoIndex:
                 imports, calls = _python_imports_and_calls(tree, source)
             elif suffix == ".go":
                 imports, calls = _go_imports_and_calls(tree, source)
+                go_module = _go_module_for(
+                    repo_path, rel_path, self._go_module_cache
+                )
+                imports = [
+                    (_normalize_go_import(module, go_module), alias, line)
+                    for module, alias, line in imports
+                ]
 
         self._conn.executemany(
             """
@@ -1302,8 +1360,11 @@ def _go_imports_and_calls(
 
         node_type = node.type
         if node_type in _GO_DEFINITION_TYPES:
-            name = ast_utils.definition_name(node, source)
-            definitions.append(name or "")
+            # Include the receiver type for methods: `Server.Do` instead of `Do`.
+            name = ast_utils.definition_qualname(node, source)
+            if not name:
+                name = ast_utils.definition_name(node, source) or ""
+            definitions.append(name)
             stack.append((node, True))
             stack.extend(
                 (child, False) for child in reversed(node.children)
@@ -1315,11 +1376,19 @@ def _go_imports_and_calls(
             if path_node is not None:
                 raw = ast_utils.node_text(path_node, source).strip().strip('"')
                 if raw:
-                    imports.append((raw, "", node.start_point[0] + 1))
+                    alias_node = node.child_by_field_name("name")
+                    alias = (
+                        ast_utils.node_text(alias_node, source).strip()
+                        if alias_node is not None
+                        else ""
+                    )
+                    imports.append((raw, alias, node.start_point[0] + 1))
         elif node_type == "call_expression":
             fn = node.child_by_field_name("function")
             if fn is not None:
                 raw = ast_utils.node_text(fn, source).strip()
+                # Generic instantiation: `pkg.Func[T]()` -> `pkg.Func`.
+                raw = re.sub(r"\[[^\]]*\]$", "", raw).strip()
                 if raw:
                     caller = ".".join(name for name in definitions if name)
                     calls.append(

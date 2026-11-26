@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -104,8 +105,63 @@ def definition_name(node: Node, source: bytes) -> Optional[str]:
     return source[name_node.start_byte : name_node.end_byte].decode("utf-8", "ignore")
 
 
+def _go_type_identifier(node: Optional[Node], source: bytes) -> str:
+    """Return the base type name for a Go receiver/type node.
+
+    Handles ``*Server``, ``Server[T]``, and ``pkg.Server``. Generics and
+    pointers are erased because the call graph only needs the receiver type
+    name to disambiguate methods.
+    """
+    if node is None:
+        return ""
+    node_type = node.type
+    if node_type == "pointer_type":
+        for child in node.children:
+            if child.type != "*":
+                value = _go_type_identifier(child, source)
+                if value:
+                    return value
+        return ""
+    if node_type == "generic_type":
+        base = node.child_by_field_name("type")
+        if base is None:
+            for child in node.children:
+                if child.type in {"type_identifier", "qualified_type"}:
+                    base = child
+                    break
+        value = _go_type_identifier(base, source)
+        if value:
+            return value
+    if node_type == "qualified_type":
+        name = node.child_by_field_name("name")
+        if name is not None:
+            return node_text(name, source)
+    if node_type == "type_identifier":
+        return node_text(node, source)
+    text = node_text(node, source).strip()
+    text = re.sub(r"\[.*\]$", "", text).lstrip("*")
+    return text.split(".")[-1] if text else ""
+
+
+def go_receiver_type(node: Node, source: bytes) -> str:
+    """Extract the receiver type of a Go ``method_declaration``."""
+    receiver = node.child_by_field_name("receiver")
+    if receiver is None:
+        return ""
+    stack: List[Node] = [receiver]
+    while stack:
+        current = stack.pop()
+        if current.type == "parameter_declaration":
+            type_node = current.child_by_field_name("type")
+            value = _go_type_identifier(type_node, source)
+            if value:
+                return value
+        stack.extend(current.children)
+    return ""
+
+
 def definition_qualname(node: Node, source: bytes) -> str:
-    """构造 module 内的 qualname，例如 `Service.handle`。"""
+    """构造 module 内的 qualname，例如 `Service.handle` / `Server.Do`。"""
     parts: List[str] = []
     current: Optional[Node] = node
     while current is not None:
@@ -114,6 +170,10 @@ def definition_qualname(node: Node, source: bytes) -> str:
             if name:
                 parts.append(name)
         current = current.parent
+    if node.type == "method_declaration":
+        receiver = go_receiver_type(node, source)
+        if receiver:
+            parts.append(receiver)
     return ".".join(reversed(parts))
 
 

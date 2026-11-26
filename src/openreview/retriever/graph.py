@@ -14,7 +14,7 @@ Phase 1 的 ``HybridRetriever`` 已经能按符号名和 import 找上下文；�
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -45,6 +45,8 @@ MAX_PRIVATE_HELPER_LINES = 25
 class _FileImports:
     modules: frozenset[str]
     symbols: frozenset[str]
+    # Go: package name/alias -> imported module directories.
+    package_modules: Dict[str, frozenset[str]] = field(default_factory=dict)
 
 
 _EMPTY_IMPORTS = _FileImports(frozenset(), frozenset())
@@ -58,7 +60,7 @@ class GraphRetriever:
         max_callers: int = MAX_CALLER_CONTEXTS,
         max_callees: int = MAX_CALLEE_CONTEXTS,
         max_dependencies: int = MAX_DEPENDENCY_CONTEXTS,
-        python_calls_only: bool = True,
+        python_calls_only: bool = False,
         line_cache: Optional[FileLineCache] = None,
     ):
         self.max_callers = max(0, max_callers)
@@ -85,10 +87,17 @@ class GraphRetriever:
             stats.setdefault(key, 0)
 
         contexts: List[CodeContext] = []
+        name_cache: Dict[str, List] = {}
         if query.symbols:
             contexts.extend(
                 self._collect(
-                    "caller", self._caller_contexts, repo_path, index, query, stats
+                    "caller",
+                    self._caller_contexts,
+                    repo_path,
+                    index,
+                    query,
+                    stats,
+                    name_cache,
                 )
             )
             contexts.extend(
@@ -116,15 +125,13 @@ class GraphRetriever:
     def _collect(
         label: str,
         collector,
-        repo_path: Path,
-        index: RepoIndex,
-        query: RetrievalQuery,
-        stats: Dict[str, float],
+        *args,
     ) -> List[CodeContext]:
         """单项图检索失败时只记录错误，不影响其他类型上下文。"""
         try:
-            return collector(repo_path, index, query, stats)
+            return collector(*args)
         except Exception as exc:  # noqa: BLE001 - 图检索是增强，失败不能阻断 review
+            stats = args[3] if len(args) > 3 else {}
             stats["graph_error"] = float(stats.get("graph_error", 0)) + 1
             logger.warning("%s graph retrieval failed: %s", label, exc)
             return []
@@ -138,6 +145,7 @@ class GraphRetriever:
         index: RepoIndex,
         query: RetrievalQuery,
         stats: Dict[str, float],
+        name_cache: Optional[Dict[str, List]] = None,
     ) -> List[CodeContext]:
         if self.max_callers <= 0:
             return []
@@ -151,10 +159,19 @@ class GraphRetriever:
         # 同一个调用方的多个调用点只注入一次：以“文件 + 调用方符号”去重，
         # 而不是按行号范围，否则同一个函数里的 3 次调用会占 3 份预算。
         seen: set[tuple[str, str]] = set()
-        for edge in index.callers_of(
+        edges = index.callers_of(
             targets, limit=max(self.max_callers * 8, 32)
-        ):
-            if self.python_calls_only and not edge.caller_file.endswith(".py"):
+        )
+        imports_by_file = self._imports_for_files(
+            index, [edge.caller_file for edge in edges]
+        )
+        for edge in edges:
+            if edge.caller_file.endswith(".go"):
+                if not self._accept_go_caller(
+                    edge, index, imports_by_file, name_cache if name_cache is not None else {}
+                ):
+                    continue
+            elif self.python_calls_only:
                 continue
             if DiffParser.is_low_value_reference_path(edge.caller_file):
                 continue
@@ -200,6 +217,55 @@ class GraphRetriever:
         return contexts
 
     @staticmethod
+    def _go_definitions(
+        index: RepoIndex, name: str, cache: Dict[str, List]
+    ) -> List:
+        if name in cache:
+            return cache[name]
+        definitions = [
+            item
+            for item in index.search_symbols([name], limit=32)
+            if item.file_path.endswith(".go")
+            and item.kind in {"function_declaration", "method_declaration"}
+        ]
+        cache[name] = definitions
+        return definitions
+
+    def _accept_go_caller(
+        self,
+        edge,
+        index: RepoIndex,
+        imports_by_file: Dict[str, "_FileImports"],
+        name_cache: Dict[str, List],
+    ) -> bool:
+        """Only inject Go call sites we can attribute with reasonable confidence.
+
+        Go has no type-checker here: a call like ``s.Do()`` exposes the receiver
+        variable, not its type. Accept package-qualified calls, same-package
+        calls, and receiver calls only when the method name is unambiguous in
+        the repository; everything else would create high-noise caller
+        contexts for names like ``Get``/``Do``/``String``.
+        """
+        if edge.caller_file.endswith("_test.go"):
+            return False
+        definitions = self._go_definitions(index, edge.callee_name, name_cache)
+        if not definitions:
+            return False
+        qualifier = (edge.callee_qualifier or "").strip()
+        if qualifier:
+            imported = imports_by_file.get(edge.caller_file, _EMPTY_IMPORTS)
+            target_modules = imported.package_modules.get(qualifier)
+            if target_modules:
+                # Require the callee definition to live in the imported package;
+                # this keeps `log.Error` or a same-named local symbol out.
+                return any(
+                    module_name(definition.file_path) in target_modules
+                    for definition in definitions
+                )
+        # Receiver/local-variable calls: only when the method name is unique.
+        return len(definitions) == 1
+
+    @staticmethod
     def _imports_for_files(
         index: RepoIndex, files: Sequence[str]
     ) -> Dict[str, "_FileImports"]:
@@ -218,14 +284,27 @@ class GraphRetriever:
 
         modules: Dict[str, set[str]] = {}
         symbols: Dict[str, set[str]] = {}
+        package_modules: Dict[str, Dict[str, set[str]]] = {}
         for item in edges:
             modules.setdefault(item.src_file, set()).add(item.dst_module)
             if item.symbol:
                 symbols.setdefault(item.src_file, set()).add(item.symbol)
+            if item.src_file.endswith(".go") and item.dst_module:
+                package = item.symbol or Path(item.dst_module).name
+                if package:
+                    package_modules.setdefault(item.src_file, {}).setdefault(
+                        package, set()
+                    ).add(item.dst_module)
         return {
             file: _FileImports(
                 frozenset(modules.get(file, ())),
                 frozenset(symbols.get(file, ())),
+                {
+                    package: frozenset(destinations)
+                    for package, destinations in package_modules.get(
+                        file, {}
+                    ).items()
+                },
             )
             for file in unique
         }
@@ -251,6 +330,13 @@ class GraphRetriever:
             score = float(getattr(definition, "score", 0.0) or 0.0)
             if definition.file_path == edge.caller_file:
                 score += 3.0
+            elif (
+                definition.file_path.endswith(".go")
+                and edge.caller_file.endswith(".go")
+                and Path(definition.file_path).parent
+                == Path(edge.caller_file).parent
+            ):
+                score += 2.5
             if module_name(definition.file_path) in imported.modules:
                 score += 2.0
             if definition.name in imported.symbols:
@@ -359,6 +445,14 @@ class GraphRetriever:
         """
         if definition.file_path == edge.caller_file:
             return True
+        # Go 的包边界就是目录：同目录不同文件仍属于同一个 package。
+        if (
+            definition.file_path.endswith(".go")
+            and edge.caller_file.endswith(".go")
+            and Path(definition.file_path).parent
+            == Path(edge.caller_file).parent
+        ):
+            return True
         if not imported.modules:
             return False
         target = module_name(definition.file_path)
@@ -411,6 +505,8 @@ class GraphRetriever:
             root = root.parent
         body = node.child_by_field_name("body")
         header_end = body.start_point[0] if body is not None else node.end_point[0] + 1
+        # Go 常见单行函数：body 与签名同在一行，此时至少保留签名这一行。
+        header_end = max(root.start_point[0] + 1, header_end)
         header = "\n".join(lines[root.start_point[0] : header_end])
 
         parts = [header]

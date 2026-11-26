@@ -72,14 +72,18 @@
 
 ## 3. 四档消融
 
-只保留四个可解释配置，相邻两档只差一个变量：
+只保留四个可解释配置，相邻两档只差 retrieval 或 verifier；triage 固定开启，
+impact/static 固定关闭：
 
-| 档位 | 检索 | Verifier | triage/impact/static |
-|---|---|---|---|
-| `diff` | 无 | 关 | 全关 |
-| `ast` | 单文件 AST | 关 | 全关 |
-| `graph` | AST + 代码图谱 | 关 | 全关 |
-| `verifier` | AST + 代码图谱 | 开 | 全关 |
+| 档位 | 检索 | Verifier | triage | impact/static |
+|---|---|---|---|---|
+| `diff` | 无 | 关 | 开 | 关 |
+| `ast` | 单文件 AST | 关 | 开 | 关 |
+| `graph` | AST + 代码图谱 | 关 | 开 | 关 |
+| `verifier` | AST + 代码图谱 | 开 | 开 | 关 |
+
+triage 是确定性的规则前置过滤，不属于本实验的消融维度；impact 与 graph
+检索都会注入跨文件证据，同时开启会污染 graph 的边际归因，因此消融中关闭。
 
 ```bash
 # 一键跑四档：review -> metrics -> gate -> 可选 semantic -> report
