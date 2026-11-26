@@ -5,6 +5,7 @@ import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Protocol, Type, TypeVar
+from urllib.parse import urlparse
 
 from openai import (
     APIConnectionError,
@@ -517,6 +518,11 @@ class LLMClient:
 
         self.model: str = resolve_model(model)
         self.base_url = resolve_base_url(self.model, base_url)
+        self.endpoint_host = (
+            urlparse(self.base_url).netloc
+            if self.base_url
+            else "api.openai.com"
+        )
         self.provider_is_deepseek = _is_deepseek_endpoint(
             self.model, self.base_url
         )
@@ -688,7 +694,10 @@ class LLMClient:
             error_type = type(exc).__name__
             if isinstance(exc, ProviderError):
                 raise
-            raise ProviderError(f"LLM provider request failed: {exc}") from exc
+            raise ProviderError(
+                "LLM provider request failed "
+                f"(model={self.model}, endpoint={self.endpoint_host}): {exc}"
+            ) from exc
         finally:
             elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
             with self._call_log_lock:

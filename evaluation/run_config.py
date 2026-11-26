@@ -28,6 +28,7 @@ def expected_run_config(
     verifier_thinking: bool = False,
     reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     llm_timeout: float = 180.0,
+    llm_max_retries: int = 0,
     mock_llm: bool = False,
 ) -> Dict[str, Any]:
     resolved_model = resolve_model(model)
@@ -49,6 +50,7 @@ def expected_run_config(
         "verifier_thinking": verifier_thinking,
         "reasoning_effort": reasoning_effort,
         "llm_timeout": float(llm_timeout),
+        "llm_max_retries": int(llm_max_retries),
         "base_url_sha256": hashlib.sha256(
             resolved_base_url.encode("utf-8")
         ).hexdigest(),

@@ -282,6 +282,7 @@ def cmd_check_run(args: argparse.Namespace) -> int:
         verifier_thinking=args.verifier_thinking,
         reasoning_effort=args.reasoning_effort,
         llm_timeout=args.llm_timeout,
+        llm_max_retries=args.llm_max_retries,
     )
     if has_reusable_results(
         instances,
@@ -401,6 +402,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         verifier_thinking=args.verifier_thinking,
         reasoning_effort=args.reasoning_effort,
         llm_timeout=args.llm_timeout,
+        llm_max_retries=args.llm_max_retries,
         mock_llm=args.mock_llm,
     )
     pipeline = ReviewPipeline(
@@ -412,6 +414,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         verifier_llm_thinking=args.verifier_thinking,
         llm_reasoning_effort=args.reasoning_effort,
         llm_timeout=args.llm_timeout,
+        llm_max_retries=args.llm_max_retries,
         ablation=args.ablation,
         budget_calls=args.budget_calls,
         budget_tokens=args.run_budget_tokens,
@@ -705,6 +708,12 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=180.0,
         help="单次 LLM 请求超时秒数（thinking 模型建议 >=180）",
+    )
+    parser.add_argument(
+        "--llm-max-retries",
+        type=int,
+        default=0,
+        help="瞬时网络/超时/429/5xx 的重试次数（默认 0；生产建议 1-2）",
     )
 
 
