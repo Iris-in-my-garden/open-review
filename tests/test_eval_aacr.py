@@ -64,20 +64,18 @@ def test_build_manifest_is_deterministic_and_stratified():
     assert first == second
     assert first["counts"] == {
         "total": 20,
-        "dev": 4,
-        "test": 12,
-        "holdout": 4,
+        "dev": 12,
+        "holdout": 8,
         "by_language": {"Go": 10, "Python": 10},
         "by_split_language": {
-            "dev": {"Go": 2, "Python": 2},
-            "test": {"Go": 6, "Python": 6},
-            "holdout": {"Go": 2, "Python": 2},
+            "dev": {"Go": 6, "Python": 6},
+            "holdout": {"Go": 4, "Python": 4},
         },
-        "repositories_by_split": {"dev": 2, "test": 6, "holdout": 2},
+        "repositories_by_split": {"dev": 6, "holdout": 4},
     }
     instances = first["instances"]
     assert len({item["instance_id"] for item in instances}) == 20
-    assert {item["split"] for item in instances} == {"dev", "test", "holdout"}
+    assert {item["split"] for item in instances} == {"dev", "holdout"}
     split_by_repo = {}
     for item in instances:
         split_by_repo.setdefault(item["repo"], item["split"])
@@ -126,12 +124,18 @@ def test_checked_in_v3_manifest_excludes_unavailable_pinned_instances():
     manifest = load_manifest(manifest_path)
 
     assert manifest["counts"]["total"] == 40
-    assert manifest["counts"]["dev"] == 7
-    assert manifest["counts"]["test"] == 23
-    assert manifest["counts"]["holdout"] == 10
+    assert manifest["counts"]["dev"] == 20
+    assert manifest["counts"]["holdout"] == 20
+    assert "test" not in manifest["counts"]
     assert manifest["counts"]["by_language"] == {"Go": 21, "Python": 19}
-    assert manifest["counts"]["by_split_language"]["test"]["Go"] == 12
-    assert manifest["counts"]["by_split_language"]["test"]["Python"] == 11
+    assert manifest["counts"]["by_split_language"]["dev"] == {
+        "Go": 10,
+        "Python": 10,
+    }
+    assert manifest["counts"]["by_split_language"]["holdout"] == {
+        "Go": 11,
+        "Python": 9,
+    }
     assert {
         item["instance_id"] for item in manifest["exclusions"]
     } == {
@@ -148,11 +152,11 @@ def test_manifest_roundtrip_and_split_lookup(tmp_path: Path):
 
     assert loaded == manifest
     dev = instances_for_split(loaded, _records(), "dev")
-    assert len(dev) == 4
+    assert len(dev) == 12
     assert all(item["comments"] for item in dev)
 
     holdout = instances_for_split(loaded, _records(), "holdout")
-    assert len(holdout) == 4
+    assert len(holdout) == 8
     assert {item["language"] for item in holdout} == {"Python", "Go"}
     assert {item["repo"] for item in dev}.isdisjoint(
         item["repo"] for item in holdout
@@ -167,7 +171,7 @@ def test_manifest_rejects_repository_leakage(tmp_path: Path):
         if item["split"] == "dev"
     )
     matching = [item for item in manifest["instances"] if item["repo"] == repo]
-    matching[-1]["split"] = "test"
+    matching[-1]["split"] = "holdout"
     path = write_manifest(manifest, tmp_path / "leaked.json")
 
     with pytest.raises(ManifestError, match="跨 split"):

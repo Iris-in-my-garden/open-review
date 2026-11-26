@@ -25,7 +25,7 @@ flowchart TD
 
 ## 评测状态
 
-评测工具支持从纯 Diff 到 AST、代码图谱和 Verifier 的固定对照（40 个 PR / 10 个仓库，按仓库互斥切分 dev/test/holdout）。**质量与成本评测尚未完成，空白不是 0，也不是结论。**指标定义、切分方法与复现步骤见[评测方法](docs/architecture/08-evaluation.md)。
+评测工具支持从纯 Diff 到 AST、代码图谱和 Verifier 的固定对照（40 个 PR / 10 个仓库，按仓库互斥切分 dev/holdout，各 20 个 PR）。**质量与成本评测尚未完成，空白不是 0，也不是结论。**指标定义、切分方法与复现步骤见[评测方法](docs/architecture/08-evaluation.md)。
 
 ## Quickstart
 
@@ -201,7 +201,7 @@ PR 标题、描述、代码注释都视为不可信数据：统一放入 `<untru
 - **检索缺口指标**：`prompt_context_coverage`、`retrieval_truncated_total`、`cross_batch_duplicates_total` 等，用于区分“召回失败”和“召回后被 cap / prompt 预算丢弃”；它们不是人工标注的 ground-truth recall，但能直接暴露检索链路的损耗位置
 - **可选语义指标**：复用 AACR-Bench 官方 LLM judge，计算文件级 Precision / Recall / Balanced
 
-数据使用 AACR-Bench Python/Go 子集的固定切分，同一仓库的 PR 不会跨 split；每种语言分别分配 dev、test、repo-level holdout 仓库。报告提供按语言/仓库分层的语义指标；单 run 不确定性使用仓库簇 bootstrap，多 run 对比使用语言分层的配对 PR bootstrap 95% 置信区间。README 只保留模板；真实结果跑完后由 `report` 子命令生成并替换。
+数据使用 AACR-Bench Python/Go 子集的固定切分，同一仓库的 PR 不会跨 split；每种语言分别分配 dev、repo-level holdout 仓库，整体约 5:5。报告提供按语言/仓库分层的语义指标；单 run 不确定性使用仓库簇 bootstrap，多 run 对比使用语言分层的配对 PR bootstrap 95% 置信区间。README 只保留模板；真实结果跑完后由 `report` 子命令生成并替换。
 
 确定性指标可以作为 CI 门禁，不消耗 token。评测运行的指标文件默认位于
 `evaluation/metrics/`（该目录不提交）；CI 使用仓库内的受控 fixture 验证门禁
@@ -305,7 +305,7 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 
 后续：
 - [x] AACR-Bench 固定切分、确定性指标与官方语义评测适配
-- [ ] 跑真实 dev/test，固化 precision / recall / token 用量 / 延迟 Results 表
+- [ ] 跑真实 dev/holdout，固化 precision / recall / token 用量 / 延迟 Results 表
 - [ ] 增量 review（只重跑变更文件，复用上次结果）
 - [ ] 多语言扩展（Java / TypeScript AST）
 - [x] 行内评论幂等（按 marker 替换上一轮 review，同一 PR 重跑不重复发评论）

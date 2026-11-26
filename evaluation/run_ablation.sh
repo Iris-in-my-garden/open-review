@@ -39,7 +39,7 @@ usage() {
   cat <<'EOF'
 用法: evaluation/run_ablation.sh [options]
 
-  --split SPLIT              dev | test | holdout | all（默认 dev）
+  --split SPLIT              dev | holdout | all（默认 dev；test 仅用于旧 manifest）
   --model MODEL              四档共用的模型名；不传则走 OPENAI_MODEL
   --levels "diff ast ..."    要跑的档位（默认全部四档）
   --limit N                  每个 split 只跑前 N 条（smoke）

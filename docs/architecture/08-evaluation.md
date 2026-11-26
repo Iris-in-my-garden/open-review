@@ -10,18 +10,24 @@
 
 | 项 | 值 |
 |---|---:|
-| PR 总数 | 43（21 Python + 22 Go） |
+| 原始 PR 总数 | 43（21 Python + 22 Go） |
+| 不可用 pinned head（已排除） | 3 |
+| manifest PR 总数 | 40（19 Python + 21 Go） |
 | 仓库数 | 10 |
-| dev / test / holdout | 7 / 26 / 10 PR |
-| 仓库覆盖 | 2 / 6 / 2 |
+| dev / holdout | 20 / 20 PR |
+| 仓库覆盖 | 6 / 4 |
+| 语言覆盖 | dev 10 Go + 10 Python；holdout 11 Go + 9 Python |
 | 原始数据 SHA256 | `02c8561f...2cb2097` |
 
 切分规则：
 
 - **按仓库互斥**：同一仓库的所有 PR 只属于一个 split，避免同仓库泄漏。
-- 每种语言都出现在每个 split。
-- dev/holdout 各选一个仓库，其余进 test；并列时用 `SHA256(seed + split + language + repo)` 稳定打破平局。
-- 每个 split 仓库数很少；某语言少于两个仓库簇时，报告省略该层 bootstrap 区间，而不是给零宽区间。
+- **两种语言都出现在两个 split**，并尽量让 PR 数接近 5:5。
+- 每种语言按仓库整体做子集和，选择 PR 数最接近该语言一半的仓库子集作为 holdout；
+  并列时优先仓库数更少（把更多仓库留给 dev），再按仓库名排序稳定打破平局。
+- 不再保留独立的 `test` split：dev 用于调参和四档迭代，holdout 只在配置冻结后跑一次。
+- 每个 split 仓库数很少（holdout 只有 4 个仓库簇）；某语言少于两个仓库簇时，
+  报告省略该层 bootstrap 区间，而不是给零宽区间。
 - **语言范围过滤**：评测按 manifest `language` 过滤 diff，只保留主语言源码
   （Go → `.go`；Python → `.py`/`.pyi`）。多语言仓库里的 C/C++/CUDA/TS
   vendored 代码不进入 Go/Python 评测队列；文件过滤器再单独跳过
@@ -124,8 +130,8 @@ uv run python -m evaluation.cli gate \
 | 项 | 状态 |
 |---|---|
 | 评测框架 | ✅ 已就绪 |
-| 固定样本 | ✅ 43 PR / 10 仓库 |
-| 仓库互斥切分 | ✅ 7 / 26 / 10 |
+| 固定样本 | ✅ 40 PR / 10 仓库（3 个不可用 head 已排除） |
+| 仓库互斥切分 | ✅ dev 20 / holdout 20 |
 | 确定性指标 | ✅ 已实现 |
 | CI gate | ✅ 已实现 |
 | 四档消融 | ✅ 已实现 |
@@ -162,7 +168,7 @@ uv run python -m evaluation.cli review --split dev --limit 1 \
 
 ## 7. 统计注意事项
 
-- 样本量小（43 PR），置信区间会很宽；必须按语言/仓库分层报告。
+- 样本量小（40 PR，holdout 20 PR / 4 仓库），置信区间会很宽；必须按语言/仓库分层报告。
 - 同一仓库的 PR 不独立；按仓库聚类做 bootstrap，而不是按 PR 独立采样。
 - 语义 judge 自身有偏差；应固定模型、温度、prompt，并报告 judge 版本。
 - 不要只报总分；同时报质量、覆盖、调用、token、延迟和失败率。
@@ -170,7 +176,7 @@ uv run python -m evaluation.cli review --split dev --limit 1 \
 
 ## 8. 后续优先项
 
-1. 在 dev/test 上跑完四档消融，发布分层结果与不确定性。
+1. 在 dev/holdout 上跑完四档消融，发布分层结果与不确定性。
 2. 校准 token 估算误差，补金额成本。
 3. 建立用户反馈闭环（评论 accept/dismiss），跟踪 precision。
 4. 扩展语言与符号关系，优先覆盖漏检案例。

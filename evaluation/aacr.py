@@ -4,8 +4,8 @@
 - 评测最怕“每次跑的数据不一样”。把 instance_id、base/head SHA、split 固化到
   仓库里，后续指标才能横向比较。
 - 原始数据体积大（1MB+），不适合每次评测重新下载；manifest 只存索引和元数据。
-- 切分使用 SHA256 排序而不是 ``random.shuffle``，不依赖 Python 版本的随机数
-  实现，任何人重跑都能得到同一批样本。
+- 切分使用确定性的仓库子集和，不依赖 Python 版本的随机数实现，任何人重跑都能
+  得到同一批样本。
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import re
 import urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 AACR_REPO_URL = "https://github.com/alibaba/aacr-bench"
 AACR_DATA_URL = (
@@ -28,7 +28,6 @@ AACR_DATA_SHA256 = (
 SUPPORTED_LANGUAGES = {"python": "Python", "go": "Go"}
 MANIFEST_VERSION = "aacr-pygo-v3"
 DEFAULT_SEED = 42
-_DEV_HOLDOUT_FRACTION = 0.2
 EXCLUDED_INSTANCES = {
     "comfyanonymous__ComfyUI@4936d01": (
         "Pinned PR head is no longer available from the repository or PR refs."
@@ -174,35 +173,68 @@ def supported_records(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]
     return result
 
 
-def _hash_key(seed: int, *parts: object) -> str:
-    payload = ":".join(str(part) for part in (seed, *parts))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+def _best_half_subset(
+    repos: Sequence[str],
+    sizes: Dict[str, int],
+) -> List[str]:
+    """Return the repo subset whose PR count is closest to half the total.
 
+    Whole repositories move together, so this is a subset-sum problem.  The
+    DP keeps, for every reachable PR count, the subset with the fewest repos
+    and then the smallest repo-index bitmask.  Both tie-breakers compose when
+    the same repository is added to two candidates, so keeping one winner per
+    sum is safe.
 
-def _closest_repo(
-    candidates: Sequence[str],
-    repo_sizes: Dict[str, int],
-    target_size: float,
-    *,
-    seed: int,
-    language: str,
-    split: str,
-) -> str:
-    ranked = [
-        (
-            abs(repo_sizes[repo] - target_size),
-            _hash_key(seed, split, language, repo),
-            repo,
-        )
-        for repo in candidates
+    Ties at the halfway point prefer fewer repositories: that keeps more
+    repositories in ``dev``, where tuning needs broader coverage.
+    """
+    ordered = sorted(repos)
+    total = sum(sizes[repo] for repo in ordered)
+    if len(ordered) < 2 or total <= 0:
+        raise ManifestError("每种语言至少需要 2 个非空仓库才能切分 dev/holdout")
+
+    # sum -> (repo_count, bitmask over ``ordered``)
+    best: Dict[int, Tuple[int, int]] = {0: (0, 0)}
+    for index, repo in enumerate(ordered):
+        size = sizes[repo]
+        if size <= 0:
+            continue
+        bit = 1 << index
+        for subtotal in sorted(best, reverse=True):
+            new_sum = subtotal + size
+            if new_sum >= total:
+                continue
+            count, mask = best[subtotal]
+            candidate = (count + 1, mask | bit)
+            current = best.get(new_sum)
+            if current is None or candidate < current:
+                best[new_sum] = candidate
+
+    target = total / 2
+    chosen_sum = min(
+        (value for value in best if value > 0),
+        key=lambda value: (
+            abs(value - target),
+            best[value][0],
+            best[value][1],
+        ),
+    )
+    mask = best[chosen_sum][1]
+    return [
+        repo for index, repo in enumerate(ordered) if mask & (1 << index)
     ]
-    return min(ranked)[2]
 
 
 def _assign_repo_splits(
     records: Sequence[Dict[str, Any]], *, seed: int
 ) -> Dict[str, str]:
-    """Assign every PR from a repository to the same language-stratified split."""
+    """Assign every PR from a repository to dev or holdout.
+
+    Splits are repo-disjoint and language-stratified.  Per language, the
+    repository subset closest to half of that language's PRs becomes holdout;
+    the rest becomes dev.  ``seed`` is recorded in the manifest for
+    reproducibility but the split itself is fully deterministic.
+    """
     by_language: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(
         lambda: defaultdict(list)
     )
@@ -210,43 +242,13 @@ def _assign_repo_splits(
         by_language[record["_language"]][record["_repo"]].append(record)
 
     split_by_id: Dict[str, str] = {}
-    for language, repos in sorted(by_language.items()):
-        target_size = (
-            sum(len(repo_records) for repo_records in repos.values())
-            * _DEV_HOLDOUT_FRACTION
-        )
-
-        candidates = sorted(repos)
-        if len(candidates) < 3:
-            raise ManifestError(
-                f"{language} 至少需要 3 个仓库才能构造 dev/test/holdout "
-                f"repo-level split，当前只有 {len(candidates)} 个"
-            )
-        repo_sizes = {repo: len(repo_records) for repo, repo_records in repos.items()}
-        dev_repo = _closest_repo(
-            candidates,
-            repo_sizes,
-            target_size,
-            seed=seed,
-            language=language,
-            split="dev",
-        )
-        holdout_repo = _closest_repo(
-            [repo for repo in candidates if repo != dev_repo],
-            repo_sizes,
-            target_size,
-            seed=seed,
-            language=language,
-            split="holdout",
-        )
+    for _language, repos in sorted(by_language.items()):
+        repo_sizes = {
+            repo: len(repo_records) for repo, repo_records in repos.items()
+        }
+        holdout_repos = set(_best_half_subset(sorted(repos), repo_sizes))
         for repo, repo_records in repos.items():
-            split = (
-                "dev"
-                if repo == dev_repo
-                else "holdout"
-                if repo == holdout_repo
-                else "test"
-            )
+            split = "holdout" if repo in holdout_repos else "dev"
             for record in repo_records:
                 split_by_id[record["_instance_id"]] = split
     return split_by_id
@@ -260,13 +262,18 @@ def build_manifest(
     source_sha256: Optional[str] = None,
     source_name: str = "AACR-Bench",
 ) -> Dict[str, Any]:
-    """Construct deterministic language-stratified splits without repo leakage.
+    """Construct deterministic language-stratified dev/holdout splits.
 
-    Per language, one repository closest to 20% of its PRs is assigned to dev,
-    another to holdout, and all remaining repositories to test. SHA256 tie
-    breaking makes the split stable across Python versions.
+    Unavailable pinned instances are removed before splitting, so they cannot
+    skew repository sizes.  Per language, the repository subset closest to
+    half of the remaining PRs becomes holdout; the rest becomes dev.  Whole
+    repositories stay in one split, so there is no repo-level leakage.
     """
-    supported = supported_records(records)
+    supported = [
+        record
+        for record in supported_records(records)
+        if record["_instance_id"] not in EXCLUDED_INSTANCES
+    ]
     if not supported:
         raise ManifestError("过滤后没有 Python/Go 记录")
 
@@ -274,8 +281,6 @@ def build_manifest(
 
     instances: List[Dict[str, Any]] = []
     for record in supported:
-        if record["_instance_id"] in EXCLUDED_INSTANCES:
-            continue
         split = split_by_id[record["_instance_id"]]
         instances.append(
             {
@@ -308,7 +313,9 @@ def build_manifest(
     by_language = Counter(item["language"] for item in instances)
     by_split_language: Dict[str, Dict[str, int]] = {}
     repo_counts: Dict[str, int] = {}
-    for split in ("dev", "test", "holdout"):
+    for split in ("dev", "holdout", "test"):
+        if not counts.get(split):
+            continue
         by_split_language[split] = dict(
             sorted(
                 Counter(
@@ -319,6 +326,17 @@ def build_manifest(
         repo_counts[split] = len(
             {item["repo"] for item in instances if item["split"] == split}
         )
+
+    count_payload: Dict[str, Any] = {
+        "total": len(instances),
+        "dev": counts.get("dev", 0),
+        "holdout": counts.get("holdout", 0),
+        "by_language": dict(sorted(by_language.items())),
+        "by_split_language": by_split_language,
+        "repositories_by_split": repo_counts,
+    }
+    if counts.get("test"):
+        count_payload["test"] = counts["test"]
 
     return {
         "version": version,
@@ -331,30 +349,24 @@ def build_manifest(
         "languages": sorted(SUPPORTED_LANGUAGES.values()),
         "seed": seed,
         "selection": {
-            "dev": "每种语言选 1 个 PR 数最接近该语言总量 20% 的仓库",
-            "holdout": "每种语言从剩余仓库中再选 1 个 PR 数最接近 20% 的仓库",
-            "test": "其余仓库中可获取的全部 PR",
+            "dev": "每种语言中未进入 holdout 的仓库",
+            "holdout": (
+                "每种语言选择 PR 数最接近一半的仓库子集；"
+                "并列时优先仓库数更少、仓库名排序更小"
+            ),
             "repository_disjoint": True,
         },
         "exclusions": [
             {"instance_id": instance_id, "reason": reason}
             for instance_id, reason in sorted(EXCLUDED_INSTANCES.items())
         ],
-        "counts": {
-            "total": len(instances),
-            "dev": counts.get("dev", 0),
-            "test": counts.get("test", 0),
-            "holdout": counts.get("holdout", 0),
-            "by_language": dict(sorted(by_language.items())),
-            "by_split_language": by_split_language,
-            "repositories_by_split": repo_counts,
-        },
+        "counts": count_payload,
         "instances": instances,
     }
 
 
 def _split_order(split: str) -> int:
-    return {"dev": 0, "test": 1, "holdout": 2}.get(split, 3)
+    return {"dev": 0, "holdout": 1, "test": 2}.get(split, 3)
 
 
 def _validate_manifest_instances(instances: Sequence[Dict[str, Any]]) -> None:
@@ -440,9 +452,12 @@ def instances_for_split(
 
 def manifest_summary(manifest: Dict[str, Any]) -> str:
     counts = manifest.get("counts", {})
+    parts = [
+        f"{split}={counts[split]}"
+        for split in ("dev", "holdout", "test")
+        if split in counts
+    ]
     return (
         f"{manifest.get('version')} | seed={manifest.get('seed')} | "
-        f"total={counts.get('total')} "
-        f"(dev={counts.get('dev')}, test={counts.get('test')}, "
-        f"holdout={counts.get('holdout')})"
+        f"total={counts.get('total')} ({', '.join(parts)})"
     )

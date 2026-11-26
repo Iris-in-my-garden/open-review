@@ -32,16 +32,15 @@
 
 `manifests/aacr_pygo_v3.json` 是提交到仓库的固定索引，包含每个实例的
 `instance_id / split / base_commit / head_commit / clone_url`。同一仓库的所有 PR
-只会落入一个 split。每种语言各选一个 dev 仓库，再从剩余仓库中选一个 holdout
-仓库；所选仓库的 PR 数尽量接近该语言样本总数的 20%，其余仓库全部用于 test。
-候选并列时使用 SHA256(seed + split + language + repo) 稳定打破平局，不依赖
-Python 版本的随机数实现：
+只会落入一个 split。每种语言按仓库整体做子集和，选 PR 数最接近该语言一半的仓库
+子集作为 holdout，其余仓库进入 dev；并列时优先仓库数更少（给 dev 留更多仓库），
+再按仓库名排序稳定打破平局，不依赖 Python 版本的随机数实现：
 
-- **dev**：Python、Go 各一个仓库
-- **holdout**：与 dev 不重叠，Python、Go 各一个未见仓库
-- **test**：剩余仓库；三个 split 都覆盖 Python 与 Go
+- **dev**：6 个仓库，20 个 PR（10 Go + 10 Python）
+- **holdout**：4 个仓库，20 个 PR（11 Go + 9 Python）
+- 两个 split 都覆盖 Python 与 Go，整体接近 5:5
 
-这使 holdout 可以用于评估未见仓库泛化；dev/test/holdout 之间仍可能有仓库数量与
+这使 holdout 可以用于评估未见仓库泛化；两个 split 之间仍可能有仓库数量与
 PR 数量不平衡，结论需同时查看按语言和仓库分层的结果。每个 split 的仓库数很少，
 如果某语言少于两个仓库簇，报告会省略该层及总体的仓库 bootstrap 区间，而不是给出
 无意义的零宽区间。
