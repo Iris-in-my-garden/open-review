@@ -21,6 +21,10 @@ from openreview.review.assessment import (
     normalize_severity,
     unique_files,
 )
+from openreview.review.evidence_anchor import (
+    EvidenceSpan,
+    canonicalize_evidence_span,
+)
 from openreview.review.redaction import redact_text
 
 logger = logging.getLogger(__name__)
@@ -268,6 +272,30 @@ class FindingValidator:
             grounding, method = self._check_evidence(
                 issue, file_diff, contexts, repo_path
             )
+
+            # 规则 3.2: 把 evidence 对齐到真实源码的连续区间。
+            # 模型经常把多行 evidence 挂在单行上，或在中间写 ``...``。
+            # 只做锚点修复，不改变 finding 的内容和严重级别；修复后
+            # deterministic evidence check 才能按 start_line..end_line 命中。
+            span = self._canonicalize_evidence(
+                issue, file_diff, repo_path
+            )
+            if span is not None:
+                issue.line = span.start_line
+                if span.end_line > span.start_line or issue.end_line is not None:
+                    issue.end_line = span.end_line
+                else:
+                    issue.end_line = None
+                issue.evidence = span.text
+                record["line"] = issue.line
+                record["end_line"] = issue.end_line
+                record["evidence"] = issue.evidence
+                if grounding is not True:
+                    # 精确源码区间是比 token 匹配更强的证据。
+                    grounding = True
+                    method = "evidence_exact"
+                    record["evidence_method"] = method
+
             record["evidence_method"] = method
             if grounding is None:
                 confidence -= self.missing_evidence_penalty
@@ -428,6 +456,84 @@ class FindingValidator:
             method = _evidence_method(evidence, haystack)
             return True, method or "evidence_token_match"
         return False, None
+
+    def _canonicalize_evidence(
+        self,
+        issue: PotentialIssue,
+        file_diff: ParsedChangedFile,
+        repo_path: Optional[Path],
+    ) -> Optional[EvidenceSpan]:
+        evidence = (issue.evidence or "").strip()
+        if len(evidence) < 6 or issue.line is None:
+            return None
+        side = str(issue.side or "RIGHT").upper()
+        visible = (
+            file_diff.old_visible_lines
+            if side == "LEFT"
+            else file_diff.visible_lines
+        )
+        if not visible:
+            return None
+
+        source_lines = self._source_lines_for_evidence(
+            file_diff, repo_path, side
+        )
+        if not source_lines:
+            return None
+
+        # 证据匹配必须使用和 prompt 相同的脱敏视图，否则引用被 mask
+        # 的密钥行会被误判成 ungrounded。
+        redacted_source = {
+            number: redact_text(line)[0]
+            for number, line in source_lines.items()
+        }
+        redacted_evidence = redact_text(evidence)[0]
+        return canonicalize_evidence_span(
+            redacted_evidence,
+            line=issue.line,
+            side=side,
+            visible_lines=visible,
+            source_lines=redacted_source,
+            prefer_line=issue.line,
+        )
+
+    @staticmethod
+    def _source_lines_for_evidence(
+        file_diff: ParsedChangedFile,
+        repo_path: Optional[Path],
+        side: str,
+    ) -> Dict[int, str]:
+        if side == "RIGHT" and repo_path is not None:
+            source = FindingValidator._read_head_source_lines(
+                repo_path, file_diff.filename
+            )
+            if source:
+                return source
+        return _side_lines_from_patch(file_diff.patch or "", side)
+
+    @staticmethod
+    def _read_head_source_lines(
+        repo_path: Path, filename: str
+    ) -> Dict[int, str]:
+        repo_path = Path(repo_path).resolve()
+        candidate = (repo_path / filename).resolve()
+        try:
+            candidate.relative_to(repo_path)
+        except ValueError:
+            return {}
+        try:
+            if (
+                not candidate.is_file()
+                or candidate.stat().st_size > MAX_GROUNDING_FILE_SIZE
+            ):
+                return {}
+            text = candidate.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return {}
+        return {
+            number: line
+            for number, line in enumerate(text.splitlines(), start=1)
+        }
 
     @staticmethod
     def _check_suggested_patch(
@@ -595,6 +701,36 @@ def _evidence_method(evidence: str, haystack: str) -> Optional[str]:
     ):
         return "evidence_line_match"
     return "evidence_token_match"
+
+
+def _side_lines_from_patch(patch: str, side: str) -> Dict[int, str]:
+    """把 patch 中某一侧的行映射为 1-based 行号 -> 文本。"""
+    side_lines: Dict[int, str] = {}
+    old_line: Optional[int] = None
+    new_line: Optional[int] = None
+    for raw_line in patch.splitlines():
+        header = HUNK_RANGE_PATTERN.match(raw_line)
+        if header:
+            old_line = int(header.group(1))
+            new_line = int(header.group(3))
+            continue
+        if old_line is None or new_line is None:
+            continue
+        if raw_line.startswith("+"):
+            if side != "LEFT":
+                side_lines[new_line] = raw_line[1:]
+            new_line += 1
+        elif raw_line.startswith("-"):
+            if side == "LEFT":
+                side_lines[old_line] = raw_line[1:]
+            old_line += 1
+        elif raw_line.startswith(" "):
+            side_lines[
+                old_line if side == "LEFT" else new_line
+            ] = raw_line[1:]
+            old_line += 1
+            new_line += 1
+    return side_lines
 
 
 def _extract_patch_window(

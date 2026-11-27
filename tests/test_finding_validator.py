@@ -364,6 +364,226 @@ def test_validate_rejects_left_side_line_on_right_side_only_patch():
     assert result.potential_issues == []
 
 
+def test_validate_extends_end_line_to_cover_multiline_evidence(tmp_path):
+    from evaluation.deterministic import evidence_is_grounded
+
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    source_lines = [
+        "def f():",
+        "    a = 1",
+        "    b = 2",
+        "    return a + b",
+    ]
+    (repo / "src" / "calc.py").write_text(
+        "\n".join(source_lines) + "\n", encoding="utf-8"
+    )
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="src/calc.py",
+                status="modified",
+                patch=(
+                    "@@ -1,4 +1,4 @@\n"
+                    " def f():\n"
+                    "-    a = 0\n"
+                    "+    a = 1\n"
+                    "     b = 2\n"
+                    "     return a + b\n"
+                ),
+                visible_lines=[1, 2, 3, 4],
+            )
+        ]
+    )
+    issue = PotentialIssue(
+        file="src/calc.py",
+        severity="High",
+        category="Bugs",
+        confidence=0.9,
+        reasoning="a and b are related.",
+        suggestion="Check it.",
+        line=2,
+        evidence="a = 1\nb = 2",
+    )
+
+    result = FindingValidator().validate(
+        _result([issue]), diff, repo_path=repo
+    )
+
+    kept = result.potential_issues[0]
+    assert kept.line == 2
+    assert kept.end_line == 3
+    assert kept.evidence == "    a = 1\n    b = 2"
+    assert evidence_is_grounded(
+        kept.evidence or "",
+        "\n".join(source_lines[kept.line - 1 : kept.end_line]),
+    )
+
+
+def test_validate_canonicalizes_ellipsis_evidence(tmp_path):
+    from evaluation.deterministic import evidence_is_grounded
+
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    source_lines = [
+        'log.Printf("first: %s", value)',
+        "middle()",
+        'log.Printf("second: %s", value)',
+    ]
+    (repo / "src" / "log.go").write_text(
+        "\n".join(source_lines) + "\n", encoding="utf-8"
+    )
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="src/log.go",
+                status="modified",
+                patch=(
+                    "@@ -1,3 +1,3 @@\n"
+                    '-log.Printf("first")\n'
+                    '+log.Printf("first: %s", value)\n'
+                    " middle()\n"
+                    '-log.Printf("second")\n'
+                    '+log.Printf("second: %s", value)\n'
+                ),
+                visible_lines=[1, 2, 3],
+            )
+        ]
+    )
+    issue = PotentialIssue(
+        file="src/log.go",
+        severity="Low",
+        category="Bugs",
+        confidence=0.9,
+        reasoning="Both log lines are wrong.",
+        suggestion="Remove them.",
+        line=1,
+        evidence=(
+            'log.Printf("first: %s", value)\n'
+            "...\n"
+            'log.Printf("second: %s", value)'
+        ),
+    )
+
+    result = FindingValidator().validate(
+        _result([issue]), diff, repo_path=repo
+    )
+
+    kept = result.potential_issues[0]
+    assert kept.evidence in {
+        'log.Printf("first: %s", value)',
+        'log.Printf("second: %s", value)',
+    }
+    assert evidence_is_grounded(
+        kept.evidence or "",
+        "\n".join(
+            source_lines[kept.line - 1 : (kept.end_line or kept.line)]
+        ),
+    )
+
+
+def test_validate_uses_visible_part_of_partially_visible_evidence(tmp_path):
+    from evaluation.deterministic import evidence_is_grounded
+
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    source_lines = [
+        "func render() {",
+        "\tfor i := range min(len(states), height-1) {",
+        "\t\tfmt.Fprint(w, states[i])",
+        "\t}",
+        "\tp.pos = len(states)",
+    ]
+    (repo / "src" / "progress.go").write_text(
+        "\n".join(source_lines) + "\n", encoding="utf-8"
+    )
+    # 只有第一行在 diff 可见行内，其余是未展示的上下文。
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="src/progress.go",
+                status="modified",
+                patch=(
+                    "@@ -1,5 +1,5 @@\n"
+                    " func render() {\n"
+                    "-\tfor i := range states {\n"
+                    "+\tfor i := range min(len(states), height-1) {\n"
+                    " \t\tfmt.Fprint(w, states[i])\n"
+                    " \t}\n"
+                    " \tp.pos = len(states)\n"
+                ),
+                visible_lines=[2],
+            )
+        ]
+    )
+    issue = PotentialIssue(
+        file="src/progress.go",
+        severity="Medium",
+        category="Bugs",
+        confidence=0.9,
+        reasoning="Cursor accounting is wrong.",
+        suggestion="Use the rendered count.",
+        line=2,
+        evidence=(
+            "\tfor i := range min(len(states), height-1) {\n"
+            "\t\tfmt.Fprint(w, states[i])\n"
+            "\t}\n"
+            "\n"
+            "\tp.pos = len(states)"
+        ),
+    )
+
+    result = FindingValidator().validate(
+        _result([issue]), diff, repo_path=repo
+    )
+
+    kept = result.potential_issues[0]
+    assert kept.line == 2
+    assert kept.end_line is None
+    assert kept.evidence == "\tfor i := range min(len(states), height-1) {"
+    assert evidence_is_grounded(kept.evidence or "", source_lines[1])
+
+
+def test_validate_canonicalizes_indentation_to_source_text(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "calc.py").write_text(
+        "def f():\n\tvalue = 1\n", encoding="utf-8"
+    )
+    diff = ParsedDiff(
+        files=[
+            ParsedChangedFile(
+                filename="src/calc.py",
+                status="modified",
+                patch=(
+                    "@@ -1,2 +1,2 @@\n"
+                    " def f():\n"
+                    "-\tvalue = 0\n"
+                    "+\tvalue = 1\n"
+                ),
+                visible_lines=[1, 2],
+            )
+        ]
+    )
+    issue = PotentialIssue(
+        file="src/calc.py",
+        severity="Medium",
+        category="Bugs",
+        confidence=0.9,
+        reasoning="Value changed.",
+        suggestion="Check it.",
+        line=2,
+        evidence="    value = 1",
+    )
+
+    result = FindingValidator().validate(
+        _result([issue]), diff, repo_path=repo
+    )
+
+    kept = result.potential_issues[0]
+    assert kept.evidence == "\tvalue = 1"
+
+
 def test_validate_evidence_can_be_grounded_in_local_source(tmp_path):
     source_dir = tmp_path / "src"
     source_dir.mkdir()
