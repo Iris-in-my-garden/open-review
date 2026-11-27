@@ -21,7 +21,11 @@ from typing import Callable, Optional, Sequence
 from openreview.domain.models import ReviewResult
 from openreview.github.client import GitHubClient
 from openreview.repo.diff_parser import DiffParser
-from openreview.repo.local import LocalReviewInput, WorktreePool
+from openreview.repo.local import (
+    LocalReviewInput,
+    WorktreePool,
+    resolve_merge_base,
+)
 from openreview.repo.manager import RepoManager
 from openreview.retriever.base import EmptyRetriever, Retriever, ScopedRetriever
 from openreview.retriever.hybrid import HybridRetriever
@@ -525,6 +529,11 @@ class ReviewPipeline:
             raise ValueError("base_sha and head_sha are required")
         if base == head:
             raise ValueError("base_sha and head_sha are identical; nothing to review")
+
+        # GitHub 的 PR diff 是 base...head（三点）。数据集里的 base 常常是
+        # 采集时 base 分支的 tip，直接 checkout 它会拿到错误的 base 快照，
+        # 也会把 base 分支上的无关改动带进 review。这里统一改用 merge-base。
+        base = resolve_merge_base(resolved_repo, base, head)
 
         synthetic_url = pr_url or (
             f"local://{resolved_repo}@{base[:7]}..{head[:7]}"

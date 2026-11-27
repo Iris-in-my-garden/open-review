@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from evaluation.languages import allowed_suffixes
-from openreview.repo.local import LocalReviewInput
+from openreview.repo.local import LocalReviewInput, resolve_merge_base
 from openreview.retriever.base import supports_plan
 from openreview.retriever.code_context import cap_repeated_contexts
 from openreview.retriever.context_planner import plan_contexts
@@ -25,9 +25,15 @@ def build_context_dry_run(
     """Run the review preparation/retrieval path and report prompt inputs only."""
     owner, repo_name = instance["repo"].split("/", 1)
     suffixes = allowed_suffixes(instance.get("language"))
+    base_sha = instance["base_commit"]
+    if (Path(repo_path) / ".git").exists():
+        # 与 review 路径保持一致：dry-run 也按 GitHub 三点 diff 估算。
+        base_sha = resolve_merge_base(
+            repo_path, base_sha, instance["head_commit"]
+        )
     local_input = LocalReviewInput(
         repo_path=repo_path,
-        base_sha=instance["base_commit"],
+        base_sha=base_sha,
         head_sha=instance["head_commit"],
         owner=owner,
         repo=repo_name,

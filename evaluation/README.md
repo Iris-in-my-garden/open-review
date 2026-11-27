@@ -8,6 +8,17 @@
 - `base_commit` / `head_commit`
 - 人工标注的 reference comments
 
+> **diff 语义与 GitHub 一致**：AACR 记录里的 `base_commit` 往往是采集时 base
+> 分支的 tip，而不是 PR 分支实际分叉的 commit。评测统一使用三点 diff
+> `merge-base(base, head)..head`，否则会把 base 分支后来合入的无关改动算进
+> PR，产生巨大的伪 diff。manifest 仍保留原始 `base_commit` 作为数据溯源。
+>
+> **`change_line_count` 不能用来校验 pinned diff**：它是 GitHub PR 最终
+> head 的 `additions + deletions`，而 manifest 的 `head_commit` 固定的是
+> reference comment 被提交时的 commit（GitHub API 的
+> `original_commit_id`）。PR 后续继续提交后，两者本来就会不同。校验 diff
+> 是否正确应看 reference comment 的 `path` / `line` 是否落在 pinned diff 内。
+
 评测分两层：
 
 1. **无需 LLM 调用的确定性指标**（每次 CI 都能跑）：行号合法性、证据可定位性、triage 跳过、维度归因、Validator/Verifier 漏斗、token 用量。

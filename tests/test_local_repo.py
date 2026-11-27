@@ -7,6 +7,7 @@ from openreview.repo.local import (
     WorktreePool,
     collect_local_changes,
     prepare_local_workspace,
+    resolve_merge_base,
 )
 from openreview.review.report_writer import ReportWriter
 from openreview.services.review_service import ReviewPipeline
@@ -71,6 +72,51 @@ def test_collect_local_changes_builds_github_equivalent_files(tmp_path: Path):
     assert by_name["src/app.py"].additions == 1
     assert by_name["src/app.py"].deletions == 1
     assert "+    return a + b" in (by_name["src/app.py"].patch or "")
+
+
+def test_collect_local_changes_uses_three_dot_diff_for_stale_base(
+    tmp_path: Path,
+):
+    """base tip 比分支点新时，只应看到 PR 自己的改动（GitHub 语义）。"""
+    repo, base, head = _make_repo(tmp_path)
+
+    # base 分支在 PR 分叉后继续前进，并新增一个只属于 main 的文件。
+    _git(repo, "checkout", "-q", base)
+    (repo / "main_only.py").write_text("MAIN = True\n", encoding="utf-8")
+    base_tip = _commit(repo, "main advances")
+
+    assert resolve_merge_base(repo, base_tip, head) == base
+    files = collect_local_changes(repo, base_tip, head)
+    names = {file.filename for file in files}
+
+    # 三点 diff 等于 base..head：main_only.py 不属于这个 PR。
+    assert names == {"src/app.py", "src/util.py", "old.py"}
+    assert "main_only.py" not in names
+
+
+def test_run_local_checks_out_merge_base_for_stale_base(tmp_path: Path):
+    repo, base, head = _make_repo(tmp_path)
+    _git(repo, "checkout", "-q", base)
+    (repo / "main_only.py").write_text("MAIN = True\n", encoding="utf-8")
+    base_tip = _commit(repo, "main advances")
+
+    pipeline = ReviewPipeline(mock_llm=True)
+    try:
+        pipeline.run_local(repo, base_tip, head, tmp_path / "out")
+        state = pipeline.last_state
+        assert state is not None
+        # review 内部使用的是 merge-base，而不是更晚的 base 分支 tip。
+        assert state.pr_info is not None
+        assert state.pr_info.base_sha == base
+        assert {file.filename for file in state.raw_files} == {
+            "src/app.py",
+            "src/util.py",
+            "old.py",
+        }
+        assert pipeline.last_result is not None
+        assert pipeline.last_result.metrics["diff"]["files"] == 3
+    finally:
+        pipeline.close()
 
 
 def test_prepare_local_workspace_isolates_head_and_base(tmp_path: Path):

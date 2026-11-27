@@ -21,7 +21,7 @@ from evaluation.repos import read_file_at_commit, repo_cache_path
 from evaluation.results import result_path
 from openreview.domain.versions import VERIFICATION_METRICS_SCHEMA_VERSION
 from openreview.repo.diff_parser import DiffParser, ParsedChangedFile, ParsedDiff
-from openreview.repo.local import collect_local_changes
+from openreview.repo.local import collect_local_changes, resolve_merge_base
 
 EVIDENCE_MIN_CHARS = 6
 EVIDENCE_METRICS_SCHEMA_VERSION = 2
@@ -362,9 +362,20 @@ def compute_deterministic_metrics(
             counters["grounding_unavailable"] += 1
         row["grounding_available"] = repo_path is not None
 
+        # GitHub PR 的 base 是 merge-base，不是采集时 base 分支的 tip。
+        # diff 本身由 collect_local_changes 的三点 diff 处理；这里再解析
+        # 一次，确保 LEFT 侧源码读取也使用同一个起点。
+        base_commit = instance["base_commit"]
+        if repo_path is not None:
+            try:
+                base_commit = resolve_merge_base(
+                    repo_path, base_commit, instance["head_commit"]
+                )
+            except Exception:  # noqa: BLE001 - 缺失 merge-base 时退回原值
+                pass
         diff_files = _parsed_diff(
             repo_path,
-            instance["base_commit"],
+            base_commit,
             instance["head_commit"],
             language=instance.get("language"),
         )
@@ -446,7 +457,7 @@ def compute_deterministic_metrics(
 
             start_line, end_line = line_range
             commit = (
-                instance["base_commit"]
+                base_commit
                 if side == "LEFT"
                 else instance["head_commit"]
             )

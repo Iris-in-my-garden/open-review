@@ -508,17 +508,52 @@ def _split_patch_by_file(patch: str) -> List[str]:
     return chunks
 
 
-def collect_local_changes(
+def resolve_merge_base(
     repo_path: str | Path,
     base_sha: str,
     head_sha: str,
-) -> List[ChangedFile]:
-    """生成与 GitHub ``list_changed_files`` 等价的文件列表。"""
+) -> str:
+    """返回 GitHub 三点 diff（``base...head``）使用的 merge-base。
+
+    数据集里的 ``base_sha`` 经常是采集时 base 分支的 tip，而不是 PR 分支
+    实际分叉的 commit。直接做 ``base..head`` 会把 base 分支后来合入的无关
+    改动也算进来，导致 review 一个巨大的伪 diff。GitHub PR 展示的是
+    ``merge-base(base, head)..head``，这里返回同一个起点。
+    """
     repo_root = resolve_repo_root(repo_path)
     base = base_sha.strip()
     head = head_sha.strip()
     _validate_commit(repo_root, base, "base_sha")
     _validate_commit(repo_root, head, "head_sha")
+
+    result = _git(repo_root, "merge-base", base, head)
+    merge_base = result.stdout.strip()
+    if not merge_base:
+        raise RepoCommandError(
+            command=["git", "-C", str(repo_root), "merge-base", base, head],
+            returncode=1,
+            stderr="merge-base returned an empty commit",
+        )
+    return merge_base
+
+
+def collect_local_changes(
+    repo_path: str | Path,
+    base_sha: str,
+    head_sha: str,
+) -> List[ChangedFile]:
+    """生成与 GitHub ``list_changed_files`` 等价的文件列表。
+
+    使用三点 diff（``base...head``）：GitHub 的 PR 视图也是以 merge-base
+    为起点的。这样即使 ``base_sha`` 是 base 分支的较新 tip，也不会把
+    分支分叉后 base 分支上的无关改动算进本次 PR。
+    """
+    repo_root = resolve_repo_root(repo_path)
+    base = base_sha.strip()
+    head = head_sha.strip()
+    _validate_commit(repo_root, base, "base_sha")
+    _validate_commit(repo_root, head, "head_sha")
+    diff_range = f"{base}...{head}"
 
     numstat = _git(
         repo_root,
@@ -526,8 +561,7 @@ def collect_local_changes(
         "--no-renames",
         "--numstat",
         "-z",
-        base,
-        head,
+        diff_range,
     ).stdout
     name_status = _git(
         repo_root,
@@ -535,8 +569,7 @@ def collect_local_changes(
         "--no-renames",
         "--name-status",
         "-z",
-        base,
-        head,
+        diff_range,
     ).stdout
 
     stats = _parse_numstat(numstat)
@@ -551,8 +584,7 @@ def collect_local_changes(
         "--no-color",
         "--no-ext-diff",
         "--unified=3",
-        base,
-        head,
+        diff_range,
     ).stdout
     chunks = _split_patch_by_file(combined_patch)
     # `git diff --name-status` and `git diff --patch` walk the same tree in the
@@ -579,8 +611,7 @@ def collect_local_changes(
                 "--no-color",
                 "--no-ext-diff",
                 "--unified=3",
-                base,
-                head,
+                diff_range,
                 "--",
                 path,
             ).stdout
