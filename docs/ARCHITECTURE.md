@@ -10,7 +10,7 @@
 | 读者 | 新贡献者、架构评审、面试官、未来的自己 |
 | 覆盖 | 系统边界、容器、生命周期、关键决策、失败模型 |
 | 不覆盖 | API reference、逐行实现细节、评测操作步骤 |
-| 适用版本 | prompt `review-v8` / validator `v2` / retriever `hybrid-v4` / metrics `5` |
+| 适用版本 | prompt `review-v8` / validator `v2` / retriever `hybrid-v5` / index schema `6` / metrics `5` |
 
 ## 2. TL;DR
 
@@ -20,7 +20,7 @@ OpenReview 是一条**有界、可验证、可观测**的 PR 审查流水线。
 - **不是 RAG**：检索以符号、import、call 的精确结构为主，向量检索不启用。
 - **不是计费系统**：预算是调用数/输入 token/输出 token/时间的硬护栏；输入 token 是保守估算，不是精确账单。
 - **失败可见**：`completed / skipped / partial / failed` 四态，CLI 退出码 `0 / 1 / 2`。
-- **当前状态**：工程契约 338 tests 通过；质量与成本消融尚未完成，空白不代表 0。
+- **当前状态**：工程契约 455 tests 通过；full dev production 与 3-PR mini ablation 已完成，full-dev ablation 与 holdout 待跑。真实结果见 [`evaluation-results.md`](evaluation-results.md)。
 
 ## 3. 系统上下文（C4 L1）
 
@@ -162,11 +162,11 @@ sequenceDiagram
 
 | 属性 | 机制 | 当前状态 |
 |---|---|---|
-| 可测试性 | 端口/适配器、纯领域策略、LLM record/replay | 338 tests 通过（11.8s） |
+| 可测试性 | 端口/适配器、纯领域策略、LLM record/replay | 455 tests 通过（~30s） |
 | 成本可控 | 客户端级预算账本、输出预留、时间上限 | 硬护栏；输入 token 为估算 |
 | 可追溯 | `run_id`、trace、metrics schema、debug sink | 单 run JSON 可还原 |
 | 可降级 | partial outcome、检索 fallback、单 batch 隔离 | 已实现 |
-| 可评测 | 四档消融、确定性指标、CI gate | 框架就绪，质量结果待补 |
+| 可评测 | 四档消融、确定性指标、CI gate | full dev production + 3-PR mini ablation 已完成；full-dev ablation / holdout 待跑 |
 | 安全 | 不可信输入隔离、脱敏、未知 verdict 收敛 | 风险降低，非安全保证 |
 
 ## 10. 已知局限与路线图
@@ -177,7 +177,9 @@ sequenceDiagram
 - 时间预算只约束 LLM 请求，不覆盖仓库准备与全部后处理。
 - 不计算金额；无集中式指标后端与告警。
 - 静态分析会执行本地工具，处理不可信仓库应使用隔离环境。
-- 评测样本 40 个 PR / 10 个仓库，质量与成本结论尚未发布。
+- 评测样本 40 个 PR / 10 个仓库；dev 20 / holdout 20。当前只有 full dev production 与 3-PR mini ablation，full-dev ablation 和 holdout 尚未运行。
+- 当前 semantic judge 与 reviewer 同模型，precision 可能有 self-preference bias；reference comment 稀疏，precision 应视为下限。
+- mini ablation 显示 graph 是“召回换精度”，verifier 在当前配置下未拒绝候选；两者都还不能对外声称质量收益。
 
 路线图：完成固定消融并发布分层结果与不确定性 → 按实测误差校准 token 估算 → 按漏检案例扩展语言/符号关系 → 按部署需要补服务化、集中指标与执行隔离。
 

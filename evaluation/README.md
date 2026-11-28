@@ -19,6 +19,9 @@
 > `original_commit_id`）。PR 后续继续提交后，两者本来就会不同。校验 diff
 > 是否正确应看 reference comment 的 `path` / `line` 是否落在 pinned diff 内。
 
+当前真实结果、mini ablation 和“不能对外声称”的边界见
+[`docs/evaluation-results.md`](../docs/evaluation-results.md)。
+
 评测分两层：
 
 1. **无需 LLM 调用的确定性指标**（每次 CI 都能跑）：行号合法性、证据可定位性、triage 跳过、维度归因、Validator/Verifier 漏斗、token 用量。
@@ -32,8 +35,9 @@
 
 - 19 个 Python PR + 21 个 Go PR = **40 个 PR**
 - 覆盖 **10 个仓库**
-- 固定的语言分层、仓库互斥切分：**7 dev / 23 test / 10 holdout PR**，分别覆盖
-  **2 / 6 / 2 个仓库**；每种语言都出现在每个 split。
+- 固定的语言分层、仓库互斥切分：**20 dev / 20 holdout PR**，分别覆盖
+  **6 / 4 个仓库**；每种语言都出现在两个 split（dev 10 Go + 10 Python，
+  holdout 11 Go + 9 Python）。不再保留独立 `test` split。
 
 原始数据 SHA256 固定为：
 
@@ -153,8 +157,12 @@ uv run python -m evaluation.cli prepare-repos --split dev
 # 真实运行四档（默认 review=deepseek-v4-pro thinking，verifier=deepseek-flash）
 ./evaluation/run_ablation.sh \
   --split dev \
-  --preflight-tokens 200000 \
-  --run-budget-tokens 20000 \
+  --preflight-tokens 800000 \
+  --run-budget-tokens 600000 \
+  --max-concurrent-batches 3 \
+  --llm-timeout 300 \
+  --llm-max-retries 2 \
+  --reasoning-effort high \
   --report-out reports/eval_dev.md
 
 # 加跑 AACR 官方语义评测
@@ -266,6 +274,7 @@ git clone --depth 1 https://github.com/alibaba/aacr-bench.git /tmp/aacr-bench
 export JUDGE_BASE_URL=...
 export JUDGE_API_KEY=...
 export JUDGE_MODEL=...
+unset JUDGE_USE_MOCK   # 或 export JUDGE_USE_MOCK=false
 
 # 3) 调用官方 evaluate.py
 uv run python -m evaluation.cli semantic \
@@ -273,6 +282,11 @@ uv run python -m evaluation.cli semantic \
   --run-id dev-gpt4o-mini \
   --aacr-eval-dir /tmp/aacr-bench/evaluation
 ```
+
+> **Mock judge 检查**：如果 `metrics_openreview_*.json` 里出现
+> `"judge_reason": "[mock] matched=[]"`，说明真实 judge 没有启用，所有 P/R=0
+> 不是模型结果。先检查 `JUDGE_API_KEY` / `JUDGE_BASE_URL` / `JUDGE_USE_MOCK`，
+> 再重跑 semantic。
 
 这里没有复制 AACR 的 judge 代码：`evaluation/semantic.py` 把它的 `evaluation/`
 目录加入 `sys.path`，直接调用 `evaluate.evaluate(...)`。我们写出的结果 JSON 使用
@@ -518,9 +532,11 @@ evaluation/
 - 当前 `tree_sitter_retriever.py` / `impact.py` 内部仍会调用 `git grep`，所以不要
   宣称“完全不用 grep”；这里的“无独立 grep retriever”指的是没有单独的 grep
   检索器 fallback。
-- call graph 是 best-effort：Python 用 `ast` 抽取，Go 调用边暂不默认启用；它只补充
-  candidate context，不保证完整类型解析。
+- call graph 是 best-effort：Python 用 `ast` 抽取，Go 通过 receiver/import/同名方法
+  做带置信度过滤的 caller/callee 扩展；它只补充 candidate context，不保证完整类型解析，
+  也不解析接口动态分发。
 - `graph_contexts_avg` 统计的是最终注入的 caller/callee/import/dependency 上下文，
   不是候选边数量；候选命中数仍保留在 `stats` 里。
-- 评测是串行的。同一 repo 反复建 worktree 时并发收益有限，但更容易把临时目录
-  和磁盘打爆；需要提速时优先按 repo 分组并行。
+- 单进程内 PR 仍是串行的；同一 repo 反复建 worktree 时并发收益有限。需要提速时
+  用 `evaluation/sharding.py` / `run_tune6_sharded.sh` 按仓库分片，起 2–3 个进程；
+  不要并发跑同一个 repo 的多个 PR，避免 worktree/index 争用。

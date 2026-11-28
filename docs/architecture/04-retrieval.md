@@ -25,7 +25,7 @@
 - 支持后缀：`.py`、`.go`
 - 单文件上限：500 KB
 - 文件数上限：20,000
-- schema 版本：`INDEX_SCHEMA_VERSION = "3"`
+- schema 版本：`INDEX_SCHEMA_VERSION = "6"`（Go qualname/import/call 语义变更会触发重建）
 
 ### 2.2 增量算法
 

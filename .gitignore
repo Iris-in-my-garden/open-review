@@ -49,4 +49,10 @@ evaluation/.cache/
 evaluation/results/
 evaluation/metrics/
 /reports/debug/
+/reports/archive/
+/reports/tune6/
+/reports/context-dry-run*.json
 Iris-in-my-garden.github.io-worktrees/
+
+# 个人面试材料：只在本地保留，不进入公开仓库
+docs/interview-notes.md

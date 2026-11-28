@@ -56,7 +56,7 @@
 
 | 指标 | 定义 |
 |---|---|
-| `file_recall` | reference comment 指向的文件是否被上下文覆盖 |
+| `file_recall` | reference comment 指向的文件是否被检索上下文覆盖（文件级，不等于模型是否看过 diff） |
 | `index_file_recall` | 仅结构化索引产出的覆盖 |
 | `symbol_coverage` | changed symbols 被检索回来的比例 |
 | `citation_rate` | finding 是否真的引用了注入的 `context_refs` |
@@ -65,6 +65,19 @@
 | `graph_contexts_avg` | 平均 graph 上下文数 |
 | `graph_context_kinds` | caller/callee/import/dependency 分布 |
 | `patch_validation` | `suggested_patch` 通过 `git apply --check` 的比例 |
+
+`file_recall` 只衡量“检索上下文文件列表”是否覆盖 reference 文件：
+
+```text
+|reference_files ∩ context_file_list| / |reference_files|
+```
+
+它**不是**“模型有没有看到这个文件”——prompt 本来就包含所有 changed file 的 diff。
+它也不是行级/函数级/issue 级召回。典型用法是区分瓶颈：
+
+- `file_recall` 低 → 检索没覆盖到文件，先修检索
+- `file_recall` 高但 semantic recall 低 → 检索到了但没被用好，修生成/上下文选择
+- `file_recall` 高但 citation rate 低 → 上下文注入过多或未被模型使用
 
 ### 2.3 语义指标（可选，调用 LLM judge）
 
@@ -89,10 +102,19 @@ triage 是确定性的规则前置过滤，不属于本实验的消融维度；i
 # 一键跑四档：review -> metrics -> gate -> 可选 semantic -> report
 # 默认 review=deepseek-v4-pro thinking，verifier=deepseek-flash
 ./evaluation/run_ablation.sh --split dev \
-  --preflight-tokens 200000 --run-budget-tokens 20000
+  --preflight-tokens 800000 --run-budget-tokens 600000 \
+  --max-concurrent-batches 3 --llm-timeout 300 --llm-max-retries 2 \
+  --reasoning-effort high
 
 # 只估算，不 clone、不调用 LLM
 ./evaluation/run_ablation.sh --dry-run --split dev
+
+# 自定义 mini manifest 和 run-id 前缀（用于 3-PR 方向验证）
+./evaluation/run_ablation.sh \
+  --manifest /tmp/mini-ablation/mini.json \
+  --split dev --run-prefix mini \
+  --levels "diff ast graph verifier" --semantic \
+  --aacr-eval-dir ~/PycharmProjects/aacr-bench/evaluation
 ```
 
 也可以逐档手动跑：
@@ -140,11 +162,26 @@ uv run python -m evaluation.cli gate \
 | 确定性指标 | ✅ 已实现 |
 | CI gate | ✅ 已实现 |
 | 四档消融 | ✅ 已实现 |
-| **真实模型质量/成本结果** | ❌ **尚未完成** |
+| full dev production（20 PR） | ✅ 已完成：P 43.9% / R 17.9% / Balanced 25.4% |
+| 3-PR mini ablation | ✅ 已完成：方向性结论，不作强断言 |
+| full-dev 四档 ablation | ❌ 未运行 |
+| holdout production | ❌ 未运行（冻结后只跑一次） |
+| 独立 judge / 人工 audit | ❌ 未运行 |
 
-现有 `evaluation/metrics/aacr-pygo-v1/*` 是 **mock 或单条 dev 样本**，只用于验证链路，不代表审查质量。README 与架构文档中的消融表留白，**空白不是 0，也不是结论**。
+真实结果、语言分层、mini ablation 和“不可对外声称”的边界统一放在
+[`evaluation-results.md`](../evaluation-results.md)。本页只保留方法论和状态。
 
-在补齐真实结果前，不应对外声称“检索提升 X%”或“Verifier 降低幻觉 Y%”。
+### 5.1 语义 judge 的 mock 陷阱
+
+未配置 `JUDGE_API_KEY` / `JUDGE_BASE_URL` 或 `JUDGE_USE_MOCK=true` 时，AACR
+评估器会退化为本地 mock judge，输出所有 P/R 为 0。判断方法：
+
+```bash
+grep -l '\[mock\]' evaluation/metrics/**/metrics_openreview_*.json
+```
+
+带 `[mock] matched=[]` 的 semantic 文件不能用于结论。本次 3-PR mini ablation
+第一次就踩到了这个坑，重跑真实 judge 后才得到上表结果。
 
 ## 6. 复现步骤
 
@@ -182,7 +219,9 @@ uv run python -m evaluation.cli review --split dev --limit 1 \
 
 ## 8. 后续优先项
 
-1. 在 dev/holdout 上跑完四档消融，发布分层结果与不确定性。
-2. 校准 token 估算误差，补金额成本。
-3. 建立用户反馈闭环（评论 accept/dismiss），跟踪 precision。
-4. 扩展语言与符号关系，优先覆盖漏检案例。
+1. 跑 full-dev 四档消融（20 PR × 4 tier），发布语言/仓库分层与不确定性。
+2. 配置冻结后跑一次 holdout production，不再根据 holdout 调参。
+3. 用独立 judge 或人工 audit 复核 semantic precision/recall。
+4. 针对 50% reference 落在零 finding 文件的问题，试第二遍 file sweep。
+5. 校准 graph context selection / citation 下降问题。
+6. 校准 token 估算误差，补金额成本；建立用户反馈闭环。

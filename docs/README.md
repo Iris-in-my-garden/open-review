@@ -11,15 +11,17 @@
 | 时间 | 读什么 | 目标 |
 |---|---|---|
 | 5 分钟 | `ARCHITECTURE.md` §1–§4 | 知道系统是什么、不是什么、一次 run 怎么走 |
+| 15 分钟 | `evaluation-results.md` | 看当前真实结果、消融结论和不能对外声称的内容 |
 | 30 分钟 | `ARCHITECTURE.md` + `decisions/ADR-0001..0005` | 理解五个关键取舍及其代价 |
 | 排障 | `architecture/07-operations.md` | 从 outcome/metrics 定位失败点 |
 | 改代码 | `architecture/03-workflow.md` + `reference/config.md` | 知道节点契约、配置默认值和 cache key |
-| 做评测 | `architecture/08-evaluation.md` | 指标定义、切分、消融、当前状态 |
+| 做评测 | `architecture/08-evaluation.md` + `evaluation-results.md` | 指标定义、切分、消融、当前状态 |
 
 ## 文档地图
 
 | 文档 | 内容 |
 |---|---|
+| [`evaluation-results.md`](evaluation-results.md) | 结果快照：full dev production、mini ablation、prompt 实验、holdout 状态 |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | 系统地图：定位、C4、生命周期、决策索引、失败总览 |
 | [`architecture/01-context.md`](architecture/01-context.md) | 外部系统、容器、信任边界、部署与并发形态 |
 | [`architecture/02-lifecycle.md`](architecture/02-lifecycle.md) | 一次 review 的时序、artifact、outcome 状态机、缓存 |
@@ -36,7 +38,7 @@
 ## 维护约定
 
 1. **单一事实源**：测试数量、消融结果、版本号只在本文档体系中出现一次；README 只保留 Quickstart 和链接。
-2. **数字带来源**：例如 `338 tests (uv run pytest -q, 2026-11-20)`。数字变化时同步更新。
+2. **数字带来源**：例如 `455 tests (uv run pytest -q, 2026-11-28)`。数字变化时同步更新。
 3. **契约变更必须改文档**：节点顺序、`ReviewState` 字段、预算语义、优先级/cap、metrics schema 变化时，更新对应 reference 文档。
 4. **架构决策必须加 ADR**：新增/替换关键机制时，在 `decisions/` 新增 ADR，并标注状态与复审条件。
 5. **代码锚点**：优先写 `src/openreview/...::Symbol`，便于重命名后 grep 到。
@@ -49,9 +51,17 @@
 |---|---|
 | Prompt | `review-v8` |
 | Validator | `validator-v2` |
-| Retriever | `hybrid-v4` |
+| Retriever | `hybrid-v5` |
+| Index schema | `6` |
 | Review cache schema | `4` |
 | Metrics schema | `5` |
 | Verification metrics schema | `1` |
+
+> 评测结果快照固定在 [`evaluation-results.md`](evaluation-results.md)；
+> 修改 prompt/validator/retriever 版本时，除了本节，也要更新结果页的“固定配置”。
+>
+> Evidence 锚定修复已经进入 `validator-v2` 代码，但没有单独 bump 版本号。
+> 正式冻结新 run 前建议把 `VALIDATOR_VERSION` 提到 `validator-v3`，避免 review
+> cache / run config 复用旧 validator 的结果。
 
 版本常量定义在 `src/openreview/domain/versions.py`，修改时必须同步本文档与 cache key 说明。

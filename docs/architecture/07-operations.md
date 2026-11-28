@@ -105,7 +105,7 @@ uv run openreview review <pr_url> --llm-cache-dir .cache/llm --llm-cache-mode re
 {
   "prompt": "review-v8",
   "validator": "validator-v2",
-  "retriever": "hybrid-v4",
+  "retriever": "hybrid-v5",
   "review_cache_schema": 4,
   "metrics_schema": 5
 }

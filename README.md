@@ -25,7 +25,14 @@ flowchart TD
 
 ## 评测状态
 
-评测工具支持从纯 Diff 到 AST、代码图谱和 Verifier 的固定对照（40 个 PR / 10 个仓库，按仓库互斥切分 dev/holdout，各 20 个 PR）。**质量与成本评测尚未完成，空白不是 0，也不是结论。**指标定义、切分方法与复现步骤见[评测方法](docs/architecture/08-evaluation.md)。
+AACR-Bench Python/Go 子集：40 个 PR / 10 个仓库，按仓库互斥切分 dev / holdout 各 20 个 PR。当前已完成：
+
+- **full dev production**（20 PR）：P 43.9% / R 17.9% / Balanced 25.4%，20/20 ok
+- **3-PR mini ablation**（2 Go + 1 Python）：AST 把 file recall 从 0 提到 89.3%；graph 提高召回但降低精度，balanced 基本持平；verifier 在当前配置下 0 rejection
+- **6-PR prompt 实验**（附录）：P 50.0% → 68.0%，R 16.3% → 20.9%，仅作方向验证
+- **尚未完成**：full-dev 四档 ablation、holdout production、独立 judge 复核
+
+真实数字、语言分层、失败分析和“不可对外声称”的边界见[评测结果快照](docs/evaluation-results.md)。
 
 ## Quickstart
 
@@ -123,6 +130,7 @@ src/openreview/
 │   ├── finalize.py            # 审查结果收敛（validator / 测试缺口 / injection）
 │   ├── output_parser.py       # 结构化 Schema、严重级别校验与聚合
 │   ├── finding_validator.py   # 行号 / evidence 校验与结论重算
+│   ├── evidence_anchor.py     # 多行 evidence / 省略号 / 缩进锚定修复
 │   ├── verifier.py            # critical/high 语义复核
 │   ├── cache.py               # review 结果缓存
 │   ├── llm_cache.py           # LLM 响应 record/replay
@@ -140,7 +148,7 @@ src/openreview/
 ## 设计取舍
 
 **为什么检索采用 AST + 图扩展，而不是 FTS5？**
-tree-sitter AST 是结构化主路径，能定位变更行所属的函数/类；SQLite 只保存符号定义与 import/call 关系，符号查找走精确名字和 LIKE 兜底。FTS5/BM25 在这里收益有限：代码审查更依赖精确符号和结构关系，而全文检索容易把弱相关定义带进 prompt。import/call graph 补上“谁调用了变更符号 / 变更函数调用了谁”，把影响面从文件级提升到函数级。上下文按相关性排序并去重，任何增强失败时仍可退回 AST 结果。call graph 是 best-effort：Python 用 `ast` 抽取 caller/callee，Go 的调用边暂不默认启用，不宣称完整类型解析。当前索引和 AST 解析都聚焦 Python / Go；其他语言只使用 diff，不注入结构上下文。
+tree-sitter AST 是结构化主路径，能定位变更行所属的函数/类；SQLite 只保存符号定义与 import/call 关系，符号查找走精确名字和 LIKE 兜底。FTS5/BM25 在这里收益有限：代码审查更依赖精确符号和结构关系，而全文检索容易把弱相关定义带进 prompt。import/call graph 补上“谁调用了变更符号 / 变更函数调用了谁”，把影响面从文件级提升到函数级。上下文按相关性排序并去重，任何增强失败时仍可退回 AST 结果。call graph 是 best-effort：Python 用 `ast` 抽取 caller/callee，Go 通过 receiver/import/同名方法做带置信度过滤的 caller/callee 扩展；不宣称完整类型解析或接口动态分发。当前索引和 AST 解析都聚焦 Python / Go；其他语言只使用 diff，不注入结构上下文。
 
 **为什么引用检索不直接用 `git grep`？**
 `git grep -e sym1 -e sym2 ...` 会把多个模式合成一个交替正则，耗时随模式数和匹配行数一起放大。实测同一个 676 文件 / 10MB 的 Go 仓库：1 个模式 0.03s，10 个 2.8s，20 个 5.6s，而 20 个模式用 ripgrep 只要 0.02s。默认 50 个检索目标会让每次 batch 都撞上 15s 超时并被静默降级。现在 `retriever/grep.py` 优先用 `rg -F -w`（固定字符串、整词、源码 glob），没有 ripgrep 时把 `git grep` 拆成 4 个模式一批并共享总时间预算，最后才退到有界的 Python 扫描；命中数和 AST 解析量都有硬上限，引擎超时只降级、不挂住 review。
@@ -201,7 +209,7 @@ PR 标题、描述、代码注释都视为不可信数据：统一放入 `<untru
 - **检索缺口指标**：`prompt_context_coverage`、`retrieval_truncated_total`、`cross_batch_duplicates_total` 等，用于区分“召回失败”和“召回后被 cap / prompt 预算丢弃”；它们不是人工标注的 ground-truth recall，但能直接暴露检索链路的损耗位置
 - **可选语义指标**：复用 AACR-Bench 官方 LLM judge，计算文件级 Precision / Recall / Balanced
 
-数据使用 AACR-Bench Python/Go 子集的固定切分，同一仓库的 PR 不会跨 split；每种语言分别分配 dev、repo-level holdout 仓库，整体约 5:5。报告提供按语言/仓库分层的语义指标；单 run 不确定性使用仓库簇 bootstrap，多 run 对比使用语言分层的配对 PR bootstrap 95% 置信区间。README 只保留模板；真实结果跑完后由 `report` 子命令生成并替换。
+数据使用 AACR-Bench Python/Go 子集的固定切分，同一仓库的 PR 不会跨 split；每种语言分别分配 dev、repo-level holdout 仓库，整体约 5:5。报告提供按语言/仓库分层的语义指标；单 run 不确定性使用仓库簇 bootstrap，多 run 对比使用语言分层的配对 PR bootstrap 95% 置信区间。当前结果统一记录在[评测结果快照](docs/evaluation-results.md)，README 只保留摘要。
 
 确定性指标可以作为 CI 门禁，不消耗 token。评测运行的指标文件默认位于
 `evaluation/metrics/`（该目录不提交）；CI 使用仓库内的受控 fixture 验证门禁
@@ -215,64 +223,43 @@ uv run python -m evaluation.cli gate \
 门禁默认要求：结果无 error/missing、未知文件率 0、非法行号率 0、未 grounding 的 evidence 率 0，evidence 可核验率至少 0.8、evidence/归因覆盖率不低于阈值；阈值可用 `--min-*` / `--max-*` 调整。
 运行真实或 mock 评测后，可将实际生成的 `deterministic_<run>.json` 传给同一命令检查该次结果。
 
-### 复现 dev mini-eval
+### 结果与复现
 
-先做一条 smoke，确认 API、token 预算和结果落盘：
-真实模型调用需设置 `OPENAI_API_KEY`（或直接设置 `DEEPSEEK_API_KEY`）。默认 review 使用
-`deepseek-v4-pro` + thinking，verifier 使用 `deepseek-flash`；私有仓库或需要更高
-GitHub API 限额时可选设置 `GITHUB_TOKEN`：
+真实结果、语言分层、mini ablation 和失败分析见[评测结果快照](docs/evaluation-results.md)。
+复现命令、manifest、分片并发和 semantic judge 配置见[评测手册](evaluation/README.md)。
 
-```bash
-export DEEPSEEK_API_KEY=...
-# export GITHUB_TOKEN=...
+full dev production（20 PR）：
 
-uv run openreview review https://github.com/owner/repo/pull/123 \
-  --budget-calls 8 \
-  --budget-tokens 20000 \
-  --budget-output-tokens 8000 \
-  --budget-seconds 120 \
-  --json-out reports/result.json
+| 指标 | 值 |
+|---|---:|
+| N | 20 / 20 ok |
+| Findings | 57 |
+| Precision | 43.9% |
+| Recall | 17.9% |
+| Balanced | 25.4% |
+| Evidence（锚定后） | 100% |
+| Calls / PR | 2.95 |
+| Tokens | 912k |
+| Latency | 116.8s/PR |
+
+语言分层：
+
+```text
+Go:     P 34.4% / R 12.8% / Balanced 18.6%
+Python: P 56.0% / R 27.5% / Balanced 36.8%
 ```
 
-需要换模型时显式覆盖，例如改用 OpenAI：
+3-PR mini ablation（2 Go + 1 Python，方向性）：
 
-```bash
-uv run openreview review https://github.com/owner/repo/pull/123 \
-  --model gpt-4o --verifier-model gpt-4o --no-thinking \
-  --base-url https://api.openai.com/v1
-```
+| Tier | Precision | Recall | Balanced | File recall | Tokens |
+|---|---:|---:|---:|---:|---:|
+| diff | 78.6% | 23.5% | 36.2% | 0.0% | 145.6k |
+| ast | 76.9% | 21.6% | 33.7% | 89.3% | 178.8k |
+| graph | 63.2% | 25.5% | 36.3% | 89.3% | 185.0k |
+| verifier | 64.7% | 21.6% | 32.4% | 89.3% | 236.2k |
 
-输入 Token 使用字符估算，估算误差可能使已发出的单次请求超过上限；时间预算约束 LLM 请求，不等同于整个流程的墙钟超时。Mock 仅验证链路，不代表审查效果。
-
-**工程状态：**当前 338 项测试通过（`uv run pytest -q`，2026-11-20），ruff 与全包 mypy 检查通过。评测框架和固定样本已准备，实际质量结果待补。
-
----
-
-## 文档
-
-### 生成 Results 表
-
-```bash
-uv run python -m evaluation.cli report \
-  --run diff=evaluation/metrics/aacr-pygo-v3/dev-diff \
-  --run ast=evaluation/metrics/aacr-pygo-v3/dev-ast \
-  --run graph=evaluation/metrics/aacr-pygo-v3/dev-graph \
-  --run verifier=evaluation/metrics/aacr-pygo-v3/dev-verifier \
-  --out reports/eval_dev.md
-```
-
-报告只展示 token 用量和调用次数，不计算货币成本。需要成本视图时，可以用 token 结果和当时的 provider 价格在外部换算。
-
-模板如下，真实数字跑完后替换：
-
-| Config | N | Findings | Precision | Recall | Balanced | Invalid line | Evidence | File recall | Symbol cov | Citation | Graph ctx | Attribution | Calls/PR | Tokens | Latency |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| diff | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
-| ast | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
-| graph | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
-| verifier | 10 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
-
-解读时至少同时看四件事：**质量（P/R）是否提升、检索覆盖是否提升、token 是否成比例、证据是否仍然可定位**。相邻档位只差一个变量，只有 graph 或 verifier 在高严重级别 findings 上有明显收益时，才值得保留对应成本；否则退回更轻的档位。
+解读时至少同时看四件事：**质量（P/R）是否提升、检索覆盖是否提升、token 是否成比例、证据是否仍然可定位**。
+3 个 PR 的 P/R 只能看方向，不能做语言或显著性结论；full-dev ablation 和 holdout 仍未运行。
 
 ## 测试与工程化
 
@@ -313,7 +300,14 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 
 后续：
 - [x] AACR-Bench 固定切分、确定性指标与官方语义评测适配
-- [ ] 跑真实 dev/holdout，固化 precision / recall / token 用量 / 延迟 Results 表
+- [x] 三点 diff 修复（32/40 个实例的 base 不是分支点）
+- [x] evidence 锚定修复（70.2% → 100%，Gate PASS）
+- [x] full dev production（20 PR，P 43.9 / R 17.9 / Balanced 25.4）
+- [x] 3-PR mini 四档 ablation（方向性结论）
+- [x] 6-PR prompt 实验（附录）
+- [ ] full-dev 四档 ablation（20 PR × 4 tier）
+- [ ] holdout production（冻结后只跑一次）
+- [ ] 独立 judge / 人工 audit 校准 precision
 - [ ] 增量 review（只重跑变更文件，复用上次结果）
 - [ ] 多语言扩展（Java / TypeScript AST）
 - [x] 行内评论幂等（按 marker 替换上一轮 review，同一 PR 重跑不重复发评论）
@@ -321,14 +315,20 @@ CI 配置在 `.github/workflows/ci.yml`：安装依赖后依次执行 ruff、myp
 
 已知限制：
 - 只支持 Python / Go；其他语言没有 AST 上下文，效果未做承诺
-- call graph 是 best-effort：Python 用 `ast` 抽取，Go 调用边暂不默认启用，不做完整类型解析
+- call graph 是 best-effort：Python 用 `ast` 抽取，Go 通过 receiver/import/同名方法过滤 caller/callee；不做完整类型解析，也不解析接口动态分发
 - patch/context 的 token 数仍是保守估算（ASCII 约 3 字符/token，CJK 按更高权重计），用于预算与截断；真实用量单独记录
 - 行内评论只能落在 diff 可见行；不在 diff 行内或 severity 为 medium/low 的问题会写入 Review body，而不是行内评论
 - 单文件极大时会先按 hunk / symbol 切片；只有单个 hunk 仍超预算时才截断，可能漏掉该 hunk 后半部分的问题
 - 单遍审查的 findings 受单次输出 token 限制；大 PR 会按 batch 拆分，但单个 batch 仍可能截断
 - 静态分析默认关闭、CLI 不暴露，且只覆盖 Python；通过 API 开启时会在本地执行 ruff/mypy
 - `--mock_llm` 仅验证流程与报告格式，不代表审查质量；仓库中的示例报告也是 mock 演示输出，不应作为真实漏洞发现或评测结果
+- full dev production 的 recall 只有 17.9%；50% 的 reference 落在零 finding 文件，生成覆盖仍是主要瓶颈
+- semantic judge 与 reviewer 同模型，precision 可能有 self-preference bias；reference comment 稀疏，43.9% 应视为下限
+- mini ablation 里 graph 是“召回换精度”，verifier 0 rejection、成本 +28%；二者都还没有证明稳定质量收益
+- full-dev ablation 和 holdout 尚未运行；不要把 mini 的方向性结论当成最终结论
 
+- [评测结果快照](docs/evaluation-results.md)：full dev production、mini ablation、prompt 实验、holdout 状态
+- [reports 索引](reports/INDEX.md)：当前报告、归档、非结论文件
 - [架构地图](docs/ARCHITECTURE.md)：系统边界、生命周期、关键决策索引
 - [架构决策 ADR](docs/decisions/)：有界工作流、结构化检索、预算下沉、单遍审查、partial outcome
 - [节点与预算契约](docs/architecture/03-workflow.md)：13 个节点的输入/输出/失败语义
