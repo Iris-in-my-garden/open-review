@@ -225,7 +225,38 @@ uv run python -m evaluation.cli review \
 
 没有设置 `--preflight-tokens` 时不要直接跑 `--split all`。
 
-### 5. 可选：AACR 官方语义评测
+### 5. 可选：按仓库分片并发跑多个 PR
+
+`review` 默认逐条跑 PR；`--max-concurrent-batches` 只并发单个 PR 内部的
+batch。需要缩短整批时间时，用 `evaluation/sharding.py` 按**仓库边界**切
+manifest，再起多个独立进程。切分必须按仓库，避免同一 repo 的
+`git worktree` / index 并发争用。
+
+```bash
+# 生成 shard manifest；instance id 用逗号分隔
+uv run python -m evaluation.sharding build \
+  --manifest evaluation/manifests/aacr_pygo_v3.json \
+  --output-dir /tmp/shards \
+  --shard "s0=repo-a@1,repo-a@2" \
+  --shard "s1=repo-b@1" \
+  --tune-manifest /tmp/shards/tune.json
+
+# 分别启动两个进程（各自 results-dir / run-id）
+# ... 跑完后合并 result JSON 和 summary
+uv run python -m evaluation.sharding merge \
+  --output-dir evaluation/results/aacr-pygo-v3/dev-sharded \
+  --run evaluation/results/aacr-pygo-v3/dev-sharded-s0 \
+  --run evaluation/results/aacr-pygo-v3/dev-sharded-s1 \
+  --instance-order-manifest /tmp/shards/tune.json
+```
+
+`evaluation/run_tune6_sharded.sh` 是 6-PR recall 实验的现成封装：自动生成
+两个 shard、并行跑 review、合并结果、跑 metrics/gate；`RUN_SEMANTIC=1`
+时继续跑 AACR judge，并用 `evaluation.sharding compare` 把 baseline 和
+candidate 限制在同一组 PR 上比较。并发 PR 建议 2–3 个，每进程
+`--max-concurrent-batches` 用 1–2，避免触发 provider 429。
+
+### 6. 可选：AACR 官方语义评测
 
 ```bash
 # 1) clone AACR（只需一次）
@@ -250,7 +281,7 @@ AACR OCR 兼容字段（`review.comments[].content`、`review.summary.input_toke
 
 如果 AACR 目录不存在，跳过这一步即可；确定性指标仍然可用。
 
-### 6. 汇总多次 run
+### 7. 汇总多次 run
 
 `report` 子命令会把 `deterministic_*.json`、`retrieval_*.json` 和可选的
 `metrics_openreview_*.json` 合成 Markdown 表格，方便贴到 README / PR / 面试材料：
