@@ -22,6 +22,7 @@ PYTHON_BIN="${PYTHON_BIN:-uv run python}"
 read -r -a PYTHON <<< "$PYTHON_BIN"
 MANIFEST="evaluation/manifests/aacr_pygo_v3.json"
 SPLIT="dev"
+RUN_PREFIX=""
 MODEL=""
 VERIFIER_MODEL=""
 THINKING=1
@@ -46,7 +47,9 @@ usage() {
   cat <<'EOF'
 用法: evaluation/run_ablation.sh [options]
 
+  --manifest PATH            评测 manifest（默认 evaluation/manifests/aacr_pygo_v3.json）
   --split SPLIT              dev | holdout | all（默认 dev；test 仅用于旧 manifest）
+  --run-prefix PREFIX        run-id 前缀（默认等于 split；mini 实验建议用 mini）
   --model MODEL              Review 主模型；不传则默认 deepseek-v4-pro
   --verifier-model MODEL     Verifier 模型；不传则 DeepSeek 下默认 deepseek-flash
   --no-thinking              关闭 Review thinking（默认开启，仅 DeepSeek 生效）
@@ -84,7 +87,9 @@ require_value() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --manifest) require_value "$@"; MANIFEST="$2"; shift 2 ;;
     --split) require_value "$@"; SPLIT="$2"; shift 2 ;;
+    --run-prefix) require_value "$@"; RUN_PREFIX="$2"; shift 2 ;;
     --model) require_value "$@"; MODEL="$2"; shift 2 ;;
     --verifier-model) require_value "$@"; VERIFIER_MODEL="$2"; shift 2 ;;
     --thinking) THINKING=1; shift ;;
@@ -122,6 +127,9 @@ if [[ ! -f "$MANIFEST" ]]; then
 fi
 
 VERSION="$("${PYTHON[@]}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$MANIFEST")"
+if [[ -z "$RUN_PREFIX" ]]; then
+  RUN_PREFIX="$SPLIT"
+fi
 if [[ -z "$REPORT_OUT" ]]; then
   REPORT_OUT="reports/eval_${SPLIT}.md"
 fi
@@ -134,7 +142,7 @@ fi
 
 run_review() {
   local level="$1"
-  local run_id="${SPLIT}-${level}"
+  local run_id="${RUN_PREFIX}-${level}"
   if [[ "$SEMANTIC" -eq 1 ]] && is_reusable_level "$level"; then
     echo "==> [$level] 复用已存在且配置匹配的 review 结果"
     return 0
@@ -174,7 +182,7 @@ is_reusable_level() {
     "${PYTHON[@]}" -m evaluation.cli check-run
     --manifest "$MANIFEST"
     --split "$SPLIT"
-    --run-id "${SPLIT}-${level}"
+    --run-id "${RUN_PREFIX}-${level}"
     --ablation "$level"
   )
   if [[ -n "$LIMIT" ]]; then cmd+=(--limit "$LIMIT"); fi
@@ -191,7 +199,7 @@ is_reusable_level() {
 
 run_metrics_and_gate() {
   local level="$1"
-  local run_id="${SPLIT}-${level}"
+  local run_id="${RUN_PREFIX}-${level}"
   local metrics_dir="evaluation/metrics/${VERSION}/${run_id}"
   local deterministic="${metrics_dir}/deterministic_${run_id}.json"
 
@@ -275,7 +283,7 @@ echo ""
 echo "==> report"
 report_cmd=("${PYTHON[@]}" -m evaluation.cli report)
 for level in "${LEVEL_ARRAY[@]}"; do
-  report_cmd+=(--run "${level}=evaluation/metrics/${VERSION}/${SPLIT}-${level}")
+  report_cmd+=(--run "${level}=evaluation/metrics/${VERSION}/${RUN_PREFIX}-${level}")
 done
 report_cmd+=(--out "$REPORT_OUT")
 "${report_cmd[@]}"

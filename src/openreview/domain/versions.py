@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import List
 
 PROMPT_VERSION = "review-v8"
-VALIDATOR_VERSION = "validator-v2"
+VALIDATOR_VERSION = "validator-v3"
 RETRIEVER_VERSION = "hybrid-v5"
 REVIEW_CACHE_SCHEMA_VERSION = 4
 METRICS_SCHEMA_VERSION = 5
