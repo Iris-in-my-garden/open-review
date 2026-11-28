@@ -298,7 +298,7 @@ AACR OCR 兼容字段（`review.comments[].content`、`review.summary.input_toke
 ### 7. 汇总多次 run
 
 `report` 子命令会把 `deterministic_*.json`、`retrieval_*.json` 和可选的
-`metrics_openreview_*.json` 合成 Markdown 表格，方便贴到 README / PR / 面试材料：
+`metrics_openreview_*.json` 合成 Markdown 表格，方便贴到 README / PR / 报告：
 
 ```bash
 uv run python -m evaluation.cli report \

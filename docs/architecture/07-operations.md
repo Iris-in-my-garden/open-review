@@ -52,7 +52,7 @@
 | `metrics.json` | 完整 RunMetrics |
 | `report.md` | 报告副本 |
 
-用于离线分析、评测复核、面试演示。不要把包含私有代码的 debug 产物提交到公开仓库。
+用于离线分析、评测复核、演示。不要把包含私有代码的 debug 产物提交到公开仓库。
 
 ## 4. 排障 Runbook
 
@@ -82,7 +82,7 @@ uv run openreview review <pr_url> --llm-cache-dir .cache/llm --llm-cache-mode re
 回放用于：
 
 - 改 Validator/Verifier/聚合策略后比较结果；
-- 复现面试/评审中的具体 case；
+- 复现评审中的具体 case；
 - 在无 API Key 环境下跑通链路。
 
 ## 6. 缓存操作

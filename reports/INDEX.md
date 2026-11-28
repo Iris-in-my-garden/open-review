@@ -1,6 +1,6 @@
 # Reports 索引
 
-`reports/` 只保留当前结论和面试材料，过期/中间产物放在 `reports/archive/`。
+`reports/` 只保留当前结论和示例报告，过期/中间产物放在 `reports/archive/`。
 
 ## 当前保留
 

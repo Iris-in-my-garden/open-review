@@ -12,7 +12,7 @@
 |---|---|---|
 | 5 分钟 | `ARCHITECTURE.md` §1–§4 | 知道系统是什么、不是什么、一次 run 怎么走 |
 | 15 分钟 | `evaluation-results.md` | 看当前真实结果、消融结论和不能对外声称的内容 |
-| 30 分钟 | `ARCHITECTURE.md` + `decisions/ADR-0001..0005` | 理解五个关键取舍及其代价 |
+| 30 分钟 | `ARCHITECTURE.md` + `decisions/ADR-0001..0010` | 理解关键取舍及其代价 |
 | 排障 | `architecture/07-operations.md` | 从 outcome/metrics 定位失败点 |
 | 改代码 | `architecture/03-workflow.md` + `reference/config.md` | 知道节点契约、配置默认值和 cache key |
 | 做评测 | `architecture/08-evaluation.md` + `evaluation-results.md` | 指标定义、切分、消融、当前状态 |
@@ -22,7 +22,7 @@
 | 文档 | 内容 |
 |---|---|
 | [`evaluation-results.md`](evaluation-results.md) | 结果快照：full dev production、mini ablation、prompt 实验、holdout 状态 |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | 系统地图：定位、C4、生命周期、决策索引、失败总览 |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | 系统地图：定位、C4、生命周期、决策索引、详细设计取舍、失败总览 |
 | [`architecture/01-context.md`](architecture/01-context.md) | 外部系统、容器、信任边界、部署与并发形态 |
 | [`architecture/02-lifecycle.md`](architecture/02-lifecycle.md) | 一次 review 的时序、artifact、outcome 状态机、缓存 |
 | [`architecture/03-workflow.md`](architecture/03-workflow.md) | 13 个节点的输入/输出/跳过/失败契约 |
@@ -31,7 +31,7 @@
 | [`architecture/06-trust.md`](architecture/06-trust.md) | Validator/Verifier、威胁模型、发布与脱敏 |
 | [`architecture/07-operations.md`](architecture/07-operations.md) | metrics schema、trace、debug、排障 runbook |
 | [`architecture/08-evaluation.md`](architecture/08-evaluation.md) | 指标定义、数据切分、四档消融、CI gate、当前状态 |
-| [`decisions/`](decisions/) | ADR：有界工作流、结构化检索、预算下沉、单遍审查、partial outcome |
+| [`decisions/`](decisions/) | ADR：有界工作流、结构化检索、预算下沉、单遍审查、partial outcome、检索执行、triage、validator/verifier、预算可观测、安全发布 |
 | [`reference/glossary.md`](reference/glossary.md) | 术语表 |
 | [`reference/config.md`](reference/config.md) | 配置默认值、CLI 映射、cache key 组成 |
 

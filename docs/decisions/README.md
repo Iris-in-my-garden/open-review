@@ -7,6 +7,11 @@
 | [ADR-0003](ADR-0003-budget-in-client.md) | 预算下沉到 LLM 客户端 | Accepted |
 | [ADR-0004](ADR-0004-single-pass-per-batch.md) | 每个 batch 一次结构化调用 | Accepted |
 | [ADR-0005](ADR-0005-partial-outcome.md) | `partial` 是一等状态 | Accepted |
+| [ADR-0006](ADR-0006-retrieval-execution.md) | 检索执行：AST/Graph 优先，rg 兜底 | Accepted |
+| [ADR-0007](ADR-0007-rule-based-triage.md) | 规则 triage，不用模型 | Accepted |
+| [ADR-0008](ADR-0008-validator-verifier.md) | Validator 确定性校验 + Verifier 有界语义复核 | Accepted |
+| [ADR-0009](ADR-0009-prompt-budget-observability.md) | Prompt/context 预算、批处理与可观测性 | Accepted |
+| [ADR-0010](ADR-0010-safety-publication.md) | 安全边界与发布策略 | Accepted |
 
 ## 新增 ADR 的规则
 

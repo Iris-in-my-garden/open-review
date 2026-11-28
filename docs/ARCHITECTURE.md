@@ -7,7 +7,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 读者 | 新贡献者、架构评审、面试官、未来的自己 |
+| 读者 | 新贡献者、架构评审、未来的自己 |
 | 覆盖 | 系统边界、容器、生命周期、关键决策、失败模型 |
 | 不覆盖 | API reference、逐行实现细节、评测操作步骤 |
 | 适用版本 | prompt `review-v8` / validator `v2` / retriever `hybrid-v5` / index schema `6` / metrics `5` |
@@ -142,6 +142,14 @@ sequenceDiagram
 | [ADR-0003](decisions/ADR-0003-budget-in-client.md) | 预算下沉到 LLM 客户端 | 重试/verifier/并发 aspect 都绕不开同一本账 |
 | [ADR-0004](decisions/ADR-0004-single-pass-per-batch.md) | 每个 batch 一次结构化调用 | 避免四倍调用量，先证明收益再增加维度 |
 | [ADR-0005](decisions/ADR-0005-partial-outcome.md) | `partial` 是一等状态 | 失败不能伪装成完整成功 |
+| [ADR-0006](decisions/ADR-0006-retrieval-execution.md) | AST/Graph 优先，rg 兜底 | 结构化证据 + 可降级执行 |
+| [ADR-0007](decisions/ADR-0007-rule-based-triage.md) | 规则 triage，不用模型 | 避免“调用 LLM 决定是否调用 LLM” |
+| [ADR-0008](decisions/ADR-0008-validator-verifier.md) | Validator 确定性校验 + Verifier 有界复核 | 行号/证据可机器核验，语义复核受预算约束 |
+| [ADR-0009](decisions/ADR-0009-prompt-budget-observability.md) | Prompt/context 预算与可观测性 | 大 PR 不爆窗，损耗位置可定位 |
+| [ADR-0010](decisions/ADR-0010-safety-publication.md) | 安全边界与发布策略 | 不可信输入隔离、静态分析 opt-in、只发 COMMENT |
+
+详细取舍已拆分为上述 ADR；本节只保留索引。新增关键机制时按
+[`decisions/README.md`](decisions/README.md) 的规则补 ADR。
 
 ## 8. 失败与降级总览
 
